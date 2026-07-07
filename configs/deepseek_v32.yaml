@@ -1,0 +1,52 @@
+# MoE benchmark config — defaults match DeepSeek V3.2.
+#
+# Weight shapes derived per rank from parallel_mode + world_size:
+#   TP: E_local = num_experts,            inter_shard = intermediate_size / world_size
+#   EP: E_local = num_experts/world_size, inter_shard = intermediate_size
+
+# ---- Model / weight shape ----
+hidden_size: 7168
+intermediate_size: 2048
+num_experts: 256
+topk: 8
+
+# ---- Parallelism ----
+parallel_mode: tp        # tp | ep
+world_size: 8
+
+# ---- Precision ----
+precision: bf16          # bf16 | fp16 | fp8
+block_shape: [128, 128]  # fp8 block-quant scale grid (only used for fp8)
+
+# ---- Workload sweep (tokens per measured point) ----
+num_tokens: [1, 4, 16, 64, 256, 1024, 4096]
+
+# ---- Routing / load balance ----
+routing:
+  distribution: balanced # balanced | uniform | skewed | single
+  skew_alpha: 1.0        # Zipf exponent for `skewed`
+  num_active_experts: null  # restrict routing to first N experts (null = all)
+
+# ---- Distributed (real cross-rank communication) ----
+# false: single process, measure only local expert compute (kernel benchmark).
+# true:  spawn world_size GPU procs, measure the full layer incl. communication
+#        (TP -> all-reduce; EP -> naive all-gather+reduce-scatter dispatch).
+distributed: false
+all2all_backend: allgather_reducescatter   # EP dispatch/combine (naive baseline)
+
+# ---- Timing ----
+warmup_iters: 10
+bench_iters: 50
+use_cuda_graph: true      # ignored in distributed mode
+seed: 0
+
+# ---- Correctness ----
+# Cross-check each implementation's output against a pure-torch reference
+# (computed from the same inputs, before timing) via torch.testing.assert_close.
+verify: true
+verify_atol: null         # null = per-precision default (see moe_bench/reference.py)
+verify_rtol: null
+
+# ---- Output ----
+device: cuda
+output_json: null
