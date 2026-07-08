@@ -1,1 +1,9 @@
 __pycache__
+*.zip
+*.so
+*.o
+*.ptx
+*.ncu-rep
+*.nsys-rep
+ThunderKittens/tileoverlap/**/probe
+ThunderKittens/tileoverlap/**/_C*.so
