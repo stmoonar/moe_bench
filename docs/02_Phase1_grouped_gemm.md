@@ -40,7 +40,15 @@ launch 的第三个参数。
 动态 smem」的 kernel 都要额外预留 1024B 的对齐余量，否则最后一个分配可能越界。02 融合 kernel
 的 dispatch 路径也用同一个 allocator，同样要留余量（已在 02 一并修）。
 
-## 坑 2（非 bug，容差说明）：144896 token 处 max diff 0.1003 略超 0.1
+## 坑 2（⚠️ 结论作废，见 docs/05）：144896 token 处 max diff 0.1003
+
+**当时误判**：以为是 bf16 大 K 舍入的正常误差。**实际上是** `group::store` 的
+warpgroup 交织行映射与 consumer 输入行不匹配的**真 bug**（详见
+[docs/05_关键bug_group_store行映射.md](05_关键bug_group_store行映射.md)）。当时
+mean diff ≈ ref mean（0.0099 vs 0.0094）本应是系统性错误的铁证，被我误读成舍入。
+
+修复后 01 三档全部 max diff ~0.0002（含 144896 token），性能不变（150~177%）。
+下面的原始记录保留以便追溯，但「bf16 舍入」的解释是错的。
 
 - mean diff 稳定在 0.0099，与通过的两档**完全一致**；只有 max 的单点 outlier 从 0.096
   漂到 0.1003。
