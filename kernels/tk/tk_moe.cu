@@ -201,6 +201,186 @@ void barrier_entry(kittens::py::TKParallelTensor &barrier, const int seq) {
 } // namespace disp
 
 /* ===================================================================== *
+ * 2b. Dispatch via source-side PUSH ⊕ grouped GEMM (layer0, optimization #1).
+ *
+ * Reverses 2's pull. Each card is both a SOURCE (pushes its own tokens out to
+ * the expert cards that need them) and an EXPERT (runs grouped GEMM on tokens
+ * pushed into its gathered buffer). Pushing uses the machine's strong path
+ * (~51 GB/s) instead of the weak SM pull (~20 GB/s, probe [C2]); remote
+ * red.release.sys is legal here (probe [B] confirmed native atomics work).
+ *
+ * gathered is a pgl now (peers write it). The GEMM producer's gate spins on a
+ * LOCAL row-block counter that peers increment remotely. Padding is handled by
+ * pre-seeding each row-block counter with its padding slack, so real pushes
+ * bring it exactly to ROW_BLOCK.
+ *
+ * push schedule (per source assignment, this card's view):
+ *   push_indices[i] = (dst_dev, dst_slot) for this card's i-th outgoing token,
+ *   push_src[i]     = local source token index to read from pre_tokens.
+ * i ranges over this card's own (token,expert) assignments to remote+local experts.
+ * ===================================================================== */
+namespace dpush {
+struct globals {
+    using cfg = gemm_config;
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    using token_vec = sv_bf<H>;
+    static constexpr int TOKENS_PER_BLOCK = cfg::DYNAMIC_SHARED_MEMORY / sizeof(token_vec);
+    using pre_tokens_gl   = gl<bf16, 1, 1, -1, H, token_vec>;                       // local source tokens
+    using gathered_pgl    = pgl<gl<bf16, 1, 1, -1, H, token_vec, cfg::A_tile>, NUM_DEVICES, false>; // peers push here
+    using post_tokens_gl  = gl<bf16, 1, 1, -1, H, token_vec, cfg::A_tile>;          // local GEMM A-tile source
+    using weights_gl      = gl<bf16, 1, -1, -1, -1, cfg::B_tile>;
+    using outputs_gl      = gl<bf16, 1, 1, -1, -1>;
+    using counts_gl       = gl<int, 1, 1, 1, -1>;
+    using push_idx_gl     = gl<int, 1, 1, -1, 2>;    // (dst_dev, dst_slot) per outgoing assignment
+    using push_src_gl     = gl<int, 1, 1, -1, 1>;    // local src token idx per outgoing assignment
+    using barrier_pgl     = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    pre_tokens_gl pre_tokens;
+    gathered_pgl gathered;         // this card's gathered view + peers'
+    post_tokens_gl activations;    // == gathered[dev_idx], the local GEMM A-tile source
+    weights_gl weights;
+    outputs_gl outputs;
+    counts_gl padded_tokens_per_expert;
+    push_idx_gl push_indices;
+    push_src_gl push_src;
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int num_local_experts;
+    const int expert_offset;
+    const int num_padded_local_tokens;   // rows of THIS card's gathered
+    const int num_push;                  // number of outgoing assignments from this card
+    const int num_comp_sms;
+};
+// Push block: each thread pushes one outgoing token to its (dst_dev, dst_slot),
+// then remotely bumps that dst card's row-block counter.
+__device__ inline void push(const globals &G, const int sm_idx) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::token_vec (&token)[globals::TOKENS_PER_BLOCK] =
+        al.allocate<typename globals::token_vec, globals::TOKENS_PER_BLOCK>();
+    __shared__ semaphore token_arrived[globals::TOKENS_PER_BLOCK];
+    const int lane_id = threadIdx.x;
+    if (lane_id < globals::TOKENS_PER_BLOCK) {
+        const int i = sm_idx * globals::TOKENS_PER_BLOCK + lane_id;
+        if (i < G.num_push) {
+            const int dst_dev  = G.push_indices[{i, 0}];
+            const int dst_slot = G.push_indices[{i, 1}];
+            const int src_tok  = G.push_src[{i, 0}];
+            if (dst_dev >= 0 && dst_slot >= 0 && src_tok >= 0) {
+                // read local source token into smem, then TMA-push to dst card's gathered slot
+                init_semaphore(token_arrived[lane_id], 0, 1);
+                tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
+                tma::load_async(token[lane_id], G.pre_tokens, {src_tok, 0}, token_arrived[lane_id]);
+                wait(token_arrived[lane_id], 0);
+                tma::store_async(G.gathered[dst_dev], token[lane_id], {dst_slot, 0});
+                tma::store_async_wait();
+                // remote release-add on dst card's row-block counter (native atomics OK here)
+                asm volatile("{red.release.sys.global.add.s32 [%0], %1;}"
+                             :: "l"(&G.barrier[dst_dev][{dst_slot / gemm_config::ROW_BLOCK}]), "r"(1) : "memory");
+            }
+        }
+    }
+}
+// Gate: producer warp spins on the LOCAL row-block counter (peers increment it
+// remotely) until it reaches ROW_BLOCK. Counter is pre-seeded with padding slack.
+struct push_gate {
+    const globals &G;
+    __device__ inline void operator()(int row_idx) const {
+        int v;
+        asm volatile("{ld.acquire.sys.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        while (v != gemm_config::ROW_BLOCK) {
+            __nanosleep(64);
+            asm volatile("{ld.acquire.sys.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        }
+    }
+};
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void kernel(const __grid_constant__ globals G) {
+    if (blockIdx.x < G.num_comp_sms)
+        grouped_gemm_sm120(G, push_gate{G}, blockIdx.x, G.num_comp_sms);
+    else
+        push(G, blockIdx.x - G.num_comp_sms);
+}
+// Padding slack seeding is done host-side by the scheme (it knows real vs padded
+// per-expert counts): before launch it writes (ROW_BLOCK - real_in_block) into
+// each row-block counter, so real pushes bring it exactly to ROW_BLOCK. No
+// device-side counter reset (see entry): re-seeding + a scheme-side barrier
+// handles the epoch boundary without racing in-flight remote adds.
+void entry(kittens::py::TKParallelTensor &pre_tokens,
+           kittens::py::TKParallelTensor &gathered, at::Tensor &weights, at::Tensor &outputs,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &push_indices, at::Tensor &push_src,
+           kittens::py::TKParallelTensor &barrier, const int num_comm_sms,
+           const int num_padded_local_tokens, const int num_push) {
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0)) / globals::NUM_DEVICES;
+    TORCH_CHECK(weights.size(0) == num_local_experts,
+                "weights first dim must equal local expert count (NUM_GPUS mismatch?)");
+    TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms must be >= 1 (deadlock otherwise)");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
+    const int num_comp_sms = sm - num_comm_sms;
+    globals G {
+        .pre_tokens = kittens::py::tensor_to_gl<globals::pre_tokens_gl>(pre_tokens.data_),
+        .gathered = kittens::py::parallel_tensor_to_pgl<globals::gathered_pgl>(gathered),
+        .activations = kittens::py::tensor_to_gl<globals::post_tokens_gl>(gathered.data_),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .push_indices = kittens::py::tensor_to_gl<globals::push_idx_gl>(push_indices),
+        .push_src = kittens::py::tensor_to_gl<globals::push_src_gl>(push_src),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_local_experts = num_local_experts,
+        .expert_offset = dev_idx * num_local_experts,
+        .num_padded_local_tokens = num_padded_local_tokens, .num_push = num_push,
+        .num_comp_sms = num_comp_sms
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const int push_blocks = (num_push + globals::TOKENS_PER_BLOCK - 1) / globals::TOKENS_PER_BLOCK;
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel<<<num_comp_sms + push_blocks, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+    // NO device-side reset here: row-0 counters are re-seeded from host every
+    // iteration (scheme writes slack), and a cross-device barrier in the scheme
+    // (after this call) ensures all peer pushes land before the next seed. A
+    // reset here would race a slow peer's still-in-flight remote red.add.
+}
+
+// DEBUG: run ONLY the push blocks (no GEMM/gate) so the kernel can't hang; the
+// caller inspects the dst counters afterward to isolate counter-update bugs from
+// gate visibility bugs.
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void push_only_kernel(const __grid_constant__ globals G) {
+    push(G, blockIdx.x);
+}
+void push_only_entry(kittens::py::TKParallelTensor &pre_tokens,
+           kittens::py::TKParallelTensor &gathered, at::Tensor &weights, at::Tensor &outputs,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &push_indices, at::Tensor &push_src,
+           kittens::py::TKParallelTensor &barrier, const int num_push) {
+    const int dev_idx = barrier.local_rank_;
+    globals G {
+        .pre_tokens = kittens::py::tensor_to_gl<globals::pre_tokens_gl>(pre_tokens.data_),
+        .gathered = kittens::py::parallel_tensor_to_pgl<globals::gathered_pgl>(gathered),
+        .activations = kittens::py::tensor_to_gl<globals::post_tokens_gl>(gathered.data_),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .push_indices = kittens::py::tensor_to_gl<globals::push_idx_gl>(push_indices),
+        .push_src = kittens::py::tensor_to_gl<globals::push_src_gl>(push_src),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_local_experts = 0, .expert_offset = 0,
+        .num_padded_local_tokens = 0, .num_push = num_push, .num_comp_sms = 0
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const int push_blocks = (num_push + globals::TOKENS_PER_BLOCK - 1) / globals::TOKENS_PER_BLOCK;
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(push_only_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    push_only_kernel<<<push_blocks, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace dpush
+
+/* ===================================================================== *
  * 3. W2 grouped GEMM ⊕ combine (layer1). Port of tileoverlap/03 fused.
  * ===================================================================== */
 namespace comb {
@@ -351,6 +531,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_TK_PARALLEL_TENSOR(m);
     m.def("grouped_gemm", &gg::entry);
     m.def("moe_dispatch_gemm", &disp::entry);
+    m.def("moe_dispatch_push", &dpush::entry);
+    m.def("moe_dispatch_push_only", &dpush::push_only_entry);
     m.def("pcie_device_barrier", &disp::barrier_entry);
     m.def("moe_gemm_combine_fused", &comb::entry);
 }
