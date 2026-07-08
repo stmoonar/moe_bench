@@ -160,7 +160,11 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &post_tokens,
            const int num_comm_sms, const int num_padded_local_tokens) {
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0)) / globals::NUM_DEVICES;
+    TORCH_CHECK(weights.size(0) == num_local_experts,
+                "weights first dim must equal local expert count (NUM_GPUS mismatch?)");
+    TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms must be >= 1 (deadlock otherwise)");
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
     const int num_comp_sms = sm - num_comm_sms;
     globals G {
         .pre_tokens = kittens::py::parallel_tensor_to_pgl<globals::pre_tokens_pgl>(pre_tokens),
@@ -311,7 +315,11 @@ void entry(at::Tensor &activations, at::Tensor &weights,
            const int num_padded_local_tokens, const int num_source_tokens, const int combine_seq) {
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0)) / globals::NUM_DEVICES;
+    TORCH_CHECK(weights.size(0) == num_local_experts,
+                "weights first dim must equal local expert count (NUM_GPUS mismatch?)");
+    TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms must be >= 1 (deadlock otherwise)");
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
     const int num_comp_sms = sm - num_comm_sms;
     globals G {
         .activations = kittens::py::tensor_to_gl<globals::activations_gl>(activations),

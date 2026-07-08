@@ -159,6 +159,14 @@ class TKFusedEP(DistributedScheme):
 
     def run(self) -> torch.Tensor:
         tk = self.tk
+        # P2: barrier BEFORE overwriting pre_tokens, so no peer is still pulling
+        # last iteration's tokens when we clobber the buffer. The safety of
+        # copy->dispatch used to rely on an implicit chain (peer pull ⇔ combine
+        # wait ⇔ W2 launched ⇔ this rank's dispatch done, all in stream order);
+        # this explicit barrier makes it robust to any future change in that chain
+        # (e.g. skipping combine, changing wait granularity). ~10µs on a ~7ms layer.
+        self._l0_seq += 1
+        tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
         self.pre_tokens.data_.copy_(self.problem.hidden_states)
         self._l0_seq += 1
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
@@ -170,8 +178,8 @@ class TKFusedEP(DistributedScheme):
         # up GEMM on the gathered tokens (local)
         tk.grouped_gemm(self.gathered, self.w_up, self.up_out, self.padded,
                         self.ctx.rank * self.problem.config.num_local_experts)
-        # SiLU-mul
-        self.act.copy_(F.silu(self.gate_out) * self.up_out)
+        # SiLU-mul, in-place into preallocated self.act (allocation-stable)
+        torch.mul(F.silu(self.gate_out), self.up_out, out=self.act)
 
         # layer1: W2 GEMM ⊕ combine
         self._l1_seq += 1
