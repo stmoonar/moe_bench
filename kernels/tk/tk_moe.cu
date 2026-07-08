@@ -281,6 +281,64 @@ __device__ inline void push(const globals &G, const int sm_idx) {
         }
     }
 }
+// Atomic-free push: same TMA data plane as push() but NO remote red.add. Used by
+// the "push2" path (push_data -> pcie_barrier_all -> plain grouped_gemm), which
+// avoids the PCIe remote-atomic increment loss (docs/08) while still using the
+// strong push bandwidth. Completion is a single cross-device barrier, not counters.
+__device__ inline void push_data(const globals &G, const int sm_idx) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::token_vec (&token)[globals::TOKENS_PER_BLOCK] =
+        al.allocate<typename globals::token_vec, globals::TOKENS_PER_BLOCK>();
+    __shared__ semaphore token_arrived[globals::TOKENS_PER_BLOCK];
+    const int lane_id = threadIdx.x;
+    if (lane_id < globals::TOKENS_PER_BLOCK) {
+        const int i = sm_idx * globals::TOKENS_PER_BLOCK + lane_id;
+        if (i < G.num_push) {
+            const int dst_dev  = G.push_indices[{i, 0}];
+            const int dst_slot = G.push_indices[{i, 1}];
+            const int src_tok  = G.push_src[{i, 0}];
+            if (dst_dev >= 0 && dst_slot >= 0 && src_tok >= 0) {
+                init_semaphore(token_arrived[lane_id], 0, 1);
+                tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
+                tma::load_async(token[lane_id], G.pre_tokens, {src_tok, 0}, token_arrived[lane_id]);
+                wait(token_arrived[lane_id], 0);
+                tma::store_async(G.gathered[dst_dev], token[lane_id], {dst_slot, 0});
+                tma::store_async_wait();
+            }
+        }
+    }
+}
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void push_data_kernel(const __grid_constant__ globals G) {
+    push_data(G, blockIdx.x);
+}
+// Standalone data-only push (no GEMM, no atomics). Caller sequences:
+//   push_data_entry (all cards) -> pcie_device_barrier -> grouped_gemm.
+void push_data_entry(kittens::py::TKParallelTensor &pre_tokens,
+           kittens::py::TKParallelTensor &gathered, at::Tensor &weights, at::Tensor &outputs,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &push_indices, at::Tensor &push_src,
+           kittens::py::TKParallelTensor &barrier, const int num_push) {
+    globals G {
+        .pre_tokens = kittens::py::tensor_to_gl<globals::pre_tokens_gl>(pre_tokens.data_),
+        .gathered = kittens::py::parallel_tensor_to_pgl<globals::gathered_pgl>(gathered),
+        .activations = kittens::py::tensor_to_gl<globals::post_tokens_gl>(gathered.data_),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .push_indices = kittens::py::tensor_to_gl<globals::push_idx_gl>(push_indices),
+        .push_src = kittens::py::tensor_to_gl<globals::push_src_gl>(push_src),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = barrier.local_rank_, .num_local_experts = 0, .expert_offset = 0,
+        .num_padded_local_tokens = 0, .num_push = num_push, .num_comp_sms = 0
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const int push_blocks = (num_push + globals::TOKENS_PER_BLOCK - 1) / globals::TOKENS_PER_BLOCK;
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(push_data_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    push_data_kernel<<<push_blocks, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
 // Gate: producer warp spins on the LOCAL row-block counter (peers increment it
 // remotely) until it reaches ROW_BLOCK. Counter is pre-seeded with padding slack.
 struct push_gate {
@@ -533,6 +591,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_dispatch_gemm", &disp::entry);
     m.def("moe_dispatch_push", &dpush::entry);
     m.def("moe_dispatch_push_only", &dpush::push_only_entry);
+    m.def("moe_push_data", &dpush::push_data_entry);
     m.def("pcie_device_barrier", &disp::barrier_entry);
     m.def("moe_gemm_combine_fused", &comb::entry);
 }

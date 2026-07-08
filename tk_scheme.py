@@ -230,6 +230,19 @@ class TKFusedEP(DistributedScheme):
             tk.moe_dispatch_push(self.pre_tokens, self.gathered, self.w_gate, self.gate_out,
                                  self.padded, self.push_idx, self.push_src, self.barrier_l0,
                                  self.num_comm_sms, self.num_padded_local, self.num_push)
+        elif self.dispatch_mode == "push2":
+            # Atomic-free push (docs/08 refactor): push tokens to peers (strong
+            # ~51GB/s path, no remote atomics), one cross-device barrier for
+            # completion, then a plain local grouped GEMM for the gate projection.
+            # Trades layer0 comm/compute overlap (unneeded — comm-bound) for the
+            # push bandwidth win, reusing only verified primitives.
+            tk.moe_push_data(self.pre_tokens, self.gathered, self.w_gate, self.gate_out,
+                             self.padded, self.push_idx, self.push_src, self.barrier_l0,
+                             self.num_push)
+            self._l0_seq += 1
+            tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)  # all pushes landed
+            tk.grouped_gemm(self.gathered.data_, self.w_gate, self.gate_out, self.padded,
+                            self.ctx.rank * self.problem.config.num_local_experts)
         else:  # "pull" fallback
             tk.moe_dispatch_gemm(self.pre_tokens, self.gathered.data_, self.w_gate, self.gate_out,
                                  self.padded, self.disp_idx, self.barrier_l0,

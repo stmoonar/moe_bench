@@ -61,3 +61,40 @@ under_blk 大量（112~127），over_blk 恒为空 []
 - 正确性无影响：主线一直用 pull，push 从未设为默认交付路径。
 - 收益：#1 的预期 ~6× dispatch 提速暂时拿不到；转 #3（schedule 上 GPU，公平性必需）和 benchmark
   覆盖，这些低风险、确定有价值。
+
+## 补充：无远端原子的 push2 重构（实现、验证、实测更慢，同样搁置）
+
+按评审止损后的决定，实现了 push 的无远端原子变体 **push2**：
+`push_data`（TMA 推数据，**无 red.add**）→ `pcie_barrier_all`（已验证的 slot+seq 原子-free
+barrier）→ 普通 `grouped_gemm`（gate 投影）。单写者完成信号本就要拆分 push 与 GEMM，故直接
+用「推 → barrier → GEMM」三段，只复用已验证原语，零新风险。
+
+### 正确性 ✅
+- 64 专家（push 会挂的规模）：对拍 reference_moe passed=True，rel_err 4.26e-3。
+- 256 专家：30 迭代 stress 无挂死、稳定（push 在此必挂）。
+
+### 性能 ❌ 反而更慢
+4 卡 EP bf16 512 token，**dispatch-only** 隔离计时：
+
+| dispatch 模式 | dispatch-only | 端到端层 |
+|---|---|---|
+| pull（融合 dispatch⊕gate GEMM） | **2.00 ms** | 7133 µs |
+| push2（push→barrier→GEMM） | 2.65 ms | 7823 µs |
+
+push2 比 pull 慢 ~30%。原因：
+1. **丢了 layer0 的通算 overlap**——pull 把 dispatch 融进 gate GEMM 的 producer 自旋，
+   push2 拆成三段串行（推、barrier、GEMM），多一次 barrier + 一次独立 kernel launch。
+2. **512 token 数据量太小**：每卡 dispatch ~57MB，20→51GB/s 的带宽差（~1.8ms vs 1.1ms 理论）
+   压不过固定开销（barrier RTT、launch、GEMM 不再被隐藏）。push 带宽的收益要在**大 token**
+   档才显现，而本 benchmark 单点 512。
+
+### 结论
+push2 **正确但更慢**，与 push（更快但错）都搁置。**pull 仍是默认且最优**。
+`moe_push_data` / `TK_DISPATCH=push2` 代码保留供大 token 档或换机器时再评估。
+
+**教训**：#1 的 ~6× 预估是基于"dispatch 纯 comm-bound 且打满带宽"的账，但**pull 版本本就
+把 dispatch 和 gate GEMM 融合overlap 了**，dispatch 并非纯串行通信——预估把已有的 overlap
+收益重复计入了。真正要提速 dispatch，得在**保持融合 overlap 的同时**换更快的数据面，
+而不是拆开。这需要 fused push+gate（producer 边等 push 边算），但完成信号又不能用远端原子
+（丢增量）——本质回到"融合 kernel 里如何无原子地精确知道 128 个 token 到齐"的难题，
+非平凡，优先级低于 #3/benchmark 覆盖。
