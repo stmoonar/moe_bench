@@ -1,0 +1,182 @@
+# SPDX-License-Identifier: Apache-2.0
+"""TK fused MoE scheme (bf16, EP) for the distributed benchmark.
+
+Full layer on one rank using the ThunderKittens fused kernels verified in
+tileoverlap/{01,02,03}:
+
+  1. dispatch ⊕ gate GEMM   (layer0 fused, moe_dispatch_gemm)   -> gate_out
+  2. up GEMM                (grouped_gemm on the gathered tokens) -> up_out
+  3. act = silu(gate) * up  (torch)
+  4. W2 GEMM ⊕ combine      (layer1 fused, moe_gemm_combine_fused) -> output
+
+Route B' communication (experience/12): pull + local FP32 reduce + slot signals,
+no remote atomics, no multimem. See docs/06_Phase4_scheme接入设计.md.
+
+bf16 only for v1 (user choice); fp8 is a follow-up. EP only.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from .config import ParallelMode
+from .context import DistContext
+from .data import MoEProblem
+from .schemes import DistributedScheme
+
+ROW_BLOCK = 128
+
+
+def _build_schedules(topk_ids, num_tokens, world_size, num_experts, num_experts_per_dev,
+                     rank, device):
+    """From this rank's routing (and all ranks', gathered) produce:
+      - pull_dispatch_indices (num_padded_local, 2): (src_dev, src_token) for the
+        tokens THIS rank's experts need, expert-sorted, 128-padded, ring-ordered.
+      - combine_indices (num_tokens*topk, 2): (e_rank, remote_slot) for THIS rank's
+        source tokens' top-k experts.
+      - padded_tokens_per_expert (num_experts,), num_padded_local.
+    All host-side (torch), done in setup (not timed).
+    """
+    # gather all ranks' topk_ids so every rank can replay every expert card's schedule
+    all_topk = torch.empty(world_size, num_tokens, topk_ids.shape[1],
+                           device=device, dtype=topk_ids.dtype)
+    torch.distributed.all_gather_into_tensor(all_topk, topk_ids.contiguous())
+    all_topk_cpu = all_topk.cpu()
+
+    tokens_per_expert = torch.bincount(all_topk.view(-1), minlength=num_experts).to(torch.int32)
+    padded = ((tokens_per_expert + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK)
+    padded_cpu = padded.cpu().long()
+
+    my_estart = num_experts_per_dev * rank
+    my_eend = num_experts_per_dev * (rank + 1)
+    num_padded_local = int(padded[my_estart:my_eend].sum())
+
+    top_k = topk_ids.shape[1]
+    disp_idx = torch.full((num_padded_local, 2), -1, dtype=torch.int32, device="cpu")
+    comb_idx = torch.full((num_tokens * top_k, 2), -1, dtype=torch.int32, device="cpu")
+
+    # replay each expert card's write cursor (ring by source device), exactly the
+    # order the dispatch kernel pulls in — so slot ids match on both sides.
+    for e_rank in range(world_size):
+        estart = num_experts_per_dev * e_rank
+        eend = num_experts_per_dev * (e_rank + 1)
+        write_pos = torch.cat([
+            torch.zeros(1, dtype=torch.int64, device="cpu"),
+            torch.cumsum(padded_cpu[estart:eend - 1], dim=0)
+        ]).tolist()
+        for i in range(world_size):
+            src_dev = (i + e_rank) % world_size
+            for src_tok in range(num_tokens):
+                for kpos, eid in enumerate(all_topk_cpu[src_dev, src_tok].tolist()):
+                    if estart <= eid < eend:
+                        e = eid - estart
+                        slot = write_pos[e]
+                        write_pos[e] += 1
+                        if e_rank == rank:  # this rank is the expert card -> dispatch entry
+                            disp_idx[slot, 0] = src_dev
+                            disp_idx[slot, 1] = src_tok
+                        if src_dev == rank:  # this rank is the source card -> combine entry
+                            comb_idx[src_tok * top_k + kpos, 0] = e_rank
+                            comb_idx[src_tok * top_k + kpos, 1] = slot
+    return (disp_idx.to(device), comb_idx.to(device), padded.to(device),
+            num_padded_local)
+
+
+class TKFusedEP(DistributedScheme):
+    name = "tkfused"
+
+    def setup(self, problem: MoEProblem, ctx: DistContext) -> None:
+        cfg = problem.config
+        assert cfg.parallel_mode == ParallelMode.EP, "TKFusedEP is EP-only"
+        assert problem.quant_config is None, "TKFusedEP v1 is bf16-only (no fp8 yet)"
+        self.ctx = ctx
+        self.problem = problem
+        H = cfg.hidden_size
+        inter = cfg.intermediate_shard
+        world = ctx.world_size
+        num_tokens = problem.num_tokens
+        num_experts = cfg.num_experts
+        e_local = cfg.num_local_experts
+        device = problem.hidden_states.device
+        self.H, self.inter, self.num_tokens, self.top_k = H, inter, num_tokens, cfg.topk
+
+        from importlib.util import spec_from_file_location, module_from_spec
+        import os
+        _build_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "kernels", "tk", "build.py")
+        _spec = spec_from_file_location("_tk_build", _build_py)
+        _bmod = module_from_spec(_spec)
+        _spec.loader.exec_module(_bmod)
+        self.tk = _bmod.build_and_load(world, hidden=H)
+
+        # schedules (host-side, not timed)
+        disp_idx, comb_idx, padded, num_padded_local = _build_schedules(
+            problem.topk_ids, num_tokens, world, num_experts, e_local, ctx.rank, device)
+        self.disp_idx = disp_idx
+        self.comb_idx = comb_idx
+        self.padded = padded
+        self.num_padded_local = num_padded_local
+        self.combine_w = problem.topk_weights.reshape(-1, 1).contiguous().float()
+
+        # weights: problem.w1 (E_local, 2*inter, H) is [gate; up] stored for x@w.T.
+        # grouped_gemm computes x @ W with W as (K, N), so W = w.T:
+        #   gate/up:  x(.,H) @ (H, inter) -> (., inter)   => W_gate = w1[:, :inter, :].transpose(1,2)
+        #   W2:       act(.,inter) @ (inter, H) -> (., H)  => W2 = w2.transpose(1,2)
+        w1 = problem.w1  # (E_local, 2*inter, H)
+        self.w_gate = w1[:, :inter, :].transpose(1, 2).contiguous()  # (E_local, H, inter)
+        self.w_up = w1[:, inter:, :].transpose(1, 2).contiguous()    # (E_local, H, inter)
+        self.w2 = problem.w2.transpose(1, 2).contiguous()            # (E_local, inter, H)
+
+        # padded expert-output max across cards (for pgl uniform sizing)
+        num_padded_max = int(padded.reshape(world, e_local).sum(dim=1).amax())
+        self.num_padded_max = num_padded_max
+
+        TK = self.tk.TKParallelTensor
+        lr, lws = ctx.local_rank, world
+        # symmetric buffers (allocated once, reused)
+        self.pre_tokens = TK((num_tokens, H), dtype=torch.bfloat16, local_rank=lr,
+                             local_world_size=lws, multicast=False)
+        self.expert_out = TK((num_padded_max, H), dtype=torch.bfloat16, local_rank=lr,
+                             local_world_size=lws, multicast=False)
+        bar_cols = max(num_padded_max // ROW_BLOCK + 1, 32)
+        self.barrier_l0 = TK((2, bar_cols), dtype=torch.int, local_rank=lr,
+                             local_world_size=lws, multicast=False)
+        self.barrier_l1 = TK((1 + world, bar_cols), dtype=torch.int, local_rank=lr,
+                             local_world_size=lws, multicast=False)
+        self.barrier_l0.data_.zero_()
+        self.barrier_l1.data_.zero_()
+
+        # local workspaces
+        self.gathered = torch.zeros(num_padded_local, H, device=device, dtype=torch.bfloat16)
+        self.gate_out = torch.zeros(num_padded_local, inter, device=device, dtype=torch.bfloat16)
+        self.up_out = torch.zeros(num_padded_local, inter, device=device, dtype=torch.bfloat16)
+        self.act = torch.zeros(num_padded_local, inter, device=device, dtype=torch.bfloat16)
+        self.combine_out = torch.zeros(num_tokens, H, device=device, dtype=torch.bfloat16)
+
+        self.num_comm_sms = 16
+        self._l0_seq = 0
+        self._l1_seq = 0
+
+    def run(self) -> torch.Tensor:
+        tk = self.tk
+        self.pre_tokens.data_.copy_(self.problem.hidden_states)
+        self._l0_seq += 1
+        tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
+
+        # layer0: dispatch ⊕ gate GEMM  (fills self.gathered + self.gate_out)
+        tk.moe_dispatch_gemm(self.pre_tokens, self.gathered, self.w_gate, self.gate_out,
+                             self.padded, self.disp_idx, self.barrier_l0,
+                             self.num_comm_sms, self.num_padded_local)
+        # up GEMM on the gathered tokens (local)
+        tk.grouped_gemm(self.gathered, self.w_up, self.up_out, self.padded,
+                        self.ctx.rank * self.problem.config.num_local_experts)
+        # SiLU-mul
+        self.act.copy_(F.silu(self.gate_out) * self.up_out)
+
+        # layer1: W2 GEMM ⊕ combine
+        self._l1_seq += 1
+        tk.moe_gemm_combine_fused(self.act, self.w2, self.expert_out, self.padded,
+                                  self.combine_out, self.comb_idx, self.combine_w,
+                                  self.barrier_l1, self.num_comm_sms,
+                                  self.num_padded_local, self.num_tokens, self._l1_seq)
+        return self.combine_out

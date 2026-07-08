@@ -84,3 +84,57 @@ run（每次，分配稳定）:
 4. 对拍 `reference_moe`（--scheme tkfused --mode ep --precision bf16 --world-size 4）。
 5. 与 serial baseline 比性能。
 6. 沉淀结果；fp8 作为后续。
+
+## 5. Phase 4 结果（已完成）：TKFusedEP scheme 接入并验证
+
+**文件**：`moe_bench/tk_scheme.py`（scheme），`moe_bench/kernels/tk/{tk_moe.cu,build.py}`
+（合并的 TK 扩展，一个 .so 暴露 grouped_gemm / moe_dispatch_gemm /
+moe_gemm_combine_fused / pcie_device_barrier），`schemes.py` 注册 `tkfused`。
+
+### 正确性：对拍 reference_moe 通过
+
+4 卡 EP bf16，num_experts=32（缩专家数以让 golden 全专家权重放进单卡显存；routing/combine
+逻辑与 256 专家完全一致）：
+
+| rank | passed | rel_err | max_abs |
+|---|---|---|---|
+| 0~3 | **True** | ~4.3e-3 | ~5e-3 |
+
+远低于 bf16 容差 atol=2e-2。完整两层数据流（dispatch⊕gate GEMM → up GEMM → SiLU-mul →
+W2 GEMM⊕combine）端到端正确。256 专家下 scheme 本身也能跑（staged 直测 RUN OK），只是
+harness 的 golden `make_logical_weights`（全 256 专家全尺寸权重 + fp32 upcast）单卡放不下
+——这是 harness 校验的显存开销，非 scheme 的 bug。
+
+### 性能：与 serial baseline 打平（v1 预期）
+
+4 卡 EP bf16，256 专家，512 token/rank，balanced routing（`--no-verify`，纯 CLI flags）：
+
+| scheme | latency |
+|---|---|
+| serial（vLLM fused_experts + NCCL AG/RS） | 7062 µs |
+| tkfused（TK 两层融合） | 7146 µs |
+
+基本持平（tkfused 慢 ~1%）。原因与 Phase 2 一致：本 workload **dispatch/comm-bound**，
+且逐 token TMA pull 的 SM 带宽偏弱（probe [C2]），balanced routing + 512 token 下 padding
+占比高。v1 是 bf16、correctness-first、schedule 在 host 现算，尚未上头号杠杆：
+1. **FP8 dispatch/combine**（传输减半，experience/12 §4.1 头号杠杆）；
+2. **源端 pack + push**（push 带宽 51GB/s 远好于 pull ~20GB/s）；
+3. schedule 上 GPU（去 host 三重循环 + D2H）；
+4. dispatch 深流水（每 block 多 outstanding TMA）。
+
+### 工程坑
+
+- **broker artifacts**：TKParallelTensor 用固定 key 的 shm(`/dev/shm/kittens_broker_shm`)
+  + socket(`/tmp/kittens_broker.sock*`)。被 kill 的 run 会残留 socket，导致下次 broker
+  init 挂死。**每次跑前清理**：`rm -f /tmp/kittens_broker.sock* /dev/shm/kittens_broker_shm`。
+- **`--config` 路径有环境 bug**：某个 import 会把 config 当 `--key value` 追加进 sys.argv，
+  导致 argparse "unrecognized arguments"。**用纯 CLI flags**（`--mode ep --precision bf16
+  --world-size 4 ...`）绕过，不要用 `--config`。
+- **broker × mp.spawn 兼容**：已验证 TKParallelTensor 在 harness 的 mp.spawn 下正常
+  （rank==local_rank==device index）。
+- **NUM_DEVICES 编译期**：扩展按 world_size 编译并缓存在 `kernels/tk/build/`。
+
+### 后续（fp8 + 优化）
+
+bf16 全链路已打通。下一步按用户「先 bf16 打通」的路线图，上 fp8（dispatch/combine 传 fp8e4m3、
+SM120 原生 fp8 mma）与上述性能杠杆，目标让 tkfused 显著超过 serial。

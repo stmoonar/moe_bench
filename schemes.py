@@ -149,6 +149,19 @@ SCHEMES: dict[str, type[DistributedScheme]] = {
 }
 
 
+def _register_optional_schemes() -> None:
+    """Register schemes with heavy/optional deps (TK extension) lazily, so a
+    missing build doesn't break the serial baseline import."""
+    try:
+        from .tk_scheme import TKFusedEP
+        SCHEMES[TKFusedEP.name] = TKFusedEP
+    except Exception:
+        pass
+
+
+_register_optional_schemes()
+
+
 def get_scheme(name: str) -> DistributedScheme:
     if name not in SCHEMES:
         raise ValueError(
