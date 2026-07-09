@@ -32,3 +32,5 @@ python环境：`source /data/cinnzhang_vllm_td_test/venvs/vllm-td/bin/activate`�
 
 在当前的分支下，每次有一些进展需要进行提交并写详细且规范的提交信息。并且在这个迭代的过程中遇到的问题和调优的经验，都可以分类沉淀到docs/下面的文档里（使用中文，且不同的问题开新的文档写，文档要整理好）。
 
+每次的进度都持久化到HANDOFF.md文档里，方便之后新开session之后能继续接手。
+

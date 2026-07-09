@@ -72,6 +72,31 @@ void entry(const at::Tensor &inputs, const at::Tensor &weights, at::Tensor &outp
     kernel<<<sm, gemm_config::NUM_THREADS, smem, stream>>>(G);
     CUDACHECK(cudaGetLastError());
 }
+// DEBUG (docs/11 T1): identical to entry() but launches an explicit num_blocks
+// grid instead of the full SM count. Used to isolate the "16 SMs yielded to comm"
+// cost — running the same W2 GEMM at 94 blocks vs 110 blocks with nothing else
+// changed. No comm, no epilogue: pure GEMM SM-yield measurement.
+void entry_nb(const at::Tensor &inputs, const at::Tensor &weights, at::Tensor &outputs,
+              const at::Tensor &padded_tokens_per_expert, const int expert_offset,
+              const int num_blocks) {
+    TORCH_CHECK(inputs.size(0) % gemm_config::ROW_BLOCK == 0, "tokens % 128");
+    TORCH_CHECK(inputs.size(1) % gemm_config::RED_BLOCK == 0, "K % 64");
+    TORCH_CHECK(weights.size(2) % gemm_config::COL_BLOCK == 0, "N % 128");
+    TORCH_CHECK(num_blocks >= 1, "num_blocks must be >= 1");
+    globals G {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(inputs),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = static_cast<int>(weights.size(0)),
+        .expert_offset = expert_offset
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel<<<num_blocks, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
 } // namespace gg
 
 /* ===================================================================== *
@@ -776,12 +801,51 @@ void entry(at::Tensor &activations, at::Tensor &weights,
     reset_kernel<<<rb, 256, 0, stream>>>(G);
     CUDACHECK(cudaGetLastError());
 }
+
+// DEBUG (docs/11 T1): run ONLY the combine (gather+reduce) blocks, one per source
+// token, with NO GEMM. Callers pass a combine_seq that the barrier ALREADY holds
+// (from a prior full fused run on the same expert_outputs), so every wait_slot
+// returns immediately and this measures the PURE cross-card gather+reduce cost
+// (8 peer rows × 14KB per token) with zero GEMM and zero signal-wait — isolating
+// combine bandwidth from HOL-wait in the layer1 tail.
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void combine_only_kernel(const __grid_constant__ globals G) {
+    combine(G, blockIdx.x);
+}
+void combine_only_entry(at::Tensor &activations, at::Tensor &weights,
+           kittens::py::TKParallelTensor &expert_outputs, at::Tensor &padded_tokens_per_expert,
+           at::Tensor &combine_out, at::Tensor &combine_indices, at::Tensor &combine_weights,
+           kittens::py::TKParallelTensor &barrier, const int num_comm_sms,
+           const int num_padded_local, const int num_source_tokens, const int combine_seq) {
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0)) / globals::NUM_DEVICES;
+    globals G {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(activations),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::output_gl>(expert_outputs.data_),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = num_local_experts, .expert_offset = dev_idx * num_local_experts,
+        .expert_outputs = kittens::py::parallel_tensor_to_pgl<globals::expert_out_pgl>(expert_outputs),
+        .combine_out = kittens::py::tensor_to_gl<globals::combine_out_gl>(combine_out),
+        .combine_indices = kittens::py::tensor_to_gl<globals::combine_idx_gl>(combine_indices),
+        .combine_weights = kittens::py::tensor_to_gl<globals::combine_w_gl>(combine_weights),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_padded_local_tokens = num_padded_local,
+        .num_source_tokens = num_source_tokens, .num_comp_sms = 0, .combine_seq = combine_seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(combine_only_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    combine_only_kernel<<<num_source_tokens, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
 } // namespace comb
 
 #include <torch/csrc/utils/pybind.h>
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_TK_PARALLEL_TENSOR(m);
     m.def("grouped_gemm", &gg::entry);
+    m.def("grouped_gemm_nb", &gg::entry_nb);
     m.def("moe_dispatch_gemm", &disp::entry);
     m.def("moe_dispatch_push", &dpush::entry);
     m.def("moe_dispatch_push_only", &dpush::push_only_entry);
@@ -790,4 +854,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_dispatch_push3_only", &dpush3::push3_only_entry);
     m.def("pcie_device_barrier", &disp::barrier_entry);
     m.def("moe_gemm_combine_fused", &comb::entry);
+    m.def("moe_combine_only", &comb::combine_only_entry);
 }
