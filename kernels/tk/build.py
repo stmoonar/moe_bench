@@ -24,7 +24,7 @@ def _nvcc_flags():
     return inc, lib
 
 
-def build_and_load(world_size: int, hidden: int = 7168, module_name: str = "tk_moe",
+def build_and_load(world_size: int, hidden: int = 4096, module_name: str = "tk_moe",
                    row_block: int = 128):
     build_dir = os.path.join(_HERE, "build")
     os.makedirs(build_dir, exist_ok=True)

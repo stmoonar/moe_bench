@@ -80,10 +80,10 @@ class MoEBenchConfig:
     mode and ``world_size`` (see :mod:`moe_bench.data`).
     """
 
-    # ---- Model / weight shape (defaults: DeepSeek V3.2) ----
-    hidden_size: int = 7168
-    intermediate_size: int = 2048
-    num_experts: int = 256
+    # ---- Model / weight shape (defaults: E=64, hidden=4096, gate_up=6144) ----
+    hidden_size: int = 4096
+    intermediate_size: int = 3072  # gate_up = 2 * intermediate = 6144
+    num_experts: int = 64
     topk: int = 8
 
     # ---- Parallelism ----

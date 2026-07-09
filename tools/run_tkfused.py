@@ -15,13 +15,13 @@ from moe_bench.distributed import run_distributed
 
 
 def main():
-    ne = int(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else 256
+    ne = int(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else 64
     verify = "--no-verify" not in sys.argv
     biter = 20
     if "--iters" in sys.argv:
         biter = int(sys.argv[sys.argv.index("--iters") + 1])
     cfg = MoEBenchConfig(
-        hidden_size=7168, intermediate_size=2048, num_experts=ne, topk=8,
+        hidden_size=4096, intermediate_size=3072, num_experts=ne, topk=8,
         parallel_mode=ParallelMode.EP, world_size=4, precision=Precision.BF16,
         num_tokens=[512], routing=RoutingConfig(distribution=Distribution.BALANCED),
         distributed=True, warmup_iters=5, bench_iters=biter, use_cuda_graph=False,

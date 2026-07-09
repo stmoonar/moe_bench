@@ -18,12 +18,14 @@ def main():
     dev = torch.device("cuda", 0)
     torch.cuda.set_device(dev)
     from moe_bench.kernels.tk import build as b
-    tk = b.build_and_load(world, hidden=7168)
+    tk = b.build_and_load(world, hidden=4096)
 
-    H, inter = 7168, 2048
-    npl = 8192 if ne == 256 else 4096
+    H, inter = 4096, 3072
     e_local = ne // world
-    per = npl // e_local
+    # per-expert tokens: 512*world*topk / ne, padded up to ROW_BLOCK=128
+    per_real = 512 * world * 8 // ne
+    per = ((per_real + 127) // 128) * 128
+    npl = e_local * per
     padded = torch.full((ne,), per, dtype=torch.int32, device=dev)
     act = torch.randn(npl, inter, dtype=torch.bfloat16, device=dev) * 0.02
     w2 = torch.randn(e_local, inter, H, dtype=torch.bfloat16, device=dev) * 0.02

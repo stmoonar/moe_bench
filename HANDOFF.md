@@ -15,10 +15,18 @@
 
 ## 2. 当前状态(全部已提交,分支 tk_dev)
 
+> **【默认形状已改 2026-07-09】** 默认 shape 现为 **E=64, TOP_K=8, hidden=4096,
+> gate_up=6144(intermediate=3072)**,512 token/rank, bf16 EP world=4(E_local=16,
+> 每专家 ~256 token,padding 少)。config.py / configs/tk_ep_bf16.yaml / 各 tool 默认
+> 已同步。此 shape 下 **tkfused 2331µs vs serial 2903µs = 1.25×**(公平口径,
+> 对拍 rel_err 4.43e-3 ok;`python -m moe_bench.tools.bench_shape_4096` 或
+> `run_tkfused`)。下面 §2 里 NE=256/hidden=7168 的历史数字是旧 shape 的记录,保留备查。
+
 - **正确性**:tkfused 全链路对拍 reference_moe 通过(bf16, EP, 4 卡, rel_err ~4.4e-3)。
-- **性能**(NE=256, 512 token/rank, bf16):tkfused **5832µs vs serial 7063µs**(快 1.21×,
-  **schedule 已 GPU 化并计入 run(),公平口径,星号已去**;T3 前不计时口径为 5603µs;
-  NE=64 3462µs)。
+- **性能(新默认 shape E=64/hidden=4096)**:tkfused **2331µs vs serial 2903µs**(快 1.25×,
+  schedule 已 GPU 化并计入 run,公平口径)。此 shape 每专家 ~256 token,padding 少,
+  默认 RB=128 / dedup off 最优(实测开 dedup/RB=64 反而略慢,符合 T5/T7 结论)。
+- **性能(旧 shape NE=256/hidden=7168,历史记录)**:tkfused 5832µs vs serial 7063µs(1.21×)。
 - **combine 两条路径**:`TK_COMBINE=prered`(默认,T6-v0,docs/13,全档位优于 pull)|
   `pull`(旧 moe_gemm_combine_fused,保留)。
 - **T4 gate+up 合并**:`TK_FUSE_GATEUP=1`(默认,pull dispatch)。

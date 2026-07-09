@@ -46,7 +46,7 @@ def _worker(rank, world, init_method, num_experts, iters, out_list):
     from moe_bench.data import make_problem, make_weights
     from moe_bench.tk_scheme import TKFusedEP
 
-    cfg = MoEBenchConfig(hidden_size=7168, intermediate_size=2048, num_experts=num_experts,
+    cfg = MoEBenchConfig(hidden_size=4096, intermediate_size=3072, num_experts=num_experts,
                          topk=8, parallel_mode=ParallelMode.EP, world_size=world,
                          precision=Precision.BF16, num_tokens=[512], distributed=True,
                          verify=False, device="cuda", seed=0)
