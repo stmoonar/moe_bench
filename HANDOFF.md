@@ -121,4 +121,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/14** | **T3:schedule GPU 化(单 argsort ring-order + 稠密 job 空间)+ CUDA graph 捕获,计入 run() 公平口径** |
 | **docs/15** | **T7:dispatch 去重(稠密 staging,gathered 逐字节等价);揭示 NE=256 dispatch 是 GEMM-bound(账本修正)** |
 | **docs/16** | **T5:ROW_BLOCK=64 编译期开关;揭示 padding 非纯浪费(满效率算),小 tile 效率折损抵消,默认保持 128** |
+| **docs/17** | **通算重叠与融合损失分析:layer0 融合 +30%、layer1 +56% 且通信零重叠(T6-v1 目标)** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
