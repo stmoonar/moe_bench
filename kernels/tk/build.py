@@ -24,10 +24,11 @@ def _nvcc_flags():
     return inc, lib
 
 
-def build_and_load(world_size: int, hidden: int = 7168, module_name: str = "tk_moe"):
+def build_and_load(world_size: int, hidden: int = 7168, module_name: str = "tk_moe",
+                   row_block: int = 128):
     build_dir = os.path.join(_HERE, "build")
     os.makedirs(build_dir, exist_ok=True)
-    mod = f"{module_name}_w{world_size}_h{hidden}"
+    mod = f"{module_name}_w{world_size}_h{hidden}_rb{row_block}"
     so_path = os.path.join(build_dir, f"{mod}.so")
 
     if not os.path.exists(so_path):
@@ -47,6 +48,7 @@ def build_and_load(world_size: int, hidden: int = 7168, module_name: str = "tk_m
             "-D__CUDA_NO_BFLOAT16_CONVERSIONS__", "-D__CUDA_NO_HALF2_OPERATORS__",
             "-DTORCH_API_INCLUDE_EXTENSION_H", f"-DTORCH_EXTENSION_NAME={mod}",
             f"-DTK_NUM_DEVICES={world_size}", f"-DTK_HIDDEN={hidden}",
+            f"-DTK_ROW_BLOCK={row_block}",
             f"-I{_TK_ROOT}/include", f"-I{_TK_ROOT}/prototype",
             *inc, *lib,
             "-ltorch_python", "-ltorch_cuda", "-ltorch_cpu", "-ltorch", "-lc10_cuda", "-lc10",
@@ -64,5 +66,6 @@ def build_and_load(world_size: int, hidden: int = 7168, module_name: str = "tk_m
 if __name__ == "__main__":
     import torch  # noqa
     ws = int(sys.argv[1]) if len(sys.argv) > 1 else 4
-    m = build_and_load(ws)
+    rb = int(sys.argv[2]) if len(sys.argv) > 2 else 128
+    m = build_and_load(ws, row_block=rb)
     print("built & loaded:", [x for x in dir(m) if not x.startswith("__")])

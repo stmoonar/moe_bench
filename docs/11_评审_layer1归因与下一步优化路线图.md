@@ -228,6 +228,13 @@ compute 反超 comm);**与 T5 叠加后 gate+up 计算减半(~1.5ms)完全沉到
 
 ### T5:ROW_BLOCK=64(两层 GEMM 各省 ~35~50% 行,NE=256 最大单项)
 
+> **【已完成 2026-07-09 — 见 docs/16;预期被推翻】** 编译期 `TK_ROW_BLOCK` 开关落地,全档位
+> 正确(WG=4 store 映射退化为恒等,规避 docs/05 坑)。**但"−1.5ms"预期错**:padding 行本以
+> 满效率 143 TFLOP/s 计算,去掉后 npl=4096 落进小 tile 低效区 75 TFLOP/s,W2 GEMM 时间
+> 几乎不变(1683→1609µs)。RB=64 仅 NE=256 净赢 ~260µs(来自非 GEMM 段),NE≤128 反而
+> 变慢(小 tile 低效占上风)。默认保持 128;大收益需 8warp×8行变体(mma 形状改,单独立项)
+> 或 fp8 计算。**账本再修正:padding 2× 行在以满速算,减 padding ≠ 减时间。**
+
 **现状证据**:§0.1(b)。NE=256 每专家均值 64 真 token padding 到 128,GEMM 算 2× 的行;
 docs/07 #4 已论证 tile 64×128 warp mma 无障碍。
 

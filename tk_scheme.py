@@ -24,7 +24,12 @@ from .context import DistContext
 from .data import MoEProblem
 from .schemes import DistributedScheme
 
-ROW_BLOCK = 128
+import os as _os_rb
+# T5 (docs/16): ROW_BLOCK is the tokens-per-tile AND expert padding unit, switchable
+# via TK_ROW_BLOCK ∈ {128 (default), 64}. At 64 the per-expert padding halves
+# (NE=256: 64 real tokens no longer pad to 128) so both GEMM layers compute ~half
+# the rows. Must match the compiled kernel's TK_ROW_BLOCK (build_and_load below).
+ROW_BLOCK = int(_os_rb.environ.get("TK_ROW_BLOCK", "128"))
 
 
 def _build_schedules(topk_ids, num_tokens, world_size, num_experts, num_experts_per_dev,
@@ -392,7 +397,7 @@ class TKFusedEP(DistributedScheme):
         _spec = spec_from_file_location("_tk_build", _build_py)
         _bmod = module_from_spec(_spec)
         _spec.loader.exec_module(_bmod)
-        self.tk = _bmod.build_and_load(world, hidden=H)
+        self.tk = _bmod.build_and_load(world, hidden=H, row_block=ROW_BLOCK)
 
         # schedules (host-side, not timed)
         (disp_idx, comb_idx, padded, num_padded_local,
