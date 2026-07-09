@@ -47,9 +47,9 @@
 | T2 | combine epilogue 换 push3 式选举信号(预期 layer1 −1ms) | **❄️ 冻结(T1 止损:fence 仅 1.2~2.8%,收益 ≤0.05ms)** |
 | T3 | schedule GPU 化并计入 run()(公平性,报数前必须) | **✅ 完成(docs/14):默认路径 6 表 GPU 化 + CUDA graph(~205µs),计入 run();对拍 host golden 全等(NE×{balanced,skewed});e2e NE=256 计入后 5832µs 仍 < serial(1.21×),星号已去** |
 | T4 | gate+up 合并一次 GEMM(up 的 1.5ms 藏进 dispatch) | **✅ 完成(docs/13 §6):NE=256 −204µs、NE=64 −478µs,默认开;T5 后 up 才完全隐藏** |
-| T5 | ROW_BLOCK=64(NE=256 两层 GEMM 各省一半行) | 未开始(**后移到 T6 之后**,docs/11 §3) |
+| T5 | ROW_BLOCK=64(NE=256 两层 GEMM 各省一半行) | 未开始(**下一主攻**:T7 揭示 NE=256 dispatch 也 GEMM-bound,减 padding 直接砍两层 GEMM 且让 T7 去重在 NE=256 生效,docs/15) |
 | T6 | combine 预归约 + push 化(A' 镜像,layer1 通信 4×) | **⬆️ 主攻,v0 ✅ 落地达标:NE=256 e2e 7131→5775µs(首超 serial 7063),NE∈{64,128,256} 对拍全过 rel~7e-3,prered 设默认(docs/13 §5);下一步 v1 push 化** |
-| T7 | dispatch (token,dst) 去重 + fp8 传输 | 未开始 |
+| T7 | dispatch (token,dst) 去重 + fp8 传输 | **去重✅(docs/15):v0 落地默认关(TK_DEDUP=1);NE≤128 大赢(e2e NE=64 −0.47ms),NE=256 无收益因 dispatch 实为 GEMM-bound(账本修正);与 T5 协同后 NE=256 生效。fp8 未做** |
 | T8 | push3 目的块重排 + 水位信号(NE=256 翻盘后设默认) | 未开始 |
 | T9 | 杂项:AGENTS.md 口径、skewed 测试、comm_sms 扫参、probe 增强 | 未开始 |
 
@@ -101,4 +101,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/12** | **T1 归因实测:layer1 慢在 combine gather(94~99%),非 fusion;T2 冻结→T6** |
 | **docs/13** | **T6-v0:combine 预归约 host 表设计(按 expert 卡重分组,等价)+ 双向对账工具 + kernel 落地 + T4 gate+up 合并** |
 | **docs/14** | **T3:schedule GPU 化(单 argsort ring-order + 稠密 job 空间)+ CUDA graph 捕获,计入 run() 公平口径** |
+| **docs/15** | **T7:dispatch 去重(稠密 staging,gathered 逐字节等价);揭示 NE=256 dispatch 是 GEMM-bound(账本修正)** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

@@ -148,6 +148,42 @@ def _build_schedules(topk_ids, num_tokens, world_size, num_experts, num_experts_
             torch.tensor(dst_blk_offset, dtype=torch.int32, device=device), total_dst_blocks)
 
 
+def _derive_staging(disp_idx, num_tokens, world_size, slot_to_staging=None,
+                    staging_needed=None):
+    """T7 (docs/15): dedup tables, pure functions of disp_idx (so they inherit
+    its verified correctness AND the GPU builder's graph-capturability).
+
+    DENSE staging layout: staging_row(src_dev, src_tok) = src_dev*num_tokens +
+    src_tok, capacity S_max = world*num_tokens (routing-invariant). Two tables:
+      slot_to_staging (num_padded_local,) int32 : gathered slot -> its staging
+        row (-1 for padding slots, preserving the count-but-no-data behavior);
+      staging_needed  (S_max,) int32 : 1 iff some local slot references that dense
+        row (the unique cross-card pull list — the pull kernel skips 0 rows).
+    Writes in place when out tensors are given (capture-safe: scatter_, no
+    bincount); else allocates. Returns (slot_to_staging, staging_needed, S_max).
+    """
+    device = disp_idx.device
+    P = disp_idx.shape[0]
+    S_max = world_size * num_tokens
+    if slot_to_staging is None:
+        slot_to_staging = torch.full((P,), -1, dtype=torch.int32, device=device)
+    if staging_needed is None:
+        staging_needed = torch.zeros(S_max, dtype=torch.int32, device=device)
+    sd = disp_idx[:, 0].long()
+    st = disp_idx[:, 1].long()
+    mask = sd >= 0
+    row = torch.where(mask, sd * num_tokens + st, torch.full_like(sd, -1))
+    slot_to_staging.copy_(row.to(torch.int32))
+    staging_needed.zero_()
+    # scatter a 1 into every referenced dense row (padding rows map to -1 -> use a
+    # trash slot S_max then drop, keeping this fixed-shape / capture-safe).
+    row_dst = torch.where(mask, row, torch.full_like(row, S_max))
+    tmp = torch.zeros(S_max + 1, dtype=torch.int32, device=device)
+    tmp.scatter_(0, row_dst, torch.ones_like(row_dst, dtype=torch.int32))
+    staging_needed.copy_(tmp[:S_max])
+    return slot_to_staging, staging_needed, S_max
+
+
 def _build_prereduce_schedule(topk_ids, topk_weights, num_tokens, world_size,
                               num_experts, num_experts_per_dev, rank, device):
     """T6-v0 pre-reduction schedule (docs/13). Regroups the combine sum
@@ -304,6 +340,11 @@ def _build_schedules_gpu(all_topk, all_w, world_size, num_experts,
     di[:, 1].scatter_(0, slot_dst, out["src_tok_grid"][order].to(torch.int32))
     out["disp_idx"].copy_(di[:P])
 
+    # ---- T7 dedup tables (derived from disp_idx) ----
+    if "slot_to_staging" in out:
+        _derive_staging(out["disp_idx"], T, world_size,
+                        out["slot_to_staging"], out["staging_needed"])
+
     # ---- prered (DENSE job space, column = kpos): the flat cell of prered_slots
     # for assignment n is (src_dev*T + src_tok)*top_k + kpos == n (the original
     # flat index). So scatter each sorted local assignment's slot back to its
@@ -417,6 +458,22 @@ class TKFusedEP(DistributedScheme):
         if self.dispatch_mode != "pull":
             self.fuse_gateup = False
 
+        # T7 (docs/15): dedup dispatch — pull each unique (src_dev,src_tok) once
+        # cross-card into staging, then local scatter to the gathered slots
+        # (measured ~7.2× fewer cross-card pulls at NE=256). BUT dispatch at NE=256
+        # is GEMM-bound (gate GEMM ~1.7ms > hidden comm), so dedup only helps where
+        # comm is exposed: NE≤128 dispatch-only 2.0ms→~1.1ms (e2e NE=64 −0.47ms);
+        # NE=256 neutral/slightly negative (lost fusion overlap). Pairs with T5:
+        # once ROW_BLOCK=64 halves the padding/GEMM, NE=256 comm re-exposes and
+        # dedup wins there too. DEFAULT OFF (prod point is NE=256); TK_DEDUP=1 on.
+        self.dedup_dispatch = (_os.environ.get("TK_DEDUP", "0") == "1"
+                               and self.dispatch_mode == "pull")
+        if self.dedup_dispatch:
+            s2s, need, s_max = _derive_staging(disp_idx, num_tokens, world)
+            self.slot_to_staging = s2s.contiguous()
+            self.staging_needed = need.contiguous()
+            self.staging_s_max = s_max
+
         # T6-v0 pre-reduction schedule (docs/13). Built regardless of combine_mode
         # (host-side, not timed); only consumed when combine_mode == "prered".
         (prered_dst, prered_slots, prered_w, num_jobs, final_contrib) = \
@@ -464,6 +521,9 @@ class TKFusedEP(DistributedScheme):
                 "prered_dst": self.prered_dst, "prered_slots": self.prered_slots,
                 "prered_w": self.prered_w, "final_contrib": self.final_contrib,
             }
+            if self.dedup_dispatch:  # rebuild dedup tables in the timed builder too
+                self._sched_out["slot_to_staging"] = self.slot_to_staging
+                self._sched_out["staging_needed"] = self.staging_needed
             self._sched_graph = None  # captured lazily on first run()
 
         # weights: problem.w1 (E_local, 2*inter, H) is [gate; up] stored for x@w.T.
@@ -527,6 +587,13 @@ class TKFusedEP(DistributedScheme):
             self.partials = TK((world * num_tokens, H), dtype=torch.bfloat16,
                                local_rank=lr, local_world_size=lws, multicast=False)
             self.partials.data_.zero_()
+
+        # T7 (docs/15) staging: LOCAL (world*num_tokens, H) bf16 = 28MB. Holds one
+        # copy of each pulled unique source token; the scatter then copies each to
+        # its gathered slots. Local-only (no peer touches it) -> plain tensor, no pgl.
+        if self.dedup_dispatch:
+            self.staging = torch.zeros(world * num_tokens, H, device=device,
+                                       dtype=torch.bfloat16)
 
         self.num_comm_sms = 16
         self._l0_seq = 0
@@ -618,9 +685,18 @@ class TKFusedEP(DistributedScheme):
             # one pass (w_gateup / gateup_out, N doubled). Otherwise gate only.
             gw = self.w_gateup if self.fuse_gateup else self.w_gate
             go = self.gateup_out if self.fuse_gateup else self.gate_out
-            tk.moe_dispatch_gemm(self.pre_tokens, self.gathered.data_, gw, go,
-                                 self.padded, self.disp_idx, self.barrier_l0,
-                                 self.num_comm_sms, self.num_padded_local)
+            if self.dedup_dispatch:
+                # T7 (docs/15): pull unique source tokens to staging then local
+                # scatter ⊕ gate GEMM — same gathered bytes, ~7× less cross-card.
+                tk.moe_dispatch_dedup(self.pre_tokens, self.staging, self.gathered.data_,
+                                      gw, go, self.padded, self.slot_to_staging,
+                                      self.staging_needed, self.barrier_l0,
+                                      self.num_comm_sms, self.num_padded_local,
+                                      self.num_tokens)
+            else:
+                tk.moe_dispatch_gemm(self.pre_tokens, self.gathered.data_, gw, go,
+                                     self.padded, self.disp_idx, self.barrier_l0,
+                                     self.num_comm_sms, self.num_padded_local)
 
         if self.fuse_gateup and self.dispatch_mode == "pull":
             # gate = gateup_out[:, :inter], up = gateup_out[:, inter:]; up compute

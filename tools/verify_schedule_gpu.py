@@ -61,6 +61,8 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
         topk_ids, T, world, ne, e_local, rank, device)
     (pdst_g, pslots_g, pw_g, J_g, contrib_g) = _build_prereduce_schedule(
         topk_ids, topk_weights, T, world, ne, e_local, rank, device)
+    from moe_bench.tk_scheme import _derive_staging
+    s2s_g, need_g, s_max = _derive_staging(disp_g, T, world)
 
     # ---- GPU builder into pre-allocated tables ----
     N = world * T * topk
@@ -79,6 +81,8 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
         "prered_slots": torch.full((max(J_g, 1), topk), -1, dtype=torch.int32, device=device),
         "prered_w": torch.zeros((max(J_g, 1), topk), dtype=torch.float32, device=device),
         "final_contrib": torch.zeros(T, world, dtype=torch.int32, device=device),
+        "slot_to_staging": torch.full((npl_g,), -1, dtype=torch.int32, device=device),
+        "staging_needed": torch.zeros(s_max, dtype=torch.int32, device=device),
     }
     npl_gpu, J_gpu = _build_schedules_gpu(all_ids, all_w, world, ne, e_local, rank, out)
 
@@ -93,6 +97,8 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
         ("prered_dst", out["prered_dst"], pdst_g),
         ("prered_slots", out["prered_slots"], pslots_g),
         ("final_contrib", out["final_contrib"], contrib_g),
+        ("slot_to_staging", out["slot_to_staging"], s2s_g),
+        ("staging_needed", out["staging_needed"], need_g),
     ]
     for name, got, ref in checks:
         if got.shape != ref.shape:

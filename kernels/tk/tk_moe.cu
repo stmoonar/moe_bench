@@ -226,6 +226,169 @@ void barrier_entry(kittens::py::TKParallelTensor &barrier, const int seq) {
 } // namespace disp
 
 /* ===================================================================== *
+ * 2b. Dedup dispatch ⊕ gate GEMM (layer0, T7-v0; docs/15). Same result as
+ *     disp:: pull, but the cross-card TMA happens ONCE per unique source token
+ *     (measured ~7.2× fewer at NE=256) instead of once per gathered slot:
+ *       kernel 1 (pull_unique): pull the ~S unique (src_dev,src_tok) rows into
+ *         a LOCAL staging buffer (the only cross-card traffic);
+ *       [same-stream kernel boundary = the publish barrier]
+ *       kernel 2 (kernel): local staging->gathered scatter per slot + the SAME
+ *         per-row-block red.add counter, fused with the gate GEMM exactly as
+ *         disp::. gathered ends byte-identical to the pull path.
+ * ===================================================================== */
+namespace ddisp {
+struct globals {
+    using cfg = gemm_config;
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    using token_vec = sv_bf<H>;
+    static constexpr int TOKENS_PER_BLOCK = cfg::DYNAMIC_SHARED_MEMORY / sizeof(token_vec);
+    using pre_tokens_pgl  = pgl<gl<bf16, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
+    using staging_gl      = gl<bf16, 1, 1, -1, H, token_vec, cfg::A_tile>;
+    using post_tokens_gl  = gl<bf16, 1, 1, -1, H, token_vec, cfg::A_tile>;
+    using weights_gl      = gl<bf16, 1, -1, -1, -1, cfg::B_tile>;
+    using outputs_gl      = gl<bf16, 1, 1, -1, -1>;
+    using counts_gl       = gl<int, 1, 1, 1, -1>;
+    using s2s_gl          = gl<int, 1, 1, 1, -1>;   // slot_to_staging (P,)
+    using need_gl         = gl<int, 1, 1, 1, -1>;   // staging_needed (S_max,)
+    using barrier_pgl     = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    pre_tokens_pgl pre_tokens;
+    staging_gl staging;
+    post_tokens_gl activations;
+    weights_gl weights;
+    outputs_gl outputs;
+    counts_gl padded_tokens_per_expert;
+    s2s_gl slot_to_staging;
+    need_gl staging_needed;
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int num_local_experts;
+    const int expert_offset;
+    const int num_padded_local_tokens;
+    const int num_tokens;      // per-card source tokens (dense staging stride)
+    const int s_max;           // world * num_tokens
+    const int num_comp_sms;
+};
+// kernel 1: pull each NEEDED unique dense row (src_dev*num_tokens + src_tok)
+// cross-card into local staging. One thread per row-block lane, like disp.
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void pull_unique_kernel(const __grid_constant__ globals G) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::token_vec (&token)[globals::TOKENS_PER_BLOCK] =
+        al.allocate<typename globals::token_vec, globals::TOKENS_PER_BLOCK>();
+    __shared__ semaphore token_arrived[globals::TOKENS_PER_BLOCK];
+    const int lane_id = threadIdx.x;
+    if (lane_id < globals::TOKENS_PER_BLOCK) {
+        const int d = blockIdx.x * globals::TOKENS_PER_BLOCK + lane_id;
+        if (d < G.s_max && G.staging_needed[{d}] != 0) {
+            const int src_dev = d / G.num_tokens;
+            const int src_tok = d % G.num_tokens;
+            init_semaphore(token_arrived[lane_id], 0, 1);
+            tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
+            tma::load_async(token[lane_id], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[lane_id]);
+            wait(token_arrived[lane_id], 0);
+            tma::store_async(G.staging, token[lane_id], {d, 0});
+            tma::store_async_wait();  // staging row complete before kernel exit
+        }
+    }
+}
+// kernel 2 comm block: local staging->gathered copy + row-block counter bump.
+__device__ inline void scatter(const globals &G, const int sm_idx) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::token_vec (&token)[globals::TOKENS_PER_BLOCK] =
+        al.allocate<typename globals::token_vec, globals::TOKENS_PER_BLOCK>();
+    __shared__ semaphore token_arrived[globals::TOKENS_PER_BLOCK];
+    const int lane_id = threadIdx.x;
+    if (lane_id < globals::TOKENS_PER_BLOCK) {
+        const int token_idx = sm_idx * globals::TOKENS_PER_BLOCK + lane_id;
+        if (token_idx < G.num_padded_local_tokens) {
+            const int s = G.slot_to_staging[{token_idx}];
+            if (s >= 0) {
+                init_semaphore(token_arrived[lane_id], 0, 1);
+                tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
+                tma::load_async(token[lane_id], G.staging, {s, 0}, token_arrived[lane_id]);
+                wait(token_arrived[lane_id], 0);
+                tma::store_async(G.activations, token[lane_id], {token_idx, 0});
+                tma::store_async_wait();
+            }
+            asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
+                         :: "l"(&G.barrier[G.dev_idx][{token_idx / gemm_config::ROW_BLOCK}]), "r"(1) : "memory");
+        }
+    }
+}
+struct dispatch_gate {
+    const globals &G;
+    __device__ inline void operator()(int row_idx) const {
+        int v;
+        asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        while (v != gemm_config::ROW_BLOCK) {
+            __nanosleep(32);
+            asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        }
+    }
+};
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void kernel(const __grid_constant__ globals G) {
+    if (blockIdx.x < G.num_comp_sms)
+        grouped_gemm_sm120(G, dispatch_gate{G}, blockIdx.x, G.num_comp_sms);
+    else
+        scatter(G, blockIdx.x - G.num_comp_sms);
+}
+__global__ __launch_bounds__(256)
+void reset_kernel(const __grid_constant__ globals G) {
+    const int nb = (G.num_padded_local_tokens + gemm_config::ROW_BLOCK - 1) / gemm_config::ROW_BLOCK;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < nb; i += gridDim.x * blockDim.x)
+        G.barrier[G.dev_idx][{i}] = 0;
+}
+void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &staging,
+           at::Tensor &post_tokens, at::Tensor &weights, at::Tensor &outputs,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &slot_to_staging,
+           at::Tensor &staging_needed, kittens::py::TKParallelTensor &barrier,
+           const int num_comm_sms, const int num_padded_local_tokens,
+           const int num_tokens) {
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0)) / globals::NUM_DEVICES;
+    TORCH_CHECK(weights.size(0) == num_local_experts,
+                "weights first dim must equal local expert count (NUM_GPUS mismatch?)");
+    TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms must be >= 1 (deadlock otherwise)");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
+    const int num_comp_sms = sm - num_comm_sms;
+    const int s_max = static_cast<int>(staging_needed.size(0));
+    globals G {
+        .pre_tokens = kittens::py::parallel_tensor_to_pgl<globals::pre_tokens_pgl>(pre_tokens),
+        .staging = kittens::py::tensor_to_gl<globals::staging_gl>(staging),
+        .activations = kittens::py::tensor_to_gl<globals::post_tokens_gl>(post_tokens),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .slot_to_staging = kittens::py::tensor_to_gl<globals::s2s_gl>(slot_to_staging),
+        .staging_needed = kittens::py::tensor_to_gl<globals::need_gl>(staging_needed),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_local_experts = num_local_experts,
+        .expert_offset = dev_idx * num_local_experts,
+        .num_padded_local_tokens = num_padded_local_tokens, .num_tokens = num_tokens,
+        .s_max = s_max, .num_comp_sms = num_comp_sms
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    const int pull_blocks = (s_max + globals::TOKENS_PER_BLOCK - 1) / globals::TOKENS_PER_BLOCK;
+    CUDACHECK(cudaFuncSetAttribute(pull_unique_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    pull_unique_kernel<<<pull_blocks, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+    const int scatter_blocks = (num_padded_local_tokens + globals::TOKENS_PER_BLOCK - 1) / globals::TOKENS_PER_BLOCK;
+    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel<<<num_comp_sms + scatter_blocks, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / gemm_config::ROW_BLOCK + 255) / 256 + 1;
+    reset_kernel<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace ddisp
+
+/* ===================================================================== *
  * 2b. Dispatch via source-side PUSH ⊕ grouped GEMM (layer0, optimization #1).
  *
  * Reverses 2's pull. Each card is both a SOURCE (pushes its own tokens out to
@@ -1077,6 +1240,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_gemm", &gg::entry);
     m.def("grouped_gemm_nb", &gg::entry_nb);
     m.def("moe_dispatch_gemm", &disp::entry);
+    m.def("moe_dispatch_dedup", &ddisp::entry);
     m.def("moe_dispatch_push", &dpush::entry);
     m.def("moe_dispatch_push_only", &dpush::push_only_entry);
     m.def("moe_push_data", &dpush::push_data_entry);

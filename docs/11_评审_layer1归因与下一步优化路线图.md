@@ -305,6 +305,14 @@ push3 R1 同款(TMA bulk 写 + 选举信号),验证方法直接搬。若正确�
 
 ### T7:dispatch (token,dst) 去重 + FP8 传输(dispatch 2.0 → ~0.5ms)
 
+> **【去重部分已完成 2026-07-09 — 见 docs/15;账本修正】** 去重 v0 落地(namespace
+> ddisp,稠密 staging,gathered 逐字节等价)。**实测推翻本节"dispatch comm-bound"前提**:
+> NE=256 dispatch 是 **GEMM-bound**(gate GEMM ~1.7ms > 被掩盖的通信),去重 7.2× 减通信
+> 却零 e2e 收益;NE≤128 通信裸露,去重 dispatch-only 2.0→~1.1ms(e2e NE=64 −0.47ms)。
+> **默认关**(prod NE=256 无收益),`TK_DEDUP=1` 在 NE≤128 大赢。**与 T5 协同**:ROW_BLOCK=64
+> 减半 npl/GEMM 后 NE=256 通信重新裸露,去重届时也赢。fp8 传输部分未做(对 compute-bound
+> 的 dispatch 帮助有限;fp8 计算才砍 GEMM,归入精度切换线)。
+
 **现状证据**:docs/07 P3/#2。每卡 assignments≈4096 而 unique 源 token≈1800,
 去重省 ~2.2×;fp8 再省 2×,两者正交,且 serial 的 NCCL 通信恒为 bf16,
 这是对 serial-fp8 的单方面优势。

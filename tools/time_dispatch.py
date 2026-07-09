@@ -49,9 +49,16 @@ def _dispatch_once(sch, tk):
         tk.grouped_gemm(sch.gathered.data_, sch.w_gate, sch.gate_out, sch.padded,
                         sch.ctx.rank * sch.problem.config.num_local_experts)
     else:  # pull
-        tk.moe_dispatch_gemm(sch.pre_tokens, sch.gathered.data_, sch.w_gate, sch.gate_out,
-                             sch.padded, sch.disp_idx, sch.barrier_l0,
-                             sch.num_comm_sms, sch.num_padded_local)
+        if getattr(sch, "dedup_dispatch", False):
+            tk.moe_dispatch_dedup(sch.pre_tokens, sch.staging, sch.gathered.data_,
+                                  sch.w_gate, sch.gate_out, sch.padded,
+                                  sch.slot_to_staging, sch.staging_needed,
+                                  sch.barrier_l0, sch.num_comm_sms,
+                                  sch.num_padded_local, sch.num_tokens)
+        else:
+            tk.moe_dispatch_gemm(sch.pre_tokens, sch.gathered.data_, sch.w_gate, sch.gate_out,
+                                 sch.padded, sch.disp_idx, sch.barrier_l0,
+                                 sch.num_comm_sms, sch.num_padded_local)
 
 
 def _worker(rank, world, init_method, ne, warmup, iters, out_list):
