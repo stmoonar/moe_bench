@@ -101,3 +101,49 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 python -m moe_bench.tools.reconcile_prereduce
    的 host 表。预期 combine 尾减半(docs/11 总账 ~6.2ms)。
 2. **v1**:数据面反转为 expert 侧 TMA push + 水位信号(dpush3 骨架镜像,内存序链 =
    push3 R1 同款,`validate_push3` 方法论直接搬);治好 docs/12 的"零重叠"病。
+
+---
+
+## 5. T6-v0 kernel 落地实测(2026-07-09,✅ 达标且超预期)
+
+**实现**(`kernels/tk/tk_moe.cu` namespace `prered`,`tk_scheme.py` `TK_COMBINE`):
+
+- `moe_gemm_prered_fused`:W2 GEMM ⊕ **本地**预归约,单 kernel 同 grid 两类 block:
+  - GEMM block(`num_comp_sms` 个):照常算 W2 写本地 `expert_out`,epilogue 改为
+    **本地**完成信号——每 row block 选举一次(`atom.acq_rel.gpu`),满额者
+    `st.release.gpu` 写 `barrier_l1[1][rb]=seq`。**只用 `__threadfence()`(gpu scope),
+    不用 `fence.sys`**——job block 同卡,跨卡步骤挪到了后面独立的 barrier;
+  - job block(`num_jobs` 个):每个 job 等它命中的 slot 所在 row block 的本地信号,
+    把本卡命中 (src_dev,src_tok) 的 ≤TOP_K 条本地行 **FP32 加权求和**成一行,写
+    peer-readable `partials[dev][src_dev*nt+src_tok]`。
+- `pcie_device_barrier`(复用已验证 push2 的 `pcie_barrier_all`,走 `barrier_l0`,
+  与 l1 不同张量无冲突):让所有卡的 partial 对系统可见。**零新协议**。
+- `moe_final_reduce`:源卡每 token 一个 block,按 `final_contrib[t][d]` 加 ≤world 个
+  `partials[d][rank*nt+t]`(权重已在 expert 侧乘,这里纯求和)→ `combine_out`。
+
+**正确性**(`tools/validate_prered.py`,4 卡):以已验证 pull combine 为 golden,
+prered 全链路 30 迭代对比 `combine_out`:
+- **NE∈{64,128,256} 全过 total_failures=0**,max_rel_err **6.9~7.1e-3**
+  (比 pull 基线 4.3e-3 多一次 bf16 舍入:FP32 partial→bf16→FP32 终和,符合预期);
+- `run_tkfused` 全链路对拍 reference_moe:prered rel_err **4.42e-3 ok**(pull 4.27e-3)。
+
+**性能**(4 卡 9,11,13,15,512 token/rank,e2e):
+
+| NE | pull(旧) | **prered(T6-v0)** | serial | 说明 |
+|---|---|---|---|---|
+| 64  | 5089µs | **3712µs** (−1377) | — | run_tkfused |
+| 256 | 7131µs | **5775µs** (−1356) | 7063µs | bench,**首次超过 serial** |
+
+NE=256 e2e 7131→5775µs(**−1356µs**),**优于 docs/11 总账 ~6.2ms 的预期**,且
+tkfused 首次打过 serial(5775 vs 7063)。**prered 全档位严格优于 pull**(不像 push3 有
+NE 交叉点——预归约只减字节、无 ∝ 行块数的协议开销),故**设为默认**(`TK_COMBINE=prered`);
+`TK_COMBINE=pull` 保留旧路径。
+
+**为什么 v0(仍 pull 数据面)已经拿到这么多**:docs/12 实测 combine 尾 1838µs 是
+per-(token,expert) 逐行跨卡 gather 58.7MB @ ~32GB/s。预归约把它降到 unique(token,卡)
+≈1800 行:(a) expert 卡本地把命中同 token 的多条行先加成一行,跨卡搬运量 44MB→~25MB;
+(b) 更关键——**终归约每 token 只读 ≤world(=4)个 partial 平面,不再逐 expert 各拉一行**,
+且这些 partial 行是 GEMM 完成即就绪、边算边被 barrier 后的 final_reduce 消费,HOL 大幅缓解。
+
+**下一步(v1)**:数据面反转为 expert 侧 TMA push + 水位信号(docs/11 §3),把跨卡 pull
+换成强路径 51GB/s push,并让 partial 就绪即推、贯穿 GEMM,进一步压 combine 尾。

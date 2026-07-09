@@ -295,6 +295,29 @@ class TKFusedEP(DistributedScheme):
         # Correct at all NE. Default stays pull because the prod point is NE=256.
         import os as _os
         self.dispatch_mode = _os.environ.get("TK_DISPATCH", "pull")
+        # combine mode: "prered" (T6-v0, docs/13) is the DEFAULT — combine
+        # pre-reduction. Expert cards FP32-weighted-sum their own hits per
+        # (src,tok) into one partial row (moe_gemm_prered_fused), a barrier
+        # publishes them, and the source card sums the <=world contributing
+        # partial rows (moe_final_reduce). Cuts sent rows 4096 -> ~1800 and the
+        # combine gather (docs/12: 94~99% of layer1 tail); zero NEW cross-card
+        # protocol (reuses the verified push2 barrier). Adjudicated correct at
+        # NE∈{64,128,256} (tools/validate_prered.py, rel_err ~7e-3) and e2e
+        # NE=256 7131->5776µs (beats serial). "pull" (moe_gemm_combine_fused,
+        # source gathers 8 peer rows/token) kept behind TK_COMBINE=pull.
+        self.combine_mode = _os.environ.get("TK_COMBINE", "prered")
+
+        # T6-v0 pre-reduction schedule (docs/13). Built regardless of combine_mode
+        # (host-side, not timed); only consumed when combine_mode == "prered".
+        (prered_dst, prered_slots, prered_w, num_jobs, final_contrib) = \
+            _build_prereduce_schedule(problem.topk_ids, problem.topk_weights,
+                                      num_tokens, world, num_experts, e_local,
+                                      ctx.rank, device)
+        self.prered_dst = prered_dst
+        self.prered_slots = prered_slots
+        self.prered_w = prered_w
+        self.num_jobs = num_jobs
+        self.final_contrib = final_contrib.contiguous()  # (num_tokens, world) int32
 
         # weights: problem.w1 (E_local, 2*inter, H) is [gate; up] stored for x@w.T.
         # grouped_gemm computes x @ W with W as (K, N), so W = w.T:
@@ -339,6 +362,15 @@ class TKFusedEP(DistributedScheme):
         self.up_out = torch.zeros(num_padded_local, inter, device=device, dtype=torch.bfloat16)
         self.act = torch.zeros(num_padded_local, inter, device=device, dtype=torch.bfloat16)
         self.combine_out = torch.zeros(num_tokens, H, device=device, dtype=torch.bfloat16)
+
+        # T6-v0 (docs/13) partial buffer: peer-readable (world, num_tokens, H)
+        # flattened to (world*num_tokens, H). Plane [s*num_tokens + t] holds THIS
+        # card's FP32-weighted pre-reduced contribution to source card s's token t.
+        # Only allocated/used when combine_mode == "prered".
+        if self.combine_mode == "prered":
+            self.partials = TK((world * num_tokens, H), dtype=torch.bfloat16,
+                               local_rank=lr, local_world_size=lws, multicast=False)
+            self.partials.data_.zero_()
 
         self.num_comm_sms = 16
         self._l0_seq = 0
@@ -411,8 +443,27 @@ class TKFusedEP(DistributedScheme):
 
         # layer1: W2 GEMM ⊕ combine
         self._l1_seq += 1
-        tk.moe_gemm_combine_fused(self.act, self.w2, self.expert_out, self.padded,
-                                  self.combine_out, self.comb_idx, self.combine_w,
-                                  self.barrier_l1, self.num_comm_sms,
-                                  self.num_padded_local, self.num_tokens, self._l1_seq)
+        if self.combine_mode == "prered":
+            # T6-v0 (docs/13): W2 GEMM ⊕ LOCAL pre-reduction. Expert cards write
+            # expert_out, then job blocks FP32-weighted-sum their own hits per
+            # (src,tok) into a peer-readable partial row (barrier_l1: row 0 =
+            # per-row-block counter, row 1 = local completion signal). A separate
+            # pcie_device_barrier (barrier_l0, verified push2 publish) makes all
+            # cards' partials system-visible, then moe_final_reduce sums the
+            # <=world contributing partial rows into combine_out. Reset row-0
+            # counters happen inside moe_gemm_prered_fused (reset_kernel).
+            tk.moe_gemm_prered_fused(self.act, self.w2, self.expert_out, self.padded,
+                                     self.partials, self.prered_dst, self.prered_slots,
+                                     self.prered_w, self.barrier_l1, self.num_comm_sms,
+                                     self.num_padded_local, self.num_tokens,
+                                     self.num_jobs, self._l1_seq)
+            self._l0_seq += 1
+            tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)  # all partials published
+            tk.moe_final_reduce(self.partials, self.final_contrib, self.combine_out,
+                                self.barrier_l0, self.num_tokens)
+        else:
+            tk.moe_gemm_combine_fused(self.act, self.w2, self.expert_out, self.padded,
+                                      self.combine_out, self.comb_idx, self.combine_w,
+                                      self.barrier_l1, self.num_comm_sms,
+                                      self.num_padded_local, self.num_tokens, self._l1_seq)
         return self.combine_out

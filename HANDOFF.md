@@ -14,9 +14,12 @@
 
 ## 2. 当前状态(全部已提交,分支 tk_dev)
 
-- **正确性**:tkfused 全链路对拍 reference_moe 通过(bf16, EP, 4 卡, rel_err ~4.3e-3)。
-- **性能**(NE=256, 512 token/rank, bf16):tkfused **7124µs vs serial 7062µs 基本打平**
-  (注意:schedule 预计算未计时,公平性打折,见 docs/07 P1 → 路线图 T3)。
+- **正确性**:tkfused 全链路对拍 reference_moe 通过(bf16, EP, 4 卡, rel_err ~4.4e-3)。
+- **性能**(NE=256, 512 token/rank, bf16):tkfused **5775µs vs serial 7063µs**
+  (**T6-v0 combine 预归约落地,首次超过 serial**;NE=64 3712µs。schedule 预计算未计时,
+  公平性仍打折,见 docs/07 P1 → 路线图 T3)。
+- **combine 两条路径**:`TK_COMBINE=prered`(默认,T6-v0,docs/13,全档位优于 pull)|
+  `pull`(旧 moe_gemm_combine_fused,保留)。
 - **dispatch 三条路径**:`TK_DISPATCH=pull`(默认,已对拍)| `push3`(正确,NE≤128 更快、
   NE=256 更慢,docs/10)| `push`/`push2`(冻结,docs/08)。
 - **代码**:`tk_scheme.py`(scheme + host schedule)、`kernels/tk/tk_moe.cu`(gg/disp/
@@ -25,7 +28,8 @@
 - **工具**:`tools/run_tkfused.py`(对拍)、`time_dispatch.py`(dispatch-only 隔离计时)、
   `time_layer1.py`(T1 layer1 5 点隔离归因)、`ncu_gemm_probe.py`(单卡 ncu)、
   `validate_push3.py` / `verify_push3_schedule.py`(协议裁决)、
-  `reconcile_prereduce.py`(T6-v0 预归约表对账,docs/13)。
+  `reconcile_prereduce.py`(T6-v0 预归约表对账,docs/13)、
+  `validate_prered.py`(T6-v0 全链路正确性:prered vs pull combine,30 迭代 × 3 NE)。
   ⚠️ `time_layer1.py` / `ncu_gemm_probe.py` 及 `tk_moe.cu` 的 T1 debug 入口
   (`gg::entry_nb`、`comb::combine_only_entry`)在服务器侧,**尚未同步入本仓库提交**。
 
@@ -40,7 +44,7 @@
 | T3 | schedule GPU 化并计入 run()(公平性,报数前必须) | 未开始(排 T6 schedule 表定型后、报数前) |
 | T4 | gate+up 合并一次 GEMM(up 的 1.5ms 藏进 dispatch) | 未开始(独立低风险,T6 期间并行小活) |
 | T5 | ROW_BLOCK=64(NE=256 两层 GEMM 各省一半行) | 未开始(**后移到 T6 之后**,docs/11 §3) |
-| T6 | combine 预归约 + push 化(A' 镜像,layer1 通信 4×) | **⬆️ 唯一主攻,进行中:v0 host schedule 预归约表 + 对账工具 ✅(docs/13,NE∈{64,128,256} 对账全过);下一步 v0 kernel(expert 侧预归约+源卡终归约,数据面仍 pull)** |
+| T6 | combine 预归约 + push 化(A' 镜像,layer1 通信 4×) | **⬆️ 主攻,v0 ✅ 落地达标:NE=256 e2e 7131→5775µs(首超 serial 7063),NE∈{64,128,256} 对拍全过 rel~7e-3,prered 设默认(docs/13 §5);下一步 v1 push 化** |
 | T7 | dispatch (token,dst) 去重 + fp8 传输 | 未开始 |
 | T8 | push3 目的块重排 + 水位信号(NE=256 翻盘后设默认) | 未开始 |
 | T9 | 杂项:AGENTS.md 口径、skewed 测试、comm_sms 扫参、probe 增强 | 未开始 |
