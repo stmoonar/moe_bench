@@ -7,11 +7,16 @@ by a cross-device barrier each iteration. Reports max-over-ranks median us.
 
   python -m moe_bench.tools.time_dispatch  <num_experts>  [warmup] [iters]
 
-Honors TK_DISPATCH (pull|push2|push3).
+Honors TK_DISPATCH (pull|push2|push3). Forces TK_FUSE_GATEUP=0 so this isolates
+the gate-only dispatch (the historical baseline for this timer); the fused
+gate+up path (T4) is measured end-to-end via bench.
 """
 from __future__ import annotations
 
 import os
+
+os.environ["TK_FUSE_GATEUP"] = "0"  # isolate gate-only dispatch (see docstring)
+
 import statistics
 import sys
 
