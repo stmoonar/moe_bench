@@ -307,6 +307,21 @@ class TKFusedEP(DistributedScheme):
         # source gathers 8 peer rows/token) kept behind TK_COMBINE=pull.
         self.combine_mode = _os.environ.get("TK_COMBINE", "prered")
 
+        # T4 (docs/11 §T4): fuse gate+up into ONE GEMM. w1 is [gate; up] rows
+        # (E, 2*inter, H), so w1.T = (E, H, 2*inter) with columns [gate | up].
+        # The dispatch⊕GEMM's N doubles (col_blocks derives from weights.cols(),
+        # zero kernel change) so the up projection's compute hides under the
+        # comm-bound dispatch instead of running as an exposed second GEMM.
+        # DEFAULT on (pull dispatch only): NE=256 e2e 5775->5570µs, NE=64
+        # 3712->3227µs, correct (run_tkfused rel_err ~4.3e-3). push* dispatch
+        # modes fall back to the two-GEMM path. TK_FUSE_GATEUP=0 disables.
+        self.fuse_gateup = _os.environ.get("TK_FUSE_GATEUP", "1") == "1"
+        # push* dispatch modes push into w_gate and don't support the doubled-N
+        # fused GEMM; fall back to the two-GEMM path for them (keeps gate/up
+        # weights materialized below and the run() branch consistent).
+        if self.dispatch_mode != "pull":
+            self.fuse_gateup = False
+
         # T6-v0 pre-reduction schedule (docs/13). Built regardless of combine_mode
         # (host-side, not timed); only consumed when combine_mode == "prered".
         (prered_dst, prered_slots, prered_w, num_jobs, final_contrib) = \
@@ -324,9 +339,14 @@ class TKFusedEP(DistributedScheme):
         #   gate/up:  x(.,H) @ (H, inter) -> (., inter)   => W_gate = w1[:, :inter, :].transpose(1,2)
         #   W2:       act(.,inter) @ (inter, H) -> (., H)  => W2 = w2.transpose(1,2)
         w1 = problem.w1  # (E_local, 2*inter, H)
-        self.w_gate = w1[:, :inter, :].transpose(1, 2).contiguous()  # (E_local, H, inter)
-        self.w_up = w1[:, inter:, :].transpose(1, 2).contiguous()    # (E_local, H, inter)
         self.w2 = problem.w2.transpose(1, 2).contiguous()            # (E_local, inter, H)
+        # T4: fused gate+up weight (E_local, H, 2*inter) columns [gate | up]. When
+        # fusing, we don't materialize the separate gate/up copies (saves memory).
+        if self.fuse_gateup:
+            self.w_gateup = w1.transpose(1, 2).contiguous()          # (E_local, H, 2*inter)
+        else:
+            self.w_gate = w1[:, :inter, :].transpose(1, 2).contiguous()  # (E_local, H, inter)
+            self.w_up = w1[:, inter:, :].transpose(1, 2).contiguous()    # (E_local, H, inter)
 
         # padded expert-output max across cards (for pgl uniform sizing)
         num_padded_max = int(padded.reshape(world, e_local).sum(dim=1).amax())
@@ -361,6 +381,10 @@ class TKFusedEP(DistributedScheme):
         self.gate_out = torch.zeros(num_padded_local, inter, device=device, dtype=torch.bfloat16)
         self.up_out = torch.zeros(num_padded_local, inter, device=device, dtype=torch.bfloat16)
         self.act = torch.zeros(num_padded_local, inter, device=device, dtype=torch.bfloat16)
+        # T4: fused gate+up output (padded, 2*inter); halves are [gate | up].
+        if self.fuse_gateup:
+            self.gateup_out = torch.zeros(num_padded_local, 2 * inter, device=device,
+                                          dtype=torch.bfloat16)
         self.combine_out = torch.zeros(num_tokens, H, device=device, dtype=torch.bfloat16)
 
         # T6-v0 (docs/13) partial buffer: peer-readable (world, num_tokens, H)
@@ -431,15 +455,26 @@ class TKFusedEP(DistributedScheme):
                                   self.barrier_l0, self.num_comm_sms, self.num_padded_local,
                                   self.num_push, self._l0_seq)
         else:  # "pull" fallback
-            tk.moe_dispatch_gemm(self.pre_tokens, self.gathered.data_, self.w_gate, self.gate_out,
+            # T4: when fusing gate+up, the dispatch⊕GEMM does BOTH projections in
+            # one pass (w_gateup / gateup_out, N doubled). Otherwise gate only.
+            gw = self.w_gateup if self.fuse_gateup else self.w_gate
+            go = self.gateup_out if self.fuse_gateup else self.gate_out
+            tk.moe_dispatch_gemm(self.pre_tokens, self.gathered.data_, gw, go,
                                  self.padded, self.disp_idx, self.barrier_l0,
                                  self.num_comm_sms, self.num_padded_local)
 
-        # up GEMM on the gathered tokens (local)
-        tk.grouped_gemm(self.gathered.data_, self.w_up, self.up_out, self.padded,
-                        self.ctx.rank * self.problem.config.num_local_experts)
-        # SiLU-mul, in-place into preallocated self.act (allocation-stable)
-        torch.mul(F.silu(self.gate_out), self.up_out, out=self.act)
+        if self.fuse_gateup and self.dispatch_mode == "pull":
+            # gate = gateup_out[:, :inter], up = gateup_out[:, inter:]; up compute
+            # was hidden under the dispatch comm. silu-mul the two halves.
+            inter = self.inter
+            torch.mul(F.silu(self.gateup_out[:, :inter]),
+                      self.gateup_out[:, inter:], out=self.act)
+        else:
+            # up GEMM on the gathered tokens (local)
+            tk.grouped_gemm(self.gathered.data_, self.w_up, self.up_out, self.padded,
+                            self.ctx.rank * self.problem.config.num_local_experts)
+            # SiLU-mul, in-place into preallocated self.act (allocation-stable)
+            torch.mul(F.silu(self.gate_out), self.up_out, out=self.act)
 
         # layer1: W2 GEMM ⊕ combine
         self._l1_seq += 1

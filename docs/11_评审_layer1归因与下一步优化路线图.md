@@ -186,6 +186,14 @@ T9 (工程杂项) —— 穿插
 
 ### T4:gate+up 合并为一次 GEMM + silu·mul epilogue(省 ~0.5ms,叠 T5 后省整段 up)
 
+> **【已完成 2026-07-09 — 见 docs/13 §6】** pull 路径把 gate+up 合并为一次
+> dispatch⊕GEMM(w_gateup = w1.T (E,H,2*inter),N 翻倍,GEMM 模板零改动),up 计算
+> 藏进 comm-bound dispatch,省掉独立 up GEMM。实测 NE=256 e2e 5775→5571µs(−204)、
+> NE=64 3712→3234µs(−478);正确(run_tkfused NE=64/128 rel_err ~4.3e-3 ok)。
+> **默认开启**(`TK_FUSE_GATEUP=1`);push* dispatch 自动回退双 GEMM(它们 push 进 w_gate)。
+> NE=256 收益小于 ~0.5ms 预估(N 翻倍后 dispatch 更偏 compute,up 未完全隐藏),
+> **T5(ROW_BLOCK=64)落地后 up 才完全沉入通信之下**(docs/11 §T4 原预期)。
+
 **现状证据**:§0.1 账本——up GEMM ~1.5ms 裸露串行;`w1` 本来就是 `[gate; up]` 连排
 (E, 2*inter, H),`self.w_gate/self.w_up` 是人为拆开的。
 

@@ -147,3 +147,28 @@ per-(token,expert) 逐行跨卡 gather 58.7MB @ ~32GB/s。预归约把它降到 
 
 **下一步(v1)**:数据面反转为 expert 侧 TMA push + 水位信号(docs/11 §3),把跨卡 pull
 换成强路径 51GB/s push,并让 partial 就绪即推、贯穿 GEMM,进一步压 combine 尾。
+
+---
+
+## 6. T4 gate+up 合并(2026-07-09,穿插小活,✅)
+
+docs/11 §T4。`w1` 本是 `[gate; up]` 连排 (E, 2*inter, H),`w1.transpose(1,2)` 即
+`w_gateup` (E, H, 2*inter),列 `[gate | up]`。pull dispatch⊕GEMM 的 N 从 inter 变 2*inter
+(`col_blocks` 由 `weights.cols()` 派生,**GEMM 模板零改动**),一次 fused GEMM 出
+`gateup_out (padded, 2*inter)`,silu·mul 直接切两半;删掉独立 up `grouped_gemm`。up 的
+计算藏进 comm-bound dispatch。
+
+- **实现**:`tk_scheme.py` `TK_FUSE_GATEUP`(默认 1)。fuse 时只 materialize `w_gateup`
+  (省内存);push* dispatch 自动回退双 GEMM(它们 push 进 w_gate,不支持翻倍 N)。
+- **正确性**:run_tkfused 对拍 reference_moe,NE=64 rel 4.42e-3、NE=128 4.34e-3 ok
+  (NE=256 的 reference dense 路径 OOM,是**既有问题**,非 T4;bench --no-verify NE=256 正常)。
+- **性能累积**(4 卡,512 tok/rank,e2e):
+
+| 里程碑 | NE=64 | NE=256 | vs serial(7063) |
+|---|---|---|---|
+| 原 pull combine | 5089µs | 7131µs | 慢 |
+| + T6-v0 prered | 3712µs | 5775µs | 快 |
+| + T4 fuse gate+up | **3234µs** | **5571µs** | **快 1.27×** |
+
+NE=256 T4 收益 −204µs 小于 ~0.5ms 预估:N 翻倍后 dispatch 偏 compute,up 未完全隐藏——
+**T5(ROW_BLOCK=64)减半 GEMM 行后 up 才完全沉入通信**(docs/11 §T4)。
