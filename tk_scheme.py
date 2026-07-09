@@ -40,6 +40,13 @@ def _build_schedules(topk_ids, num_tokens, world_size, num_experts, num_experts_
       - slack_seed (num_padded_local//ROW_BLOCK,): ROW_BLOCK - (real tokens in
         that row block on THIS card), so push counters start pre-seeded and real
         pushes bring each row block exactly to ROW_BLOCK.
+      - push_cnt_idx (num_tokens*topk, 1): push3 (docs/09) flat LOCAL counter idx
+        for each outgoing assignment = dst_blk_offset[dst_dev] + dst_slot//ROW_BLOCK.
+      - push_expected (total_dst_blocks,): push3 satisfaction count per local
+        counter (real tokens this card sends into that (dst,row block)).
+      - gate_expected (nblk_local, world): push3, this card AS DST — tokens
+        expected from each source card per local row block (gate uses >0 only).
+      - dst_blk_offset (world,), total_dst_blocks: push3 counter geometry.
       - padded_tokens_per_expert (num_experts,), num_padded_local.
     All host-side (torch), done in setup (not timed).
     """
@@ -58,11 +65,28 @@ def _build_schedules(topk_ids, num_tokens, world_size, num_experts, num_experts_
     my_eend = num_experts_per_dev * (rank + 1)
     num_padded_local = int(padded[my_estart:my_eend].sum())
 
+    # push3 (docs/09) row-block geometry: per-device row-block counts + offsets.
+    # A single flat counter array [0, total_dst_blocks) spans EVERY device's
+    # gathered row blocks; dst_blk_offset[d] is where device d's blocks start.
+    padded_per_dev = padded_cpu.reshape(world_size, num_experts_per_dev).sum(dim=1)
+    nblk_per_dev = (padded_per_dev // ROW_BLOCK).long()               # (world,)
+    dst_blk_offset = torch.cat([
+        torch.zeros(1, dtype=torch.int64, device="cpu"),
+        torch.cumsum(nblk_per_dev, dim=0)[:-1]
+    ]).tolist()                                                       # (world,)
+    total_dst_blocks = int(nblk_per_dev.sum())
+    nblk_local = num_padded_local // ROW_BLOCK
+
     top_k = topk_ids.shape[1]
     disp_idx = torch.full((num_padded_local, 2), -1, dtype=torch.int32, device="cpu")
     comb_idx = torch.full((num_tokens * top_k, 2), -1, dtype=torch.int32, device="cpu")
     push_idx = torch.full((num_tokens * top_k, 2), -1, dtype=torch.int32, device="cpu")
     push_src = torch.full((num_tokens * top_k, 1), -1, dtype=torch.int32, device="cpu")
+    # push3: local flat counter index per outgoing assignment (built at the SAME
+    # src_tok*top_k+kpos slot as push_idx/push_src, filtered by the same mask).
+    push_cnt_idx = torch.full((num_tokens * top_k, 1), -1, dtype=torch.int32, device="cpu")
+    # push3: this card AS DST — tokens expected from each source card per local row block.
+    gate_expected = torch.zeros(nblk_local, world_size, dtype=torch.int32, device="cpu")
 
     # replay each expert card's write cursor (ring by source device), exactly the
     # order the dispatch kernel pulls in — so slot ids match on both sides.
@@ -84,12 +108,17 @@ def _build_schedules(topk_ids, num_tokens, world_size, num_experts, num_experts_
                         if e_rank == rank:  # this rank is the expert card -> dispatch entry
                             disp_idx[slot, 0] = src_dev
                             disp_idx[slot, 1] = src_tok
+                            # push3: as DST, count expected arrivals per (local row block, source)
+                            gate_expected[slot // ROW_BLOCK, src_dev] += 1
                         if src_dev == rank:  # this rank is the source card -> combine + push
                             comb_idx[src_tok * top_k + kpos, 0] = e_rank
                             comb_idx[src_tok * top_k + kpos, 1] = slot
                             push_idx[src_tok * top_k + kpos, 0] = e_rank
                             push_idx[src_tok * top_k + kpos, 1] = slot
                             push_src[src_tok * top_k + kpos, 0] = src_tok
+                            # push3: flat local counter for this (dst_dev=e_rank, dst row block)
+                            push_cnt_idx[src_tok * top_k + kpos, 0] = \
+                                dst_blk_offset[e_rank] + slot // ROW_BLOCK
 
     # slack seed: for THIS card's experts, each row block's padding = ROW_BLOCK -
     # (real tokens in that block). Blocks fully inside real region → 0; the tail
@@ -107,8 +136,16 @@ def _build_schedules(topk_ids, num_tokens, world_size, num_experts, num_experts_
             slack[blk] = ROW_BLOCK - real_in_block
             blk += 1
 
+    # push3 expected values (source side): satisfaction count per local flat
+    # counter = number of THIS card's real assignments pointing at it. Built by
+    # bincount over the valid push_cnt_idx entries (padding rows are -1 → dropped).
+    valid_cnt = push_cnt_idx[:, 0][push_cnt_idx[:, 0] >= 0].to(torch.int64)
+    push_expected = torch.bincount(valid_cnt, minlength=total_dst_blocks).to(torch.int32)
+
     return (disp_idx.to(device), comb_idx.to(device), padded.to(device),
-            num_padded_local, push_idx.to(device), push_src.to(device), slack.to(device))
+            num_padded_local, push_idx.to(device), push_src.to(device), slack.to(device),
+            push_cnt_idx.to(device), push_expected.to(device), gate_expected.to(device),
+            torch.tensor(dst_blk_offset, dtype=torch.int32, device=device), total_dst_blocks)
 
 
 class TKFusedEP(DistributedScheme):
@@ -140,7 +177,9 @@ class TKFusedEP(DistributedScheme):
 
         # schedules (host-side, not timed)
         (disp_idx, comb_idx, padded, num_padded_local,
-         push_idx, push_src, slack) = _build_schedules(
+         push_idx, push_src, slack,
+         push_cnt_idx, push_expected, gate_expected, dst_blk_offset,
+         total_dst_blocks) = _build_schedules(
             problem.topk_ids, num_tokens, world, num_experts, e_local, ctx.rank, device)
         self.disp_idx = disp_idx
         self.comb_idx = comb_idx
@@ -152,13 +191,25 @@ class TKFusedEP(DistributedScheme):
         valid = push_src[:, 0] >= 0
         self.push_idx = push_idx[valid].contiguous()
         self.push_src = push_src[valid].contiguous()
+        self.push_cnt_idx = push_cnt_idx[valid].contiguous()  # push3, same mask/order
         self.num_push = int(valid.sum())
         self.slack = slack  # (num_padded_local//ROW_BLOCK,) int32
+        # push3 (docs/09) expected-value tables + geometry
+        self.push_expected = push_expected            # (total_dst_blocks,) int32
+        self.gate_expected = gate_expected.contiguous()  # (nblk_local, world) int32
+        self.dst_blk_offset = dst_blk_offset          # (world,) int32
+        self.total_dst_blocks = total_dst_blocks
+        # push3 local counters (this card's outgoing counters), zeroed each iter.
+        self.push_local_cnt = torch.zeros(total_dst_blocks, dtype=torch.int32, device=device)
         # dispatch mode: "pull" is the verified/default path. "push" (source-side
         # push + remote red.add) is FROZEN — PCIe remote atomics drop increments
         # under high-concurrency scatter on this machine (see docs/08); it only
         # runs correctly at small expert counts. Kept behind TK_DISPATCH=push for
         # experiments / other platforms.
+        # "push3" (docs/10) is the correct, atomic-free source-push ⊕ gate GEMM
+        # fusion (slot-signal completion): FASTER than pull at NE<=128, SLOWER at
+        # NE=256 (crossover — signal/gate protocol cost grows with row-block count).
+        # Correct at all NE. Default stays pull because the prod point is NE=256.
         import os as _os
         self.dispatch_mode = _os.environ.get("TK_DISPATCH", "pull")
 
@@ -183,7 +234,12 @@ class TKFusedEP(DistributedScheme):
         self.expert_out = TK((num_padded_max, H), dtype=torch.bfloat16, local_rank=lr,
                              local_world_size=lws, multicast=False)
         bar_cols = max(num_padded_max // ROW_BLOCK + 1, 32)
-        self.barrier_l0 = TK((2, bar_cols), dtype=torch.int, local_rank=lr,
+        # push3 (docs/09 §3.2) widens barrier_l0 to (2 + world, bar_cols):
+        #   row 0        : pull-mode local row-block counter (retained, pull fallback)
+        #   row 1        : pcie_barrier_all arrival slots (retained)
+        #   row 2 + s    : source card s's push3 completion signal (col = local row block)
+        # Rows 0/1 and bar_cols are unchanged, so pull / pcie_barrier_all are byte-identical.
+        self.barrier_l0 = TK((2 + world, bar_cols), dtype=torch.int, local_rank=lr,
                              local_world_size=lws, multicast=False)
         self.barrier_l1 = TK((1 + world, bar_cols), dtype=torch.int, local_rank=lr,
                              local_world_size=lws, multicast=False)
@@ -243,6 +299,22 @@ class TKFusedEP(DistributedScheme):
             tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)  # all pushes landed
             tk.grouped_gemm(self.gathered.data_, self.w_gate, self.gate_out, self.padded,
                             self.ctx.rank * self.problem.config.num_local_experts)
+        elif self.dispatch_mode == "push3":
+            # Source-side push ⊕ gate GEMM with SLOT-signal completion (docs/09,
+            # optimization #1c): strong ~51GB/s TMA push data plane AND fusion
+            # preserved (gate spins locally while pushes stream in), with NO
+            # remote atomics — completion is a single-writer st.release.sys seq
+            # per (src card, dst row block), elected by a LOCAL atom.acq_rel that
+            # reaches the host-precomputed expected count. Zero seed / pre-barrier
+            # needed: local_cnt is a private tensor cleared here (same-stream), and
+            # the signal seq is monotonic (immune to reset).
+            self.push_local_cnt.zero_()
+            self._l0_seq += 1
+            tk.moe_dispatch_push3(self.pre_tokens, self.gathered, self.w_gate, self.gate_out,
+                                  self.padded, self.push_idx, self.push_src, self.push_cnt_idx,
+                                  self.push_local_cnt, self.push_expected, self.gate_expected,
+                                  self.barrier_l0, self.num_comm_sms, self.num_padded_local,
+                                  self.num_push, self._l0_seq)
         else:  # "pull" fallback
             tk.moe_dispatch_gemm(self.pre_tokens, self.gathered.data_, self.w_gate, self.gate_out,
                                  self.padded, self.disp_idx, self.barrier_l0,
