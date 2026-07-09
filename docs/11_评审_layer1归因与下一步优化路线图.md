@@ -241,6 +241,13 @@ e2e 预期 −1.5ms 级。
 
 ### T6:combine 预归约 + push 化(A' 镜像,layer1 通信 4×,消 HOL)
 
+> **【进行中 2026-07-09 — v0 地基已落地,见 docs/13】** 第一步(v0/v1 共用的 host
+> schedule 预归约表 + 对账工具)完成:`_build_prereduce_schedule` 把 combine 求和按
+> expert 卡重新分组(数学等价,FP32),`tools/reconcile_prereduce.py` 对 golden
+> `comb_idx`/`combine_w` **双向逐项对账**(覆盖+无多余 bijection + contrib mask),
+> **NE∈{64,128,256} 全过 total_failures=0**。纯 host、未接入 run()。
+> 下一步:v0 kernel(expert 侧预归约 + 源卡终归约,数据面仍 pull)。
+
 **现状证据**:§0.3 差距表前四行。现状源卡逐 (token,expert) pull 4096 行 = 43MB 跨卡
 @ 弱~中路径;per-token block 等 8 个跨卡信号的 max。
 
@@ -365,15 +372,21 @@ push @51GB/s(T8 后):→ ~0.25ms。
 
 ## 2. 总账与验收
 
-预期逐项叠加(NE=256, 4 卡, 512 token/rank,现状 7124µs):
+> **【2026-07-09 T1 后修订】** 原表含 T2 行,已随 T2 冻结作废。T1(docs/12)实测
+> combine 尾 1838µs **完全裸露**(t_E ≈ t_GEMM + t_combine,零重叠),layer1 的收益
+> 全部从 T6 出,且比原账大;终点量级不变。
+
+预期逐项叠加(NE=256, 4 卡, 512 token/rank,现状 7124µs = L0 2005 + up 1500 +
+silu 100 + L1 3500):
 
 | 里程碑 | e2e 预期 | 备注 |
 |---|---|---|
-| T2 epilogue 选举信号 | ~6.1ms | layer1 GEMM 回速(依 T1 归因) |
-| + T4/T5 gate+up 合并 + ROW_BLOCK=64 | ~4.5ms | 两层 GEMM 减半,up 隐藏 |
-| + T6 combine 预归约+push | ~3.6ms | layer1 通信 4×,HOL 消失 |
-| + T7 dispatch 去重+fp8 | ~2.7ms | dispatch 2.0→~0.6(pull)  |
-| + T8 push 默认 | **~2.4ms** | dispatch 数据面 ~0.25ms |
+| T6-v0 预归约(pull 预归约行) | ~6.2ms | combine 尾 1838→~840µs(行数 4096→~1800) |
+| + T6-v1 push 化 | ~5.6ms | 强路径 51GB/s + 边就绪边推,尾藏进 GEMM,L1 ≈ 2.0ms |
+| + T4 gate+up 合并 | ~5.1ms | up 部分藏进 dispatch 通信 |
+| + T5 ROW_BLOCK=64 | ~3.9ms | 两层 GEMM 减半,up 完全隐藏,L1 ≈ 1.1ms |
+| + T7 去重+fp8 | ~2.6ms | dispatch 2.0→~0.6(pull) |
+| + T8 push 默认 | **~2.3ms** | dispatch 数据面 ~0.3ms |
 
 对照 docs/07 §3 的账(~2.5–3.5ms vs serial 7ms)一致;且 serial-fp8 的通信仍是
 bf16 AG/RS,fp8 口径下差距只会更大。**所有性能宣称在 T3 落地(schedule 计入 run)
@@ -381,3 +394,36 @@ bf16 AG/RS,fp8 口径下差距只会更大。**所有性能宣称在 T3 落地(s
 
 每完成一项:对拍锚点全过 → 提交(规范 commit message)→ 结果写回本文档对应小节
 + 细节开新编号文档 → 更新 HANDOFF.md。
+
+---
+
+## 3. T1 之后的执行顺序修订(2026-07-09)
+
+T1(docs/12)裁决后,§1 的依赖图更新为:
+
+```
+T6 (combine 预归约+push) —— layer1 唯一主攻,拆 v0 → v1 两个台阶
+T4 (gate+up 合并) —— 独立、低风险、~1天,作为 T6 期间的并行小活
+T3 (schedule GPU化) —— 排在 T6 的 schedule 新表定型之后、报数之前
+T5 (ROW_BLOCK=64) —— 后移到 T6 之后
+T7 → T8 —— 顺序不变
+T2 —— 冻结(T1 止损)
+```
+
+理由:
+
+1. **T6 拆 v0/v1**(两者共用同一套 host schedule 预归约表 + expert 侧预归约逻辑,
+   v0 是 v1 的中间检查点,不是绕路):
+   - **v0:预归约 + 源卡 pull 预归约行**——零新协议,信号/pull 数据面沿用现状,
+     只换索引表;风险集中在 host schedule 新表,用"预归约表 vs comb_idx 逆映射对账"
+     裁决;顺带验证预归约的精度账(多一次 bf16 舍入)。预期 combine 尾减半。
+   - **v1:数据面反转为 expert 侧 TMA push + 源卡终归约**——dpush3 骨架镜像,
+     内存序链 = push3 R1 同款,`validate_push3` 方法论直接搬。v1 同时治好 T1 发现的
+     "零重叠"病:预归约行就绪即推,推流贯穿 GEMM,per-token 等 8 信号的 max 消失。
+   - **第一件事是 v0 的 host schedule 新表 + 对账工具**——v0/v1 共用的地基,
+     风险最集中处,先裁决干净。
+2. **T5 后移**:T1 证明 GEMM 本身健康(~140 TFLOP/s),combine 尾裸露时省 GEMM
+   只是让尾更裸露,T5 的收益要等 T6 兑现后才能落袋;且行块数翻倍加重信号协议,
+   先有 T6/T8 的聚合信号再上 T5 更顺。
+3. **T3 的插入时点**:T6 会新增预归约表,T3 的 GPU 向量化范围顺势把新表一起覆盖,
+   避免向量化两遍;但必须在下一次对外报数之前完成。

@@ -2,7 +2,8 @@
 
 > 新 session 从这里接手。读完本文 + 最新一篇 docs/ 即可继续。
 
-**最后更新**:2026-07-09(push3 落地 + 全量评审 + 路线图 + **T1 归因实测,见 docs/12**)
+**最后更新**:2026-07-09(push3 落地 + 全量评审 + 路线图 + T1 归因实测 docs/12 +
+**T6-v0 host 预归约表 + 对账落地,见 docs/13**)
 
 ## 1. 项目一句话
 
@@ -23,7 +24,10 @@
   grouped_gemm_sm120 模板)。
 - **工具**:`tools/run_tkfused.py`(对拍)、`time_dispatch.py`(dispatch-only 隔离计时)、
   `time_layer1.py`(T1 layer1 5 点隔离归因)、`ncu_gemm_probe.py`(单卡 ncu)、
-  `validate_push3.py` / `verify_push3_schedule.py`(协议裁决)。
+  `validate_push3.py` / `verify_push3_schedule.py`(协议裁决)、
+  `reconcile_prereduce.py`(T6-v0 预归约表对账,docs/13)。
+  ⚠️ `time_layer1.py` / `ncu_gemm_probe.py` 及 `tk_moe.cu` 的 T1 debug 入口
+  (`gg::entry_nb`、`comb::combine_only_entry`)在服务器侧,**尚未同步入本仓库提交**。
 
 ## 3. 下一步:按 docs/11 路线图执行
 
@@ -33,10 +37,10 @@
 |---|---|---|
 | T1 | ncu 归因 layer1 GEMM 为何只有 71 TFLOP/s(fence/SM让渡/L2) | **✅ 完成(docs/12):假设推翻,慢在 combine gather 94~99%,非 fusion** |
 | T2 | combine epilogue 换 push3 式选举信号(预期 layer1 −1ms) | **❄️ 冻结(T1 止损:fence 仅 1.2~2.8%,收益 ≤0.05ms)** |
-| T3 | schedule GPU 化并计入 run()(公平性,报数前必须) | 未开始 |
-| T4 | gate+up 合并一次 GEMM(up 的 1.5ms 藏进 dispatch) | 未开始 |
-| T5 | ROW_BLOCK=64(NE=256 两层 GEMM 各省一半行) | 未开始 |
-| T6 | combine 预归约 + push 化(A' 镜像,layer1 通信 4×) | **⬆️ 提为 layer1 唯一主攻(T1 裁决)** |
+| T3 | schedule GPU 化并计入 run()(公平性,报数前必须) | 未开始(排 T6 schedule 表定型后、报数前) |
+| T4 | gate+up 合并一次 GEMM(up 的 1.5ms 藏进 dispatch) | 未开始(独立低风险,T6 期间并行小活) |
+| T5 | ROW_BLOCK=64(NE=256 两层 GEMM 各省一半行) | 未开始(**后移到 T6 之后**,docs/11 §3) |
+| T6 | combine 预归约 + push 化(A' 镜像,layer1 通信 4×) | **⬆️ 唯一主攻,进行中:v0 host schedule 预归约表 + 对账工具 ✅(docs/13,NE∈{64,128,256} 对账全过);下一步 v0 kernel(expert 侧预归约+源卡终归约,数据面仍 pull)** |
 | T7 | dispatch (token,dst) 去重 + fp8 传输 | 未开始 |
 | T8 | push3 目的块重排 + 水位信号(NE=256 翻盘后设默认) | 未开始 |
 | T9 | 杂项:AGENTS.md 口径、skewed 测试、comm_sms 扫参、probe 增强 | 未开始 |
@@ -87,4 +91,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | docs/09/10 | push3 规划 / 实现验证实测(NE 交叉点) |
 | **docs/11** | **第二轮评审 + 当前任务清单(T1~T9,做事看这篇)** |
 | **docs/12** | **T1 归因实测:layer1 慢在 combine gather(94~99%),非 fusion;T2 冻结→T6** |
+| **docs/13** | **T6-v0:combine 预归约 host 表设计(按 expert 卡重分组,等价)+ 双向对账工具** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

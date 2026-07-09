@@ -148,6 +148,89 @@ def _build_schedules(topk_ids, num_tokens, world_size, num_experts, num_experts_
             torch.tensor(dst_blk_offset, dtype=torch.int32, device=device), total_dst_blocks)
 
 
+def _build_prereduce_schedule(topk_ids, topk_weights, num_tokens, world_size,
+                              num_experts, num_experts_per_dev, rank, device):
+    """T6-v0 pre-reduction schedule (docs/13). Regroups the combine sum
+
+        out[t] = Σ_k  w(t,k) · expert_out[e_rank(t,k)][slot(t,k)]
+
+    by EXPERT CARD instead of by (token, expert):
+
+        partial[d][(s,t)] = Σ_{k : e_rank(t,k)==d}  w(t,k) · expert_out[d][slot]
+        out[t]            = Σ_d partial[d][(rank,t)]
+
+    Same terms, regrouped — so it must reconcile term-for-term against the
+    already-verified `comb_idx` (see tools/reconcile_prereduce.py). The slot
+    cursor here is the SAME ring-by-source-device replay as `_build_schedules`,
+    so the local slots here == the dispatch slots there. The pre-reduced row for
+    (src_dev, src_tok) lives at plane [src_dev][src_tok] of a (world, num_tokens,
+    H) partial buffer — a layout shared by v0 (source pulls that row) and v1
+    (expert card TMA-pushes it to the source card's staging[d][t]).
+
+    Standalone / not wired into run() or setup(): this is the T6 foundation to
+    be adjudicated clean before any kernel change (docs/11 §3).
+
+    Returns, EXPERT-CARD view (this rank as producer d == rank):
+      prered_dst   (J, 2)     int32 : (src_dev, src_tok) each partial job targets
+      prered_slots (J, TOP_K) int32 : local slots to FP32-reduce (-1 padded)
+      prered_w     (J, TOP_K) f32   : weights aligned to slots (0 padded)
+      num_jobs J
+    and SOURCE-CARD view (this rank as consumer s == rank):
+      final_contrib (num_tokens, world) int32 : 1 iff card d holds ≥1 of t's experts
+    """
+    top_k = topk_ids.shape[1]
+
+    all_topk = torch.empty(world_size, num_tokens, top_k, device=device, dtype=topk_ids.dtype)
+    torch.distributed.all_gather_into_tensor(all_topk, topk_ids.contiguous())
+    all_w = torch.empty(world_size, num_tokens, top_k, device=device, dtype=torch.float32)
+    torch.distributed.all_gather_into_tensor(all_w, topk_weights.float().contiguous())
+    all_topk_cpu = all_topk.cpu()
+    all_w_cpu = all_w.cpu()
+
+    tokens_per_expert = torch.bincount(all_topk.view(-1), minlength=num_experts).to(torch.int32)
+    padded_cpu = ((tokens_per_expert + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK).cpu().long()
+
+    # expert-card side: (src_dev, src_tok) -> list of (local_slot, weight) this
+    # card must FP32-reduce into one partial row. source-card side: contrib mask.
+    jobs: dict[tuple[int, int], list[tuple[int, float]]] = {}
+    final_contrib = torch.zeros(num_tokens, world_size, dtype=torch.int32, device="cpu")
+
+    for e_rank in range(world_size):
+        estart = num_experts_per_dev * e_rank
+        eend = num_experts_per_dev * (e_rank + 1)
+        write_pos = torch.cat([
+            torch.zeros(1, dtype=torch.int64, device="cpu"),
+            torch.cumsum(padded_cpu[estart:eend - 1], dim=0)
+        ]).tolist()
+        for i in range(world_size):
+            src_dev = (i + e_rank) % world_size
+            for src_tok in range(num_tokens):
+                for kpos, eid in enumerate(all_topk_cpu[src_dev, src_tok].tolist()):
+                    if estart <= eid < eend:
+                        e = eid - estart
+                        slot = write_pos[e]
+                        write_pos[e] += 1
+                        if e_rank == rank:  # I am the expert card: accumulate a partial job
+                            w = float(all_w_cpu[src_dev, src_tok, kpos])
+                            jobs.setdefault((src_dev, src_tok), []).append((slot, w))
+                        if src_dev == rank:  # I am the source card: mark contributor
+                            final_contrib[src_tok, e_rank] = 1
+
+    num_jobs = len(jobs)
+    prered_dst = torch.full((max(num_jobs, 1), 2), -1, dtype=torch.int32, device="cpu")
+    prered_slots = torch.full((max(num_jobs, 1), top_k), -1, dtype=torch.int32, device="cpu")
+    prered_w = torch.zeros((max(num_jobs, 1), top_k), dtype=torch.float32, device="cpu")
+    for j, (src_dev, src_tok) in enumerate(sorted(jobs.keys())):
+        prered_dst[j, 0] = src_dev
+        prered_dst[j, 1] = src_tok
+        for c, (slot, w) in enumerate(jobs[(src_dev, src_tok)]):
+            prered_slots[j, c] = slot
+            prered_w[j, c] = w
+
+    return (prered_dst.to(device), prered_slots.to(device), prered_w.to(device),
+            num_jobs, final_contrib.to(device))
+
+
 class TKFusedEP(DistributedScheme):
     name = "tkfused"
 
