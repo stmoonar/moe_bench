@@ -2,8 +2,9 @@
 
 > 新 session 从这里接手。读完本文 + 最新一篇 docs/ 即可继续。
 
-**最后更新**:2026-07-09(push3 落地 + 全量评审 + 路线图 + T1 归因实测 docs/12 +
-**T6-v0 host 预归约表 + 对账落地,见 docs/13**)
+**最后更新**:2026-07-09(本轮:T6-v0 预归约 + T4 gate+up + T3 schedule GPU化(公平口径)
++ T7 dispatch 去重 + T5 ROW_BLOCK=64,五项落地;**NE=256 e2e 7131→5830µs 公平口径超 serial
+7063 的 1.21×**,见 docs/13~16)
 
 ## 1. 项目一句话
 
@@ -79,14 +80,23 @@
 source /data/cinnzhang_vllm_td_test/venvs/vllm-td/bin/activate
 cd /data/cinnzhang_vllm_td_test/xxy          # 必须在上级目录跑 -m moe_bench.*
 nvidia-smi                                    # 跑前确认卡空闲
-# 对拍
+# 对拍(全链路 vs reference_moe)
 CUDA_VISIBLE_DEVICES=9,11,13,15 python -m moe_bench.tools.run_tkfused 64
-# benchmark(bf16 EP)
-CUDA_VISIBLE_DEVICES=9,11,13,15 python -m moe_bench.bench --scheme tkfused,serial \
-    --mode ep --precision bf16 --world-size 4 --no-verify
+# benchmark(bf16 EP;--distributed 必带,--scheme 单值,分别跑 tkfused / serial)
+CUDA_VISIBLE_DEVICES=9,11,13,15 python -m moe_bench.bench --distributed --scheme tkfused \
+    --mode ep --precision bf16 --world-size 4 --no-verify --num-tokens 512
 # dispatch-only 隔离计时
 CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time_dispatch 256 10 50
 ```
+
+**默认路径 = pull dispatch + prered combine + fused gate+up + GPU schedule(计入 run)。**
+环境开关速查:
+- `TK_COMBINE` = `prered`(默认,T6-v0)| `pull`(旧 combine)
+- `TK_FUSE_GATEUP` = `1`(默认,T4)| `0`
+- `TK_GPU_SCHED` = `1`(默认,T3,CUDA graph)| `0`(schedule 回 setup 不计时)
+- `TK_DEDUP` = `0`(默认)| `1`(T7,NE≤128 赢、NE=256 无收益)
+- `TK_ROW_BLOCK` = `128`(默认)| `64`(T5,仅 NE=256 净赢 ~260µs,NE≤128 变慢)
+- `TK_DISPATCH` = `pull`(默认)| `push3`/`push2`/`push`(实验/冻结)
 
 ## 6. 文档索引
 
