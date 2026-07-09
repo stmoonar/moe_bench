@@ -278,6 +278,34 @@ def _build_prereduce_schedule(topk_ids, topk_weights, num_tokens, world_size,
             num_jobs, final_contrib.to(device))
 
 
+def _derive_combine_push(prered_slots, final_contrib, num_tokens, world_size,
+                         push_expected_l1=None, recv_from=None):
+    """T6-v1 (docs/18): expert-side combine-push tables, pure functions of the v0
+    prered tables (so they inherit correctness AND graph-capturability).
+
+    Dense job space: job j = src_dev*num_tokens + src_tok, grouped by src_dev in
+    contiguous blocks of num_tokens. This card (expert card d == rank) pushes a
+    partial row for every NON-EMPTY job to source card s = j // num_tokens.
+
+      push_expected_l1 (world,) int32 : rows this card pushes to source card s =
+        count of non-empty jobs with src_dev==s (the election target count).
+      recv_from (world,) int32 : as SOURCE card, 1 iff expert card d sends me >=1
+        row = (final_contrib[:,d].sum()>0) — the symmetric complement, so I only
+        wait on cards that will actually signal (no deadlock).
+    Capture-safe (no bincount / host sync). Writes in place if out given."""
+    device = prered_slots.device
+    has_hit = (prered_slots >= 0).any(dim=1).to(torch.int32)          # (J,)
+    exp = has_hit.view(world_size, num_tokens).sum(dim=1).to(torch.int32)  # (world,)
+    rf = (final_contrib.sum(dim=0) > 0).to(torch.int32)               # (world,)
+    if push_expected_l1 is None:
+        push_expected_l1 = torch.empty(world_size, dtype=torch.int32, device=device)
+    if recv_from is None:
+        recv_from = torch.empty(world_size, dtype=torch.int32, device=device)
+    push_expected_l1.copy_(exp)
+    recv_from.copy_(rf)
+    return push_expected_l1, recv_from
+
+
 def _build_schedules_gpu(all_topk, all_w, world_size, num_experts,
                          num_experts_per_dev, rank, out):
     """T3 (docs/14): GPU-vectorized rebuild of the DEFAULT-path schedule tables,
@@ -369,6 +397,11 @@ def _build_schedules_gpu(all_topk, all_w, world_size, num_experts,
     out["final_contrib"].zero_()
     out["final_contrib"].scatter_(1, card, torch.ones_like(card, dtype=torch.int32))
 
+    # ---- T6-v1 combine-push tables (derived from prered_slots / final_contrib) ----
+    if "push_expected_l1" in out:
+        _derive_combine_push(out["prered_slots"], out["final_contrib"], T, world_size,
+                             out["push_expected_l1"], out["recv_from"])
+
     return P, world_size * T
 
 
@@ -446,7 +479,14 @@ class TKFusedEP(DistributedScheme):
         # NE∈{64,128,256} (tools/validate_prered.py, rel_err ~7e-3) and e2e
         # NE=256 7131->5776µs (beats serial). "pull" (moe_gemm_combine_fused,
         # source gathers 8 peer rows/token) kept behind TK_COMBINE=pull.
-        self.combine_mode = _os.environ.get("TK_COMBINE", "prered")
+        # "prered_push" (T6-v1, docs/18, DEFAULT): expert card pushes each partial
+        # row to the source card's staging edge-triggered (strong path, streams
+        # under the W2 GEMM) + per-card watermark election, no full barrier —
+        # fixes v0's ~0% comm overlap (docs/17). Correct at NE∈{64,128,256}
+        # (validate_prered_push.py, rel ~7e-3); e2e (default shape) 2331->1963µs
+        # (1.48× serial). "prered" (v0) kept behind TK_COMBINE=prered; "pull"
+        # (moe_gemm_combine_fused) behind TK_COMBINE=pull.
+        self.combine_mode = _os.environ.get("TK_COMBINE", "prered_push")
 
         # T4 (docs/11 §T4): fuse gate+up into ONE GEMM. w1 is [gate; up] rows
         # (E, 2*inter, H), so w1.T = (E, H, 2*inter) with columns [gate | up].
@@ -491,6 +531,17 @@ class TKFusedEP(DistributedScheme):
         self.num_jobs = num_jobs
         self.final_contrib = final_contrib.contiguous()  # (num_tokens, world) int32
 
+        # T6-v1 (docs/18) combine-push tables: rows this card pushes to each
+        # source card (election target) + which cards send me (watermark wait
+        # mask). Derived from prered_slots / final_contrib; rebuilt in the GPU
+        # schedule too. Only consumed when combine_mode == "prered_push".
+        self.push_expected_l1, self.recv_from = _derive_combine_push(
+            self.prered_slots, self.final_contrib, num_tokens, world)
+        self.push_expected_l1 = self.push_expected_l1.contiguous()
+        self.recv_from = self.recv_from.contiguous()
+        # per-source-card push counter, zeroed each iter (private, same-stream)
+        self.combine_local_cnt = torch.zeros(world, dtype=torch.int32, device=device)
+
         # T3 (docs/14): GPU-vectorized schedule rebuild, counted in run() for a
         # fair vs-serial number (serial pays routing metadata per run; docs/07 P1).
         # Default ON. Grid sizes (num_padded_local, num_jobs) stay host-computed
@@ -529,6 +580,9 @@ class TKFusedEP(DistributedScheme):
             if self.dedup_dispatch:  # rebuild dedup tables in the timed builder too
                 self._sched_out["slot_to_staging"] = self.slot_to_staging
                 self._sched_out["staging_needed"] = self.staging_needed
+            if self.combine_mode == "prered_push":  # rebuild v1 combine-push tables
+                self._sched_out["push_expected_l1"] = self.push_expected_l1
+                self._sched_out["recv_from"] = self.recv_from
             self._sched_graph = None  # captured lazily on first run()
 
         # weights: problem.w1 (E_local, 2*inter, H) is [gate; up] stored for x@w.T.
@@ -564,7 +618,11 @@ class TKFusedEP(DistributedScheme):
         # Rows 0/1 and bar_cols are unchanged, so pull / pcie_barrier_all are byte-identical.
         self.barrier_l0 = TK((2 + world, bar_cols), dtype=torch.int, local_rank=lr,
                              local_world_size=lws, multicast=False)
-        self.barrier_l1 = TK((1 + world, bar_cols), dtype=torch.int, local_rank=lr,
+        # barrier_l1 rows: 0 = GEMM col-block counter (reset each iter), 1 = local
+        # W2 completion signal (prered job/push slot gate). T6-v1 (docs/18) adds
+        # rows 2+d = expert card d's cross-card combine watermark. Widen to
+        # (2+world); pull-combine (comb) uses rows 0/1+d and stays byte-identical.
+        self.barrier_l1 = TK((2 + world, bar_cols), dtype=torch.int, local_rank=lr,
                              local_world_size=lws, multicast=False)
         self.barrier_l0.data_.zero_()
         self.barrier_l1.data_.zero_()
@@ -592,6 +650,14 @@ class TKFusedEP(DistributedScheme):
             self.partials = TK((world * num_tokens, H), dtype=torch.bfloat16,
                                local_rank=lr, local_world_size=lws, multicast=False)
             self.partials.data_.zero_()
+
+        # T6-v1 (docs/18) combine staging: peer-WRITABLE (world*num_tokens, H) bf16.
+        # Plane [d] (rows [d*T, d*T+T)) is written ONLY by expert card d (single
+        # writer, no atomics); source card sums the contributing planes. Push target.
+        if self.combine_mode == "prered_push":
+            self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
+                                      local_rank=lr, local_world_size=lws, multicast=False)
+            self.combine_staging.data_.zero_()
 
         # T7 (docs/15) staging: LOCAL (world*num_tokens, H) bf16 = 28MB. Holds one
         # copy of each pulled unique source token; the scatter then copies each to
@@ -736,6 +802,25 @@ class TKFusedEP(DistributedScheme):
             tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)  # all partials published
             tk.moe_final_reduce(self.partials, self.final_contrib, self.combine_out,
                                 self.barrier_l0, self.num_tokens)
+        elif self.combine_mode == "prered_push":
+            # T6-v1 (docs/18): W2 GEMM ⊕ prered PUSH. Expert card pushes each
+            # partial row to the source card's staging edge-triggered (streams
+            # under the W2 GEMM) + per-card watermark election (barrier_l1 row
+            # 2+d). NO full barrier — final_reduce_push waits only on the <=world
+            # cards in recv_from. local_cnt zeroed each iter (same-stream); seq is
+            # monotonic (immune to reset). Same seq gates the epilogue signal
+            # (row 1), the push election (row 2+d), and the source wait.
+            self.combine_local_cnt.zero_()
+            tk.moe_gemm_prered_push_fused(self.act, self.w2, self.expert_out, self.padded,
+                                          self.combine_staging, self.prered_dst,
+                                          self.prered_slots, self.prered_w,
+                                          self.combine_local_cnt, self.push_expected_l1,
+                                          self.barrier_l1, self.num_comm_sms,
+                                          self.num_padded_local, self.num_tokens,
+                                          self.num_jobs, self._l1_seq)
+            tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
+                                     self.recv_from, self.combine_out, self.barrier_l1,
+                                     self.num_tokens, self._l1_seq)
         else:
             tk.moe_gemm_combine_fused(self.act, self.w2, self.expert_out, self.padded,
                                       self.combine_out, self.comb_idx, self.combine_w,

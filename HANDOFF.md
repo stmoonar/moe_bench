@@ -18,14 +18,15 @@
 > **【默认形状已改 2026-07-09】** 默认 shape 现为 **E=64, TOP_K=8, hidden=4096,
 > gate_up=6144(intermediate=3072)**,512 token/rank, bf16 EP world=4(E_local=16,
 > 每专家 ~256 token,padding 少)。config.py / configs/tk_ep_bf16.yaml / 各 tool 默认
-> 已同步。此 shape 下 **tkfused 2331µs vs serial 2903µs = 1.25×**(公平口径,
-> 对拍 rel_err 4.43e-3 ok;`python -m moe_bench.tools.bench_shape_4096` 或
-> `run_tkfused`)。下面 §2 里 NE=256/hidden=7168 的历史数字是旧 shape 的记录,保留备查。
+> 已同步。此 shape 下 **tkfused 1963µs vs serial 2905µs = 1.48×**(公平口径,combine
+> 预归约 push 化 T6-v1 默认,对拍 rel_err 4.43e-3 ok;`bench_shape_4096` / `run_tkfused`)。
+> 下面 §2 里 NE=256/hidden=7168 的历史数字是旧 shape 的记录,保留备查。
 
 - **正确性**:tkfused 全链路对拍 reference_moe 通过(bf16, EP, 4 卡, rel_err ~4.4e-3)。
-- **性能(新默认 shape E=64/hidden=4096)**:tkfused **2331µs vs serial 2903µs**(快 1.25×,
-  schedule 已 GPU 化并计入 run,公平口径)。此 shape 每专家 ~256 token,padding 少,
-  默认 RB=128 / dedup off 最优(实测开 dedup/RB=64 反而略慢,符合 T5/T7 结论)。
+- **性能(新默认 shape E=64/hidden=4096)**:tkfused **1963µs vs serial 2905µs**(快 1.48×,
+  T6-v1 combine push 化默认;v0 prered 为 2331µs)。
+- **combine 三条路径**:`TK_COMBINE=prered_push`(默认,T6-v1,docs/18,边算边推)|
+  `prered`(v0,barrier+pull,docs/13)| `pull`(旧 moe_gemm_combine_fused)。
 - **性能(旧 shape NE=256/hidden=7168,历史记录)**:tkfused 5832µs vs serial 7063µs(1.21×)。
 - **combine 两条路径**:`TK_COMBINE=prered`(默认,T6-v0,docs/13,全档位优于 pull)|
   `pull`(旧 moe_gemm_combine_fused,保留)。
@@ -42,7 +43,10 @@
   `reconcile_prereduce.py`(T6-v0 预归约表对账,docs/13)、
   `validate_prered.py`(T6-v0 全链路正确性:prered vs pull combine,30 迭代 × 3 NE)、
   `verify_schedule_gpu.py`(T3 GPU schedule vs host golden element-wise,docs/14)、
-  `time_schedule.py`(T3 schedule 重算成本:all_gather/eager/graph 分解)。
+  `time_schedule.py`(T3 schedule 重算成本:all_gather/eager/graph 分解)、
+  `validate_prered_push.py`(T6-v1 push combine 正确性,30 迭代 × 3 NE,docs/18)、
+  `analyze_overlap.py`(通算重叠 + 融合损失分析,docs/17/18)、
+  `bench_shape_4096.py`(默认 shape tkfused vs serial)。
   ⚠️ `time_layer1.py` / `ncu_gemm_probe.py` 及 `tk_moe.cu` 的 T1 debug 入口
   (`gg::entry_nb`、`comb::combine_only_entry`)在服务器侧,**尚未同步入本仓库提交**。
 
@@ -57,7 +61,7 @@
 | T3 | schedule GPU 化并计入 run()(公平性,报数前必须) | **✅ 完成(docs/14):默认路径 6 表 GPU 化 + CUDA graph(~205µs),计入 run();对拍 host golden 全等(NE×{balanced,skewed});e2e NE=256 计入后 5832µs 仍 < serial(1.21×),星号已去** |
 | T4 | gate+up 合并一次 GEMM(up 的 1.5ms 藏进 dispatch) | **✅ 完成(docs/13 §6):NE=256 −204µs、NE=64 −478µs,默认开;T5 后 up 才完全隐藏** |
 | T5 | ROW_BLOCK=64(NE=256 两层 GEMM 各省一半行) | **✅ 完成(docs/16):编译期 TK_ROW_BLOCK 开关,全档正确;但预期被推翻——padding 本以满效率算,减 padding 后 npl=4096 落小 tile 低效区(143→75 TFLOP/s),W2 wash。RB=64 仅 NE=256 净赢 ~260µs,NE≤128 变慢。默认保持 128。大收益需 8warp×8行/fp8 计算** |
-| T6 | combine 预归约 + push 化(A' 镜像,layer1 通信 4×) | **⬆️ 主攻,v0 ✅ 落地达标:NE=256 e2e 7131→5775µs(首超 serial 7063),NE∈{64,128,256} 对拍全过 rel~7e-3,prered 设默认(docs/13 §5);下一步 v1 push 化** |
+| T6 | combine 预归约 + push 化(A' 镜像,layer1 通信 4×) | **✅ v0+v1 完成:v0 预归约(docs/13)+ v1 push 化(docs/18,边算边推消零重叠)。默认 prered_push;layer1 融合损失 283→192µs,e2e(默认shape)2331→1963µs(1.48× serial)** |
 | T7 | dispatch (token,dst) 去重 + fp8 传输 | **去重✅(docs/15):v0 落地默认关(TK_DEDUP=1);NE≤128 大赢(e2e NE=64 −0.47ms),NE=256 无收益因 dispatch 实为 GEMM-bound(账本修正);与 T5 协同后 NE=256 生效。fp8 未做** |
 | T8 | push3 目的块重排 + 水位信号(NE=256 翻盘后设默认) | 未开始 |
 | T9 | 杂项:AGENTS.md 口径、skewed 测试、comm_sms 扫参、probe 增强 | 未开始 |
@@ -99,7 +103,7 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 
 **默认路径 = pull dispatch + prered combine + fused gate+up + GPU schedule(计入 run)。**
 环境开关速查:
-- `TK_COMBINE` = `prered`(默认,T6-v0)| `pull`(旧 combine)
+- `TK_COMBINE` = `prered_push`(默认,T6-v1)| `prered`(v0)| `pull`(旧 combine)
 - `TK_FUSE_GATEUP` = `1`(默认,T4)| `0`
 - `TK_GPU_SCHED` = `1`(默认,T3,CUDA graph)| `0`(schedule 回 setup 不计时)
 - `TK_DEDUP` = `0`(默认)| `1`(T7,NE≤128 赢、NE=256 无收益)
@@ -122,4 +126,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/15** | **T7:dispatch 去重(稠密 staging,gathered 逐字节等价);揭示 NE=256 dispatch 是 GEMM-bound(账本修正)** |
 | **docs/16** | **T5:ROW_BLOCK=64 编译期开关;揭示 padding 非纯浪费(满效率算),小 tile 效率折损抵消,默认保持 128** |
 | **docs/17** | **通算重叠与融合损失分析:layer0 融合 +30%、layer1 +56% 且通信零重叠(T6-v1 目标)** |
+| **docs/18** | **T6-v1:combine 预归约 push 化(边算边推 + 水位选举,消 barrier+零重叠);layer1 融合损失 283→192µs,默认** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

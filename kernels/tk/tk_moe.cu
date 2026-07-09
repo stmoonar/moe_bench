@@ -1234,6 +1234,290 @@ void final_reduce_entry(kittens::py::TKParallelTensor &partials, at::Tensor &fin
 }
 } // namespace prered
 
+/* ===================================================================== *
+ * 4b. W2 GEMM ⊕ pre-reduction PUSH (layer1, T6-v1; docs/18). Same math as v0
+ *     prered, but the data plane is reversed to the verified dpush3 push+
+ *     election pattern: as soon as an expert card computes a partial row for
+ *     (src_dev=s, src_tok=t), it TMA-PUSHES it to source card s's staging plane
+ *     [my_rank] row t (strong path), edge-triggered so the transfer streams
+ *     under the ongoing W2 GEMM (docs/17: v0 had ~0% overlap). Per-(expert card)
+ *     watermark election (dpush3-style) replaces v0's full barrier; the source's
+ *     final_reduce_push waits only on the <=world cards that actually send it.
+ *
+ * Signal layout: barrier_l1 rows — 0 = local GEMM col-block counter (reset each
+ * iter), 1 = local W2 completion signal (job slot gate, same as v0), 2+d =
+ * expert card d's cross-card watermark ("d finished all pushes to me").
+ * ===================================================================== */
+namespace preredpush {
+struct globals {
+    using cfg = gemm_config;
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    static constexpr int TOP_K = 8;
+    using row_vec        = sv_bf<H>;                          // one partial row in smem for TMA push
+    using activations_gl = gl<bf16, 1, 1, -1, -1, cfg::A_tile>;
+    using weights_gl     = gl<bf16, 1, -1, -1, -1, cfg::B_tile>;
+    using outputs_gl     = gl<bf16, 1, 1, -1, H>;             // local W2 output (expert_out)
+    using counts_gl      = gl<int, 1, 1, 1, -1>;
+    using staging_pgl    = pgl<gl<bf16, 1, 1, -1, H, row_vec>, NUM_DEVICES, false>;  // peers push here
+    using dst_gl         = gl<int, 1, 1, -1, 2>;              // (J,2) -> (src_dev, src_tok)
+    using slots_gl       = gl<int, 1, 1, -1, TOP_K>;          // (J,TOP_K) local slots (-1 pad)
+    using w_gl           = gl<float, 1, 1, -1, TOP_K>;        // (J,TOP_K) weights (0 pad)
+    using cnt1d_gl       = gl<int, 1, 1, 1, -1>;              // local_cnt / push_expected (world,)
+    using barrier_pgl    = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    activations_gl activations;
+    weights_gl weights;
+    outputs_gl outputs;
+    counts_gl padded_tokens_per_expert;
+    const int num_local_experts;
+    const int expert_offset;
+    staging_pgl staging;           // this card's + peers' staging (push target)
+    dst_gl prered_dst;
+    slots_gl prered_slots;
+    w_gl prered_w;
+    cnt1d_gl local_cnt;            // (world,) per-source-card push counter, zeroed each iter
+    cnt1d_gl push_expected_l1;     // (world,) rows this card pushes to each source card
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int num_padded_local_tokens;
+    const int num_source_tokens;
+    const int num_jobs;
+    const int num_comp_sms;
+    const int seq;
+};
+struct final_globals {
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    using staging_pgl    = pgl<gl<bf16, 1, 1, -1, H>, NUM_DEVICES, false>;
+    using contrib_gl     = gl<int, 1, 1, -1, -1>;             // (num_tokens, world)
+    using cnt1d_gl       = gl<int, 1, 1, 1, -1>;              // recv_from (world,)
+    using combine_out_gl = gl<bf16, 1, 1, -1, H>;
+    using barrier_pgl    = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    staging_pgl staging;
+    contrib_gl final_contrib;
+    cnt1d_gl recv_from;
+    combine_out_gl combine_out;
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int num_source_tokens;
+    const int seq;
+};
+// LOCAL W2 completion signal — identical to v0 prered_signal_epilogue.
+struct signal_epilogue {
+    const globals &G;
+    const int col_blocks;
+    __device__ inline void operator()(int row_idx, int) const {
+        __threadfence();
+        kittens::group<gemm_config::CONSUMER_WARPS>::sync(1);
+        if (kittens::laneid() != 0 || kittens::warpid() != 0) return;
+        int done;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(done) : "l"(&G.barrier[G.dev_idx][{0, row_idx}]) : "memory");
+        if (done + 1 == col_blocks)
+            asm volatile("st.release.gpu.global.s32 [%0], %1;"
+                         :: "l"(&G.barrier[G.dev_idx][{1, row_idx}]), "r"(G.seq) : "memory");
+    }
+};
+struct no_gate { __device__ inline void operator()(int) const {} };
+// one push job: FP32 weighted-sum this card's local slots hitting (s,t) into an
+// smem row, TMA-push it to source card s's staging[my_rank][t], then the elected
+// last-completer for s fences+signals s's watermark.
+__device__ inline void push_job(const globals &G, const int j) {
+    if (j >= G.num_jobs) return;
+    constexpr int H = globals::H, VEC = 8, HVEC = H / VEC;
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::row_vec &row = al.allocate<typename globals::row_vec>();
+    __shared__ int s_slot[globals::TOP_K];
+    __shared__ float s_w[globals::TOP_K];
+    __shared__ int s_s, s_t, s_has;
+    if (threadIdx.x < globals::TOP_K) {
+        const int k = threadIdx.x;
+        const int slot = G.prered_slots[{j, k}];
+        s_slot[k] = slot;
+        s_w[k] = G.prered_w[{j, k}];
+        if (slot >= 0)
+            pcie_sync::wait_slot(G.barrier, G.dev_idx, 1, slot / gemm_config::ROW_BLOCK, G.seq);
+    }
+    if (threadIdx.x == 0) {
+        s_s = G.prered_dst[{j, 0}];
+        s_t = G.prered_dst[{j, 1}];
+        int has = 0;
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) has |= (G.prered_slots[{j, k}] >= 0);
+        s_has = has;
+    }
+    __syncthreads();
+    if (!s_has) return;  // empty job: no push, no count (matches host push_expected)
+
+    // FP32 weighted-sum into the smem row (bf16)
+    bf16 *row_ptr = reinterpret_cast<bf16 *>(&row);
+    float4 *row_v = reinterpret_cast<float4 *>(row_ptr);
+    for (int c = threadIdx.x; c < HVEC; c += blockDim.x) {
+        float acc[VEC];
+        #pragma unroll
+        for (int i = 0; i < VEC; i++) acc[i] = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) {
+            const int slot = s_slot[k];
+            if (slot < 0) continue;
+            const float w = s_w[k];
+            const bf16 *e_row = &G.outputs[{slot, 0}];
+            const float4 packed = reinterpret_cast<const float4 *>(e_row)[c];
+            const bf16_2 *pv = reinterpret_cast<const bf16_2 *>(&packed);
+            #pragma unroll
+            for (int jj = 0; jj < VEC / 2; jj++) {
+                float2 f = __bfloat1622float2(pv[jj]);
+                acc[2*jj] += w * f.x; acc[2*jj+1] += w * f.y;
+            }
+        }
+        bf16_2 res[VEC / 2];
+        #pragma unroll
+        for (int jj = 0; jj < VEC / 2; jj++) res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
+        row_v[c] = *reinterpret_cast<const float4 *>(res);
+    }
+    __syncthreads();
+    // TMA-push the smem row to source card s's staging plane [my_rank] row t.
+    if (threadIdx.x == 0) {
+        const int dst_row = G.dev_idx * G.num_source_tokens + s_t;
+        tma::store_async(G.staging[s_s], row, {dst_row, 0});
+        tma::store_async_wait();  // my remote bulk write committed
+        // LOCAL election (gpu scope): last completer for source s fences+signals.
+        int old;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(old) : "l"(&G.local_cnt[{s_s}]) : "memory");
+        if (old + 1 == G.push_expected_l1[{s_s}]) {
+            __threadfence_system();
+            pcie_sync::signal_slot(G.barrier, s_s, 2 + G.dev_idx, 0, G.seq);
+        }
+    }
+}
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void gemm_push_kernel(const __grid_constant__ globals G) {
+    const int col_blocks = static_cast<int>(G.weights.cols()) / gemm_config::COL_BLOCK;
+    if (blockIdx.x < G.num_comp_sms)
+        grouped_gemm_sm120(G, no_gate{}, signal_epilogue{G, col_blocks}, blockIdx.x, G.num_comp_sms);
+    else
+        push_job(G, blockIdx.x - G.num_comp_sms);
+}
+__global__ __launch_bounds__(256)
+void reset_kernel(const __grid_constant__ globals G) {
+    const int nb = (G.num_padded_local_tokens + gemm_config::ROW_BLOCK - 1) / gemm_config::ROW_BLOCK;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < nb; i += gridDim.x * blockDim.x)
+        G.barrier[G.dev_idx][{0, i}] = 0;
+}
+// source-card final reduce: wait per-card watermark, then sum contributing rows.
+__global__ void final_reduce_push_kernel(const __grid_constant__ final_globals G) {
+    const int t = blockIdx.x;
+    if (t >= G.num_source_tokens) return;
+    constexpr int H = final_globals::H, VEC = 8, HVEC = H / VEC;
+    __shared__ int s_contrib[final_globals::NUM_DEVICES];
+    // per-card watermark wait: only the cards that send me anything (recv_from)
+    if (threadIdx.x < final_globals::NUM_DEVICES) {
+        const int d = threadIdx.x;
+        s_contrib[d] = G.final_contrib[{t, d}];
+        if (G.recv_from[{d}] != 0)
+            pcie_sync::wait_slot(G.barrier, G.dev_idx, 2 + d, 0, G.seq);
+    }
+    __syncthreads();
+    bf16 *out_row = &G.combine_out[{t, 0}];
+    float4 *out_v = reinterpret_cast<float4 *>(out_row);
+    for (int c = threadIdx.x; c < HVEC; c += blockDim.x) {
+        float acc[VEC];
+        #pragma unroll
+        for (int i = 0; i < VEC; i++) acc[i] = 0.0f;
+        #pragma unroll 1
+        for (int d = 0; d < final_globals::NUM_DEVICES; d++) {
+            if (!s_contrib[d]) continue;
+            const int row = d * G.num_source_tokens + t;
+            const bf16 *p_row = &G.staging[G.dev_idx][{row, 0}];
+            const float4 packed = reinterpret_cast<const float4 *>(p_row)[c];
+            const bf16_2 *pv = reinterpret_cast<const bf16_2 *>(&packed);
+            #pragma unroll
+            for (int jj = 0; jj < VEC / 2; jj++) {
+                float2 f = __bfloat1622float2(pv[jj]);
+                acc[2*jj] += f.x; acc[2*jj+1] += f.y;
+            }
+        }
+        bf16_2 res[VEC / 2];
+        #pragma unroll
+        for (int jj = 0; jj < VEC / 2; jj++) res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
+        out_v[c] = *reinterpret_cast<const float4 *>(res);
+    }
+}
+static void _launch_gemm_push(globals &G, at::Tensor &padded_tokens_per_expert,
+                              int num_padded_local_tokens, int num_comm_sms) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(gemm_push_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    gemm_push_kernel<<<G.num_comp_sms + G.num_jobs, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / gemm_config::ROW_BLOCK + 255) / 256 + 1;
+    reset_kernel<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+static globals _make_globals(at::Tensor &activations, at::Tensor &weights,
+           kittens::py::TKParallelTensor &expert_outputs, at::Tensor &padded_tokens_per_expert,
+           kittens::py::TKParallelTensor &staging, at::Tensor &prered_dst,
+           at::Tensor &prered_slots, at::Tensor &prered_w, at::Tensor &local_cnt,
+           at::Tensor &push_expected_l1, kittens::py::TKParallelTensor &barrier,
+           int num_comm_sms, int num_padded_local_tokens, int num_source_tokens,
+           int num_jobs, int seq) {
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0)) / globals::NUM_DEVICES;
+    TORCH_CHECK(weights.size(0) == num_local_experts, "weights first dim mismatch");
+    TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms >= 1");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    const int num_comp_sms = sm - num_comm_sms;
+    return globals {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(activations),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(expert_outputs.data_),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = num_local_experts, .expert_offset = dev_idx * num_local_experts,
+        .staging = kittens::py::parallel_tensor_to_pgl<globals::staging_pgl>(staging),
+        .prered_dst = kittens::py::tensor_to_gl<globals::dst_gl>(prered_dst),
+        .prered_slots = kittens::py::tensor_to_gl<globals::slots_gl>(prered_slots),
+        .prered_w = kittens::py::tensor_to_gl<globals::w_gl>(prered_w),
+        .local_cnt = kittens::py::tensor_to_gl<globals::cnt1d_gl>(local_cnt),
+        .push_expected_l1 = kittens::py::tensor_to_gl<globals::cnt1d_gl>(push_expected_l1),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_padded_local_tokens = num_padded_local_tokens,
+        .num_source_tokens = num_source_tokens, .num_jobs = num_jobs,
+        .num_comp_sms = num_comp_sms, .seq = seq
+    };
+}
+void gemm_push_entry(at::Tensor &activations, at::Tensor &weights,
+           kittens::py::TKParallelTensor &expert_outputs, at::Tensor &padded_tokens_per_expert,
+           kittens::py::TKParallelTensor &staging, at::Tensor &prered_dst,
+           at::Tensor &prered_slots, at::Tensor &prered_w, at::Tensor &local_cnt,
+           at::Tensor &push_expected_l1, kittens::py::TKParallelTensor &barrier,
+           const int num_comm_sms, const int num_padded_local_tokens,
+           const int num_source_tokens, const int num_jobs, const int seq) {
+    globals G = _make_globals(activations, weights, expert_outputs, padded_tokens_per_expert,
+                              staging, prered_dst, prered_slots, prered_w, local_cnt,
+                              push_expected_l1, barrier, num_comm_sms,
+                              num_padded_local_tokens, num_source_tokens, num_jobs, seq);
+    _launch_gemm_push(G, padded_tokens_per_expert, num_padded_local_tokens, num_comm_sms);
+}
+void final_reduce_push_entry(kittens::py::TKParallelTensor &staging, at::Tensor &final_contrib,
+           at::Tensor &recv_from, at::Tensor &combine_out, kittens::py::TKParallelTensor &barrier,
+           const int num_source_tokens, const int seq) {
+    const int dev_idx = barrier.local_rank_;
+    final_globals G {
+        .staging = kittens::py::parallel_tensor_to_pgl<final_globals::staging_pgl>(staging),
+        .final_contrib = kittens::py::tensor_to_gl<final_globals::contrib_gl>(final_contrib),
+        .recv_from = kittens::py::tensor_to_gl<final_globals::cnt1d_gl>(recv_from),
+        .combine_out = kittens::py::tensor_to_gl<final_globals::combine_out_gl>(combine_out),
+        .barrier = kittens::py::parallel_tensor_to_pgl<final_globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_source_tokens = num_source_tokens, .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    final_reduce_push_kernel<<<num_source_tokens, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace preredpush
+
 #include <torch/csrc/utils/pybind.h>
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_TK_PARALLEL_TENSOR(m);
@@ -1251,4 +1535,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_combine_only", &comb::combine_only_entry);
     m.def("moe_gemm_prered_fused", &prered::gemm_prered_entry);
     m.def("moe_final_reduce", &prered::final_reduce_entry);
+    m.def("moe_gemm_prered_push_fused", &preredpush::gemm_push_entry);
+    m.def("moe_final_reduce_push", &preredpush::final_reduce_push_entry);
 }

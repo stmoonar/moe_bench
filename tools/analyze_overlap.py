@@ -97,43 +97,25 @@ def _worker(rank, world, init_method, ne, warmup, iters, out_list):
     flop1 = 2.0 * npl * inter * H          # W2: (npl,inter)@(inter,H)
     def L1_gemm():                          # pure W2 GEMM
         tk.grouped_gemm(sch.act, sch.w2, sch.expert_out.data_, sch.padded, eoff)
-    def L1_fused():                         # W2⊕prered + barrier + final_reduce
+    def L1_fused():                         # W2⊕prered_push + final_reduce_push (T6-v1)
         sch._l1_seq += 1
-        tk.moe_gemm_prered_fused(sch.act, sch.w2, sch.expert_out, sch.padded,
-                                 sch.partials, sch.prered_dst, sch.prered_slots,
-                                 sch.prered_w, sch.barrier_l1, sch.num_comm_sms,
-                                 sch.num_padded_local, sch.num_tokens, sch.num_jobs, sch._l1_seq)
-        sch._l0_seq += 1; tk.pcie_device_barrier(sch.barrier_l0, sch._l0_seq)
-        tk.moe_final_reduce(sch.partials, sch.final_contrib, sch.combine_out,
-                            sch.barrier_l0, sch.num_tokens)
-
-    def L1_prered():                        # W2⊕prered only (no barrier/final_reduce)
-        sch._l1_seq += 1
-        tk.moe_gemm_prered_fused(sch.act, sch.w2, sch.expert_out, sch.padded,
-                                 sch.partials, sch.prered_dst, sch.prered_slots,
-                                 sch.prered_w, sch.barrier_l1, sch.num_comm_sms,
-                                 sch.num_padded_local, sch.num_tokens, sch.num_jobs, sch._l1_seq)
+        sch.combine_local_cnt.zero_()
+        tk.moe_gemm_prered_push_fused(sch.act, sch.w2, sch.expert_out, sch.padded,
+                                      sch.combine_staging, sch.prered_dst, sch.prered_slots,
+                                      sch.prered_w, sch.combine_local_cnt, sch.push_expected_l1,
+                                      sch.barrier_l1, sch.num_comm_sms, sch.num_padded_local,
+                                      sch.num_tokens, sch.num_jobs, sch._l1_seq)
+        tk.moe_final_reduce_push(sch.combine_staging, sch.final_contrib, sch.recv_from,
+                                 sch.combine_out, sch.barrier_l1, sch.num_tokens, sch._l1_seq)
 
     t = {}
     t["L0_gemm"] = _time(L0_gemm, warmup, iters)
-    t["L1_prered"] = _time(L1_prered, warmup, iters)
     _prep(); t["L0_fused"] = _time(lambda: (_prep(), L0_fused()), warmup, iters)
     t["L1_gemm"] = _time(L1_gemm, warmup, iters)
     t["L1_fused"] = _time(L1_fused, warmup, iters)
 
-    # standalone comm proxies (no GEMM):
-    #  - final_reduce alone = source-side cross-card partial gather (T6-v1 replaces
-    #    the source pull with expert-side push; this is the pull cost it competes with)
-    def L1_finalreduce():
-        sch._l0_seq += 1; tk.pcie_device_barrier(sch.barrier_l0, sch._l0_seq)
-        tk.moe_final_reduce(sch.partials, sch.final_contrib, sch.combine_out,
-                            sch.barrier_l0, sch.num_tokens)
-    # populate partials once so final_reduce reads real data
-    L1_fused(); torch.cuda.synchronize(); dist.barrier()
-    t["L1_finalreduce"] = _time(L1_finalreduce, warmup, iters)
-
     out_list.append({"rank": rank, "npl": npl, "N0": N0, "flop0": flop0,
-                     "flop1": flop1, "fuse": fuse, **t})
+                     "flop1": flop1, "fuse": fuse, "combine": sch.combine_mode, **t})
     del sch, problem; torch.cuda.empty_cache()
     dist.destroy_process_group()
 
@@ -155,27 +137,16 @@ def main():
     rows = sorted(out_list, key=lambda r: r["rank"])
     rm = max(rows, key=lambda r: r["L1_fused"])
     print(f"\n===== comm/compute overlap + fusion penalty  NE={ne}  world={world} "
-          f"(max-time rank {rm['rank']}, npl={rm['npl']}, fuse_gateup={rm['fuse']}, N0={rm['N0']}) =====")
+          f"(max-time rank {rm['rank']}, npl={rm['npl']}, fuse_gateup={rm['fuse']}, "
+          f"combine={rm['combine']}, N0={rm['N0']}) =====")
     for lab, gemm, fused, flop in [
             ("LAYER0 dispatch⊕gate+up", "L0_gemm", "L0_fused", "flop0"),
-            ("LAYER1 prered combine  ", "L1_gemm", "L1_fused", "flop1")]:
+            ("LAYER1 combine         ", "L1_gemm", "L1_fused", "flop1")]:
         g = rm[gemm]*1e3; fu = rm[fused]*1e3; pen = fu - g
         print(f"\n  {lab}")
         print(f"    pure compute (GEMM)   : {g:8.1f} us   {_tf(rm[flop],rm[gemm]):6.1f} TFLOP/s")
         print(f"    fused (comm+compute)  : {fu:8.1f} us   {_tf(rm[flop],rm[fused]):6.1f} TFLOP/s")
         print(f"    fusion penalty        : {pen:8.1f} us   (+{pen/g*100:4.1f}% over pure compute)")
-    # layer1 standalone comm (source-side partial gather) and overlap estimate
-    fr = rm["L1_finalreduce"]*1e3
-    l1pen = (rm["L1_fused"] - rm["L1_gemm"])*1e3
-    print(f"\n  LAYER1 comm detail")
-    print(f"    W2⊕prered only (no barrier/final)                    : {rm['L1_prered']*1e3:8.1f} us")
-    print(f"    final_reduce alone (source cross-card partial gather): {fr:8.1f} us")
-    print(f"    layer1 fusion penalty (un-overlapped comm)           : {l1pen:8.1f} us")
-    preredpen = (rm["L1_prered"] - rm["L1_gemm"])*1e3
-    print(f"      of which W2⊕prered penalty (scatter+signal)        : {preredpen:8.1f} us")
-    print(f"      of which barrier + final_reduce                    : {l1pen - preredpen:8.1f} us")
-    hid = max(fr - l1pen, 0.0)
-    print(f"    => hidden under W2 GEMM ≈ {hid:6.1f} us  ({(hid/fr*100 if fr>0 else 0):4.1f}% of standalone comm)")
     print()
 
 
