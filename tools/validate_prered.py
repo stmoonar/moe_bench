@@ -32,6 +32,8 @@ import torch.nn.functional as F
 
 def _worker(rank, world, init_method, num_experts, iters, out_list):
     os.environ["TK_COMBINE"] = "prered"
+    os.environ["TK_FUSE_GATEUP"] = "0"  # this tool drives w_gate/disp_idx directly
+    os.environ["TK_GPU_SCHED"] = "0"    # host schedule (tool builds act via w_gate)
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     torch.set_default_device(device)

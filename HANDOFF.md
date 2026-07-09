@@ -15,12 +15,13 @@
 ## 2. 当前状态(全部已提交,分支 tk_dev)
 
 - **正确性**:tkfused 全链路对拍 reference_moe 通过(bf16, EP, 4 卡, rel_err ~4.4e-3)。
-- **性能**(NE=256, 512 token/rank, bf16):tkfused **5571µs vs serial 7063µs**(快 1.27×)
-  (**T6-v0 combine 预归约 + T4 gate+up 合并**;NE=64 3234µs。schedule 预计算未计时,
-  公平性仍打折,见 docs/07 P1 → 路线图 T3)。
+- **性能**(NE=256, 512 token/rank, bf16):tkfused **5832µs vs serial 7063µs**(快 1.21×,
+  **schedule 已 GPU 化并计入 run(),公平口径,星号已去**;T3 前不计时口径为 5603µs;
+  NE=64 3462µs)。
 - **combine 两条路径**:`TK_COMBINE=prered`(默认,T6-v0,docs/13,全档位优于 pull)|
   `pull`(旧 moe_gemm_combine_fused,保留)。
 - **T4 gate+up 合并**:`TK_FUSE_GATEUP=1`(默认,pull dispatch)。
+- **T3 schedule GPU 化**:`TK_GPU_SCHED=1`(默认,pull+prered 路径,CUDA graph,docs/14)。
 - **dispatch 三条路径**:`TK_DISPATCH=pull`(默认,已对拍)| `push3`(正确,NE≤128 更快、
   NE=256 更慢,docs/10)| `push`/`push2`(冻结,docs/08)。
 - **代码**:`tk_scheme.py`(scheme + host schedule)、`kernels/tk/tk_moe.cu`(gg/disp/
@@ -30,7 +31,9 @@
   `time_layer1.py`(T1 layer1 5 点隔离归因)、`ncu_gemm_probe.py`(单卡 ncu)、
   `validate_push3.py` / `verify_push3_schedule.py`(协议裁决)、
   `reconcile_prereduce.py`(T6-v0 预归约表对账,docs/13)、
-  `validate_prered.py`(T6-v0 全链路正确性:prered vs pull combine,30 迭代 × 3 NE)。
+  `validate_prered.py`(T6-v0 全链路正确性:prered vs pull combine,30 迭代 × 3 NE)、
+  `verify_schedule_gpu.py`(T3 GPU schedule vs host golden element-wise,docs/14)、
+  `time_schedule.py`(T3 schedule 重算成本:all_gather/eager/graph 分解)。
   ⚠️ `time_layer1.py` / `ncu_gemm_probe.py` 及 `tk_moe.cu` 的 T1 debug 入口
   (`gg::entry_nb`、`comb::combine_only_entry`)在服务器侧,**尚未同步入本仓库提交**。
 
@@ -42,7 +45,7 @@
 |---|---|---|
 | T1 | ncu 归因 layer1 GEMM 为何只有 71 TFLOP/s(fence/SM让渡/L2) | **✅ 完成(docs/12):假设推翻,慢在 combine gather 94~99%,非 fusion** |
 | T2 | combine epilogue 换 push3 式选举信号(预期 layer1 −1ms) | **❄️ 冻结(T1 止损:fence 仅 1.2~2.8%,收益 ≤0.05ms)** |
-| T3 | schedule GPU 化并计入 run()(公平性,报数前必须) | 未开始(排 T6 schedule 表定型后、报数前) |
+| T3 | schedule GPU 化并计入 run()(公平性,报数前必须) | **✅ 完成(docs/14):默认路径 6 表 GPU 化 + CUDA graph(~205µs),计入 run();对拍 host golden 全等(NE×{balanced,skewed});e2e NE=256 计入后 5832µs 仍 < serial(1.21×),星号已去** |
 | T4 | gate+up 合并一次 GEMM(up 的 1.5ms 藏进 dispatch) | **✅ 完成(docs/13 §6):NE=256 −204µs、NE=64 −478µs,默认开;T5 后 up 才完全隐藏** |
 | T5 | ROW_BLOCK=64(NE=256 两层 GEMM 各省一半行) | 未开始(**后移到 T6 之后**,docs/11 §3) |
 | T6 | combine 预归约 + push 化(A' 镜像,layer1 通信 4×) | **⬆️ 主攻,v0 ✅ 落地达标:NE=256 e2e 7131→5775µs(首超 serial 7063),NE∈{64,128,256} 对拍全过 rel~7e-3,prered 设默认(docs/13 §5);下一步 v1 push 化** |
@@ -96,5 +99,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | docs/09/10 | push3 规划 / 实现验证实测(NE 交叉点) |
 | **docs/11** | **第二轮评审 + 当前任务清单(T1~T9,做事看这篇)** |
 | **docs/12** | **T1 归因实测:layer1 慢在 combine gather(94~99%),非 fusion;T2 冻结→T6** |
-| **docs/13** | **T6-v0:combine 预归约 host 表设计(按 expert 卡重分组,等价)+ 双向对账工具** |
+| **docs/13** | **T6-v0:combine 预归约 host 表设计(按 expert 卡重分组,等价)+ 双向对账工具 + kernel 落地 + T4 gate+up 合并** |
+| **docs/14** | **T3:schedule GPU 化(单 argsort ring-order + 稠密 job 空间)+ CUDA graph 捕获,计入 run() 公平口径** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

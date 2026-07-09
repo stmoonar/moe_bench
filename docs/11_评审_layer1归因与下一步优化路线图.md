@@ -164,6 +164,12 @@ T9 (工程杂项) —— 穿插
 
 ### T3:schedule GPU 化并计入 run()(公平性 P1,信用前提)
 
+> **【已完成 2026-07-09 — 见 docs/14】** 默认路径(pull+prered+fused)的 6 张 schedule
+> 表 GPU 向量化(单次全局 argsort 复现 ring-order slot + 稠密 job 空间),CUDA graph 捕获
+> (~205µs),每迭代计入 run()。对 host golden element-wise 全等(NE∈{64,128,256}×
+> {balanced,skewed})。e2e NE=256 计入后 5832µs(+229µs),仍 < serial 7063(1.21×),
+> **星号已去掉**。`TK_GPU_SCHED=1` 默认。
+
 **现状证据**:docs/07 P1。`_build_schedules` host 四重循环在 setup() 不计时;serial 的
 `moe_align_block_size` 每次 run 在 GPU 上做。"打平 serial"带星号。
 

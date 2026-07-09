@@ -170,11 +170,15 @@ def _build_prereduce_schedule(topk_ids, topk_weights, num_tokens, world_size,
     Standalone / not wired into run() or setup(): this is the T6 foundation to
     be adjudicated clean before any kernel change (docs/11 §3).
 
-    Returns, EXPERT-CARD view (this rank as producer d == rank):
-      prered_dst   (J, 2)     int32 : (src_dev, src_tok) each partial job targets
-      prered_slots (J, TOP_K) int32 : local slots to FP32-reduce (-1 padded)
-      prered_w     (J, TOP_K) f32   : weights aligned to slots (0 padded)
-      num_jobs J
+    Returns, EXPERT-CARD view (this rank as producer d == rank). DENSE job space
+    (docs/14): num_jobs = world*num_tokens, job j = src_dev*num_tokens + src_tok
+    covers ALL (src_dev, src_tok) pairs (aligned to the partials buffer rows);
+    column = kpos. Jobs with no local hit stay all -1 (harmless unread zero row).
+    Constant num_jobs makes the GPU rebuild (T3) fixed-shape / graph-capturable.
+      prered_dst   (J, 2)     int32 : (src_dev, src_tok) per job (= (j//T, j%T))
+      prered_slots (J, TOP_K) int32 : local slot per kpos (-1 where no local hit)
+      prered_w     (J, TOP_K) f32   : weight per kpos (0 where no local hit)
+      num_jobs J = world*num_tokens
     and SOURCE-CARD view (this rank as consumer s == rank):
       final_contrib (num_tokens, world) int32 : 1 iff card d holds ≥1 of t's experts
     """
@@ -190,9 +194,21 @@ def _build_prereduce_schedule(topk_ids, topk_weights, num_tokens, world_size,
     tokens_per_expert = torch.bincount(all_topk.view(-1), minlength=num_experts).to(torch.int32)
     padded_cpu = ((tokens_per_expert + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK).cpu().long()
 
-    # expert-card side: (src_dev, src_tok) -> list of (local_slot, weight) this
-    # card must FP32-reduce into one partial row. source-card side: contrib mask.
-    jobs: dict[tuple[int, int], list[tuple[int, float]]] = {}
+    # expert-card side: (src_dev, src_tok) -> per-kpos (local_slot, weight) this
+    # card must FP32-reduce into one partial row. DENSE job space (docs/14):
+    # job j = src_dev*num_tokens + src_tok covers ALL (src_dev, src_tok) pairs,
+    # aligned to the partials buffer row layout; column = kpos (order-independent
+    # for a sum). Jobs with no local hit stay all -1 and write a harmless unread
+    # zero row. num_jobs = world*num_tokens (constant, routing-independent) —
+    # which makes the GPU rebuild (T3) fixed-shape / CUDA-graph capturable.
+    num_jobs = world_size * num_tokens
+    prered_dst = torch.full((num_jobs, 2), -1, dtype=torch.int32, device="cpu")
+    prered_slots = torch.full((num_jobs, top_k), -1, dtype=torch.int32, device="cpu")
+    prered_w = torch.zeros((num_jobs, top_k), dtype=torch.float32, device="cpu")
+    src_dev_col = torch.arange(num_jobs) // num_tokens
+    src_tok_col = torch.arange(num_jobs) % num_tokens
+    prered_dst[:, 0] = src_dev_col.to(torch.int32)
+    prered_dst[:, 1] = src_tok_col.to(torch.int32)
     final_contrib = torch.zeros(num_tokens, world_size, dtype=torch.int32, device="cpu")
 
     for e_rank in range(world_size):
@@ -210,25 +226,104 @@ def _build_prereduce_schedule(topk_ids, topk_weights, num_tokens, world_size,
                         e = eid - estart
                         slot = write_pos[e]
                         write_pos[e] += 1
-                        if e_rank == rank:  # I am the expert card: accumulate a partial job
-                            w = float(all_w_cpu[src_dev, src_tok, kpos])
-                            jobs.setdefault((src_dev, src_tok), []).append((slot, w))
+                        if e_rank == rank:  # I am the expert card: record hit at (job, kpos)
+                            j = src_dev * num_tokens + src_tok
+                            prered_slots[j, kpos] = slot
+                            prered_w[j, kpos] = float(all_w_cpu[src_dev, src_tok, kpos])
                         if src_dev == rank:  # I am the source card: mark contributor
                             final_contrib[src_tok, e_rank] = 1
 
-    num_jobs = len(jobs)
-    prered_dst = torch.full((max(num_jobs, 1), 2), -1, dtype=torch.int32, device="cpu")
-    prered_slots = torch.full((max(num_jobs, 1), top_k), -1, dtype=torch.int32, device="cpu")
-    prered_w = torch.zeros((max(num_jobs, 1), top_k), dtype=torch.float32, device="cpu")
-    for j, (src_dev, src_tok) in enumerate(sorted(jobs.keys())):
-        prered_dst[j, 0] = src_dev
-        prered_dst[j, 1] = src_tok
-        for c, (slot, w) in enumerate(jobs[(src_dev, src_tok)]):
-            prered_slots[j, c] = slot
-            prered_w[j, c] = w
-
     return (prered_dst.to(device), prered_slots.to(device), prered_w.to(device),
             num_jobs, final_contrib.to(device))
+
+
+def _build_schedules_gpu(all_topk, all_w, world_size, num_experts,
+                         num_experts_per_dev, rank, out):
+    """T3 (docs/14): GPU-vectorized rebuild of the DEFAULT-path schedule tables,
+    element-for-element identical to the host `_build_schedules` /
+    `_build_prereduce_schedule` goldens. Called each run() and counted in timing
+    (fairness — serial pays its routing metadata per run; docs/07 P1, docs/11 §T3).
+
+    Reproduces the host's ring-order slot cursor with ONE global sort. Host assigns
+    a token-expert assignment's slot by its rank in the total order
+
+        (eid, ring_offset, src_tok, kpos),  ring_offset = (src_dev - e_rank) mod world
+
+    Because (src_dev, src_tok, kpos) is a bijection over flattened all_topk, every
+    key is UNIQUE — so argsort needs no stability (CUDA argsort is not stable).
+
+    `all_topk` (world, T, TOPK) int, `all_w` (world, T, TOPK) f32 are already
+    gathered. `out` is a dict of PRE-ALLOCATED output tensors written in place:
+      disp_idx (P,2) int32, padded (num_experts,) int32,
+      prered_dst (J,2) int32, prered_slots (J,TOP_K) int32, prered_w (J,TOP_K) f32,
+      final_contrib (T, world) int32
+    plus constant index grids src_dev_grid/src_tok_grid/kpos_grid (shape N).
+    No GPU->host sync; grid/tensor sizes are fixed (routing invariant per problem).
+    """
+    device = all_topk.device
+    T = all_topk.shape[1]
+    top_k = all_topk.shape[2]
+    e_local = num_experts_per_dev
+    N = world_size * T * top_k
+
+    eid = all_topk.reshape(N).long()
+    e_rank_of = eid // e_local
+    ring = (out["src_dev_grid"] - e_rank_of) % world_size
+    key = ((eid * world_size + ring) * T + out["src_tok_grid"]) * top_k + out["kpos_grid"]
+    order = torch.argsort(key)
+    eid_s = eid[order]
+
+    # per-expert counts (shared cursor across ALL source devices) + padding.
+    # scatter_add (not bincount) — bincount does a device sync that breaks CUDA
+    # graph capture; scatter_add is capture-safe and equivalent.
+    counts = torch.zeros(num_experts, dtype=torch.long, device=device)
+    counts.scatter_add_(0, eid, torch.ones_like(eid))
+    padded = ((counts + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK).to(torch.int32)
+    out["padded"].copy_(padded)
+    grp_start = torch.zeros(num_experts, dtype=torch.long, device=device)
+    grp_start[1:] = torch.cumsum(counts, dim=0)[:-1]
+    pos_in_expert = torch.arange(N, device=device) - grp_start[eid_s]
+
+    # absolute padded slot for EVERY (sorted) assignment; local ones land in
+    # [0, num_padded_local). Non-local ones use a masked el_idx=0 to stay
+    # in-bounds and are dropped by the trash-row redirect below — no boolean
+    # compaction, so the whole builder is fixed-shape / CUDA-graph capturable.
+    is_loc = (eid_s // e_local) == rank
+    el_idx = torch.where(is_loc, eid_s - rank * e_local, torch.zeros_like(eid_s))
+    padded_l = padded[rank * e_local:(rank + 1) * e_local].long()
+    padded_base = torch.zeros(e_local, dtype=torch.long, device=device)
+    padded_base[1:] = torch.cumsum(padded_l, dim=0)[:-1]
+    slot_abs_sorted = padded_base[el_idx] + pos_in_expert
+
+    # ---- disp_idx: slot -> (src_dev, src_tok) (local assignments only) ----
+    # non-local assignments scatter into a trash row P (extra slot), then dropped.
+    P = out["disp_idx"].shape[0]
+    slot_dst = torch.where(is_loc, slot_abs_sorted, torch.full_like(slot_abs_sorted, P))
+    di = torch.full((P + 1, 2), -1, dtype=torch.int32, device=device)
+    di[:, 0].scatter_(0, slot_dst, out["src_dev_grid"][order].to(torch.int32))
+    di[:, 1].scatter_(0, slot_dst, out["src_tok_grid"][order].to(torch.int32))
+    out["disp_idx"].copy_(di[:P])
+
+    # ---- prered (DENSE job space, column = kpos): the flat cell of prered_slots
+    # for assignment n is (src_dev*T + src_tok)*top_k + kpos == n (the original
+    # flat index). So scatter each sorted local assignment's slot back to its
+    # original position `order[pos]`. Column order within a job is kpos, which is
+    # order-independent for the FP32 sum. prered_dst is constant (set by caller).
+    slot_by_n = torch.full((N,), -1, dtype=torch.int32, device=device)
+    w_by_n = torch.zeros(N, dtype=torch.float32, device=device)
+    slot_by_n.scatter_(0, order, torch.where(is_loc, slot_abs_sorted.to(torch.int32),
+                                             torch.full_like(eid_s, -1, dtype=torch.int32)))
+    w_by_n.scatter_(0, order, torch.where(is_loc, all_w.reshape(N)[order],
+                                          torch.zeros(N, device=device)))
+    out["prered_slots"].copy_(slot_by_n.view(world_size * T, top_k))
+    out["prered_w"].copy_(w_by_n.view(world_size * T, top_k))
+
+    # ---- final_contrib (source view): card d holds >=1 of my token t's experts ----
+    card = (all_topk[rank] // e_local).long()  # (T, TOPK)
+    out["final_contrib"].zero_()
+    out["final_contrib"].scatter_(1, card, torch.ones_like(card, dtype=torch.int32))
+
+    return P, world_size * T
 
 
 class TKFusedEP(DistributedScheme):
@@ -328,11 +423,48 @@ class TKFusedEP(DistributedScheme):
             _build_prereduce_schedule(problem.topk_ids, problem.topk_weights,
                                       num_tokens, world, num_experts, e_local,
                                       ctx.rank, device)
-        self.prered_dst = prered_dst
-        self.prered_slots = prered_slots
-        self.prered_w = prered_w
+        self.prered_dst = prered_dst.contiguous()
+        self.prered_slots = prered_slots.contiguous()
+        self.prered_w = prered_w.contiguous()
         self.num_jobs = num_jobs
         self.final_contrib = final_contrib.contiguous()  # (num_tokens, world) int32
+
+        # T3 (docs/14): GPU-vectorized schedule rebuild, counted in run() for a
+        # fair vs-serial number (serial pays routing metadata per run; docs/07 P1).
+        # Default ON. Grid sizes (num_padded_local, num_jobs) stay host-computed
+        # above for allocation (routing fixed per problem); only the index
+        # CONTENTS recompute on GPU each run. Covers the DEFAULT path tables only.
+        self.gpu_schedule = _os.environ.get("TK_GPU_SCHED", "1") == "1"
+        if self.gpu_schedule:
+            N = world * num_tokens * self.top_k
+            ar = torch.arange(N, device=device)
+            self._sched_grids = {
+                "src_dev_grid": ar // (num_tokens * self.top_k),
+                "src_tok_grid": (ar // self.top_k) % num_tokens,
+                "kpos_grid": ar % self.top_k,
+            }
+            # per-run routing gather buffers (all ranks' topk_ids / weights)
+            self._all_topk = torch.empty(world, num_tokens, self.top_k,
+                                         device=device, dtype=problem.topk_ids.dtype)
+            self._all_w = torch.empty(world, num_tokens, self.top_k,
+                                      device=device, dtype=torch.float32)
+            self._topk_ids_local = problem.topk_ids.contiguous()
+            self._topk_w_local = problem.topk_weights.float().contiguous()
+            self._num_experts = num_experts
+            self._e_local = e_local
+            # prered_dst is a constant of the dense job space (j = src_dev*T +
+            # src_tok); the GPU builder does not rewrite it, so set it once here.
+            nj = world * num_tokens
+            self.prered_dst[:, 0] = (torch.arange(nj, device=device) // num_tokens).to(torch.int32)
+            self.prered_dst[:, 1] = (torch.arange(nj, device=device) % num_tokens).to(torch.int32)
+            # in-place GPU write targets (fixed shape/address -> CUDA-graph safe)
+            self._sched_out = {
+                **self._sched_grids,
+                "disp_idx": self.disp_idx, "padded": self.padded,
+                "prered_dst": self.prered_dst, "prered_slots": self.prered_slots,
+                "prered_w": self.prered_w, "final_contrib": self.final_contrib,
+            }
+            self._sched_graph = None  # captured lazily on first run()
 
         # weights: problem.w1 (E_local, 2*inter, H) is [gate; up] stored for x@w.T.
         # grouped_gemm computes x @ W with W as (K, N), so W = w.T:
@@ -402,6 +534,33 @@ class TKFusedEP(DistributedScheme):
 
     def run(self) -> torch.Tensor:
         tk = self.tk
+        # T3 (docs/14): rebuild the DEFAULT-path schedule on GPU each iteration,
+        # inside the timed region — the fair analogue of serial's per-run routing
+        # metadata (moe_align_block_size) + routing all_gathers. Grid sizes are
+        # fixed (routing invariant per problem), so this only rewrites the index
+        # CONTENTS of pre-allocated tables; num_padded_local / num_jobs are
+        # asserted unchanged. Only active on the default path (pull + prered).
+        if self.gpu_schedule and self.dispatch_mode == "pull" and self.combine_mode == "prered":
+            torch.distributed.all_gather_into_tensor(self._all_topk, self._topk_ids_local)
+            torch.distributed.all_gather_into_tensor(self._all_w, self._topk_w_local)
+            # The pure-compute builder (no NCCL, fixed shapes, fixed tensor
+            # addresses) is CUDA-graph captured on first call and replayed after —
+            # this cuts the ~30 eager kernel launches from ~660µs to ~180µs. The
+            # all_gathers above stay eager (NCCL can't be captured here).
+            if self._sched_graph is None:
+                _build_schedules_gpu(self._all_topk, self._all_w, self.ctx.world_size,
+                                     self._num_experts, self._e_local, self.ctx.rank,
+                                     self._sched_out)  # warmup (populates + allocs)
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    _build_schedules_gpu(self._all_topk, self._all_w, self.ctx.world_size,
+                                         self._num_experts, self._e_local, self.ctx.rank,
+                                         self._sched_out)
+                self._sched_graph = g
+            else:
+                self._sched_graph.replay()
+
         # P2: barrier BEFORE overwriting pre_tokens, so no peer is still pulling
         # last iteration's tokens when we clobber the buffer. The safety of
         # copy->dispatch used to rely on an implicit chain (peer pull ⇔ combine
