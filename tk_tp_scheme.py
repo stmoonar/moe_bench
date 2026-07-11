@@ -72,13 +72,16 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     padded = (counts + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK
     num_padded_total = int(padded.sum())
 
+    # NOTE: explicit device="cpu" everywhere — the distributed worker runs under
+    # torch.set_default_device(cuda), which would silently move these host-side
+    # tables (and turn the fill loop into 16k+ single-element GPU writes).
     write_pos = torch.cat([
-        torch.zeros(1, dtype=torch.int64),
+        torch.zeros(1, dtype=torch.int64, device="cpu"),
         torch.cumsum(padded[:-1], dim=0)
     ]).tolist()
     S = world_size * num_tokens
-    tp_slots = torch.full((S, top_k), -1, dtype=torch.int32)
-    tp_w = torch.zeros((S, top_k), dtype=torch.float32)
+    tp_slots = torch.full((S, top_k), -1, dtype=torch.int32, device="cpu")
+    tp_w = torch.zeros((S, top_k), dtype=torch.float32, device="cpu")
     for i in range(world_size):
         src_dev = (rank + i) % world_size  # ring, own shard first
         for src_tok in range(num_tokens):
@@ -90,7 +93,7 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
                 tp_w[j, kpos] = float(all_w_cpu[src_dev, src_tok, kpos])
 
     nblk = num_padded_total // ROW_BLOCK
-    slack = torch.zeros(nblk, dtype=torch.int32)
+    slack = torch.zeros(nblk, dtype=torch.int32, device="cpu")
     blk = 0
     for e in range(num_experts):
         real_e = int(counts[e])
