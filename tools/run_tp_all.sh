@@ -37,9 +37,9 @@ if [ "$(basename "$MOE_DIR")" != "moe_bench" ]; then
     note "FATAL: 目录名必须是 moe_bench（当前 $(basename "$MOE_DIR")），否则 python -m moe_bench.* 找不到模块"
     exit 1
 fi
-if [ ! -f "$PARENT_DIR/ThunderKittens/include/kittens.cuh" ] && [ ! -f "$MOE_DIR/../ThunderKittens/include/kittens.cuh" ]; then
-    note "FATAL: 找不到 ThunderKittens/include/kittens.cuh（应位于 moe_bench 同级目录）。"
-    note "       新 clone 请先执行: git submodule update --init"
+if [ ! -f "$MOE_DIR/ThunderKittens/include/kittens.cuh" ]; then
+    note "FATAL: 找不到 $MOE_DIR/ThunderKittens/include/kittens.cuh（TK submodule 在 moe_bench 内）。"
+    note "       submodule 未初始化的话先执行: git -C $MOE_DIR submodule update --init"
     exit 1
 fi
 if [ "$VENV" != "none" ]; then
