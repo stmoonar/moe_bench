@@ -110,9 +110,9 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     # stability; the +index tie-break just keeps host/GPU byte-identical under
     # any future table change.
     mins = tp_slots.min(dim=1).values.long()
-    pull_order = torch.argsort(mins * S + torch.arange(S)).to(torch.int32)
+    pull_order = torch.argsort(mins * S + torch.arange(S, device="cpu")).to(torch.int32)
     maxs = tp_slots.max(dim=1).values.long()
-    job_order = torch.argsort(maxs * S + torch.arange(S)).to(torch.int32)
+    job_order = torch.argsort(maxs * S + torch.arange(S, device="cpu")).to(torch.int32)
 
     return (padded.to(torch.int32).to(device), tp_slots.to(device),
             tp_w.to(device), slack.to(device), pull_order.to(device),

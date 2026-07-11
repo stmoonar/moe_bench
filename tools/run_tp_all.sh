@@ -112,13 +112,22 @@ run_step() {  # run_step <名字> <超时秒> <命令...>
 
 cd "$PARENT_DIR"
 
+# ---------- 0b. CPU 预检（无 GPU 依赖：设备守卫 + 表裁决 + 数据流模拟） ----------
+run_step 00_preflight_cpu 600 python "$MOE_DIR/tools/preflight_tp_cpu.py"
+if [ "$FAIL" -gt 0 ]; then
+    note "CPU 预检失败, 不烧卡, 直接打包退出"
+    SKIP_ALL=1
+fi
+
 # ---------- 1. 干净编译（清缓存防 .so 过期） ----------
+if [ "${SKIP_ALL:-0}" != "1" ]; then
 rm -rf "$MOE_DIR/kernels/tk/build"
 run_step 01_build 1800 python "$MOE_DIR/kernels/tk/build.py" 4
+fi
 
-# 编译失败则后续全部无意义，直接打包退出
-if [ ! -f "$MOE_DIR/kernels/tk/build/"tk_moe_w4_h4096_rb128.so ]; then
-    note "编译产物缺失，跳过全部运行步骤"
+# 预检/编译失败则后续全部无意义，直接打包退出
+if [ "${SKIP_ALL:-0}" = "1" ] || [ ! -f "$MOE_DIR/kernels/tk/build/"tk_moe_w4_h4096_rb128.so ]; then
+    note "预检失败或编译产物缺失，跳过全部运行步骤"
 else
     # ---------- 2. 调度裁决：GPU builder vs host golden + TP 不变量 ----------
     run_step 02_verify_tp_schedule 900 python -m moe_bench.tools.verify_tp_schedule
