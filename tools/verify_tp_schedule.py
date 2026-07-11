@@ -54,7 +54,7 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
     topk_weights = all_w[rank].contiguous()
 
     # ---- host golden ----
-    (padded_g, slots_g, w_g, slack_g, P) = _build_tp_schedules(
+    (padded_g, slots_g, w_g, slack_g, pull_g, job_g, P) = _build_tp_schedules(
         topk_ids, topk_weights, T, world, ne, rank, device)
 
     # ---- GPU builder ----
@@ -68,6 +68,8 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
         "tp_slots": torch.full((world * T, topk), -1, dtype=torch.int32, device=device),
         "prered_w": torch.zeros(world * T, topk, dtype=torch.float32, device=device),
         "slack": torch.zeros(P // ROW_BLOCK, dtype=torch.int32, device=device),
+        "pull_order": torch.zeros(world * T, dtype=torch.int32, device=device),
+        "job_order": torch.zeros(world * T, dtype=torch.int32, device=device),
     }
     _build_tp_schedules_gpu(all_ids, all_w, world, ne, rank, out)
 
@@ -75,7 +77,9 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
     for name, got, ref in [("padded", out["padded"], padded_g),
                            ("tp_slots", out["tp_slots"], slots_g),
                            ("prered_w", out["prered_w"], w_g),
-                           ("slack", out["slack"], slack_g)]:
+                           ("slack", out["slack"], slack_g),
+                           ("pull_order", out["pull_order"], pull_g),
+                           ("job_order", out["job_order"], job_g)]:
         if got.shape != ref.shape:
             fails.append(f"{name} shape {tuple(got.shape)} != host {tuple(ref.shape)}")
         elif not torch.equal(got, ref):
@@ -105,6 +109,18 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
     real_per_blk = torch.bincount(flat // ROW_BLOCK, minlength=P // ROW_BLOCK)
     if not torch.equal(real_per_blk + slack_g.long(), torch.full_like(real_per_blk, ROW_BLOCK)):
         fails.append("slack[b] + real_in_block != ROW_BLOCK somewhere")
+    # docs/20 orders: both must be permutations of [0, world*T), and sorted by
+    # their respective keys (pull: min slot ascending, job: max slot ascending)
+    S = world * T
+    for name, ordv, key in [("pull_order", pull_g, slots_g.min(dim=1).values),
+                            ("job_order", job_g, slots_g.max(dim=1).values)]:
+        o = ordv.long()
+        if o.unique().numel() != S or int(o.min()) < 0 or int(o.max()) >= S:
+            fails.append(f"{name} not a permutation of [0, {S})")
+        else:
+            k = key[o]
+            if not bool((k[1:] > k[:-1]).all()):
+                fails.append(f"{name} not sorted by its slot key")
 
     nfail = torch.tensor(len(fails), device=device)
     dist.all_reduce(nfail, op=dist.ReduceOp.SUM)

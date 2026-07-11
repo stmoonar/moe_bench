@@ -2,11 +2,13 @@
 
 > 新 session 从这里接手。读完本文 + 最新一篇 docs/ 即可继续。
 
-**最后更新**:2026-07-11(本轮:**TP 版 tile overlap(tktp scheme)落地,分支 tp_test**,
-docs/19。kernel 新增 tpdisp(AG去重拉取⊕gate+up GEMM)+ preredpush TP 入口;layer1 复用
-T6-v1 push+水位协议(TP 下 top-k 预归约完全本地、跨卡退化为稠密 RS)。本地已验证:调度表
-host/GPU 逐元素一致 + 不变量全过(NE×分布×rank 全档),CPU 数据流模拟对拍 rel 3.7e-7。
-**尚未上机**:一键脚本 tools/run_tp_all.sh(编译→裁决→对拍→bench→打包zip),等实测结果回流)
+**最后更新**:2026-07-11(TP 分支 tp_test 第二轮:**首轮实测正确性全绿但性能 0.73× serial
+(3613 vs 2624µs),归因为两处调度串行**(docs/20):L0 ring 拉取序使 GEMM 停在整个 AG 后 +
+L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot 序,链路并发+边到边算)
++ 全员 dispenser(gemm_push_kernel_tp,job_order 就绪序,comp 块跑完 GEMM 加入排空)+
+分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
+仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
+首轮落地记录见 docs/19。)
 
 > **【EP 上一轮 2026-07-09】** T6-v0 预归约 + T4 gate+up + T3 schedule GPU化(公平口径)
 + T7 dispatch 去重 + T5 ROW_BLOCK=64,五项落地;NE=256 e2e 7131→5830µs 公平口径超 serial
@@ -145,4 +147,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/17** | **通算重叠与融合损失分析:layer0 融合 +30%、layer1 +56% 且通信零重叠(T6-v1 目标)** |
 | **docs/18** | **T6-v1:combine 预归约 push 化(边算边推 + 水位选举,消 barrier+零重叠);layer1 融合损失 283→192µs,默认** |
 | **docs/19** | **TP 版 tile overlap(tktp,分支 tp_test):AG⊕gate+up GEMM + 本地prered⊕稠密RS push;复用矩阵/调度表/账/上机风险清单/一键脚本** |
+| **docs/20** | **TP 首轮实测归因(0.73× serial:L0 ring 序拉取 + L1 job 块排队)与修复(pull_order/全员 dispenser/time_tp_stages);修复后预期账与天花板提醒** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

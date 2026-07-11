@@ -50,13 +50,16 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
         (prered gathers the same slots' W2 rows) — in TP they are the same map.
       - tp_w (world*T, TOP_K) float32: routing weight per assignment;
       - slack (nblk,) int32: ROW_BLOCK - real tokens per row block (counter seed);
+      - pull_order (world*T,) int32: unique tokens sorted by MIN gathered slot
+        (expert-major; docs/20 — a ring-by-source order made every row block
+        wait for the LAST ring stage, stalling the GEMM behind the whole AG);
+      - job_order (world*T,) int32: jobs sorted by MAX slot = readiness order
+        for the layer1 dispenser (docs/20);
       - num_padded_total: gathered rows (= sum(padded)).
 
     Slot order within an expert is (ring_offset, src_tok, kpos) with
-    ring_offset = (src_dev - rank) % world — own shard first, so the earliest
-    row blocks of every expert fill from local copies while peer shards are
-    still in flight. The layout is purely LOCAL in TP (nothing cross-card
-    depends on it), so each rank ordering its own ring is safe.
+    ring_offset = (src_dev - rank) % world. The layout is purely LOCAL in TP
+    (nothing cross-card depends on it), so each rank ordering its own is safe.
     """
     top_k = topk_ids.shape[1]
     all_topk = torch.empty(world_size, num_tokens, top_k, device=device,
@@ -102,8 +105,18 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
             slack[blk] = ROW_BLOCK - real_in
             blk += 1
 
+    # docs/20 orders. min/max slots are already unique across tokens (slots are
+    # a bijection and each slot belongs to one token), so argsort needs no
+    # stability; the +index tie-break just keeps host/GPU byte-identical under
+    # any future table change.
+    mins = tp_slots.min(dim=1).values.long()
+    pull_order = torch.argsort(mins * S + torch.arange(S)).to(torch.int32)
+    maxs = tp_slots.max(dim=1).values.long()
+    job_order = torch.argsort(maxs * S + torch.arange(S)).to(torch.int32)
+
     return (padded.to(torch.int32).to(device), tp_slots.to(device),
-            tp_w.to(device), slack.to(device), num_padded_total)
+            tp_w.to(device), slack.to(device), pull_order.to(device),
+            job_order.to(device), num_padded_total)
 
 
 def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out):
@@ -163,6 +176,16 @@ def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out)
     tmp.scatter_(0, idx, slackv)
     out["slack"].copy_(tmp[:nb_total])
 
+    # docs/20 orders (see host golden for rationale)
+    S = world_size * T
+    tpl = out["tp_slots"].long()
+    out["pull_order"].copy_(
+        torch.argsort(tpl.min(dim=1).values * S + torch.arange(S, device=device))
+        .to(torch.int32))
+    out["job_order"].copy_(
+        torch.argsort(tpl.max(dim=1).values * S + torch.arange(S, device=device))
+        .to(torch.int32))
+
 
 class TKFusedTP(DistributedScheme):
     name = "tktp"
@@ -195,15 +218,20 @@ class TKFusedTP(DistributedScheme):
         self.tk = _bmod.build_and_load(world, hidden=H, row_block=ROW_BLOCK)
 
         # ---- host golden schedule (not timed) ----
-        (padded, tp_slots, tp_w, slack, num_padded_total) = _build_tp_schedules(
+        (padded, tp_slots, tp_w, slack, pull_order, job_order,
+         num_padded_total) = _build_tp_schedules(
             problem.topk_ids, problem.topk_weights, num_tokens, world,
             num_experts, ctx.rank, device)
         self.padded = padded
         self.tp_slots = tp_slots.contiguous()
         self.prered_w = tp_w.contiguous()
         self.slack = slack.contiguous()
+        self.pull_order = pull_order.contiguous()
+        self.job_order = job_order.contiguous()
         self.num_padded_total = num_padded_total
         self.num_jobs = world * num_tokens
+        # layer1 dispenser counter (docs/20), zeroed each iter (same-stream)
+        self.job_next = torch.zeros(1, dtype=torch.int32, device=device)
 
         # ---- layer1 constants (routing-independent in TP) ----
         # prered_dst: job j -> (src_dev, src_tok) of the dense job space.
@@ -238,6 +266,7 @@ class TKFusedTP(DistributedScheme):
                 "kpos_grid": ar % self.top_k,
                 "padded": self.padded, "tp_slots": self.tp_slots,
                 "prered_w": self.prered_w, "slack": self.slack,
+                "pull_order": self.pull_order, "job_order": self.job_order,
             }
             self._sched_graph = None  # captured lazily on first run()
 
@@ -319,8 +348,9 @@ class TKFusedTP(DistributedScheme):
         # layer0: AllGather-dedup dispatch ⊕ gate+up GEMM (one launch)
         tk.moe_tp_dispatch_gemm(self.pre_tokens, self.gathered, self.w_gateup,
                                 self.gateup_out, self.padded, self.tp_slots,
-                                self.slack, self.barrier_l0, self.num_comm_sms,
-                                self.num_padded_total, self.num_tokens)
+                                self.slack, self.pull_order, self.barrier_l0,
+                                self.num_comm_sms, self.num_padded_total,
+                                self.num_tokens)
 
         # silu(gate) * up on the halves (up compute hid under the AG comm)
         inter = self.inter
@@ -331,10 +361,12 @@ class TKFusedTP(DistributedScheme):
         # then the source-side reduce over the world partial planes.
         self._l1_seq += 1
         self.combine_local_cnt.zero_()
+        self.job_next.zero_()
         tk.moe_tp_gemm_prered_push(self.act, self.w2, self.expert_out, self.padded,
                                    self.combine_staging, self.prered_dst,
                                    self.tp_slots, self.prered_w,
                                    self.combine_local_cnt, self.push_expected_l1,
+                                   self.job_order, self.job_next,
                                    self.barrier_l1, self.num_comm_sms,
                                    self.num_padded_total, self.num_tokens,
                                    self.num_jobs, self._l1_seq)

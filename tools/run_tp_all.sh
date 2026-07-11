@@ -159,6 +159,12 @@ else
                 --no-verify --iters 30 --json "$JSONS/tktp_ne${NE}.json"
         done
     fi
+
+    # ---------- 8. 分阶段归因(docs/09 三件套: 各阶段 + GEMM-alone 对照) ----------
+    run_step 08_time_stages 900 python -m moe_bench.tools.time_tp_stages 64 20
+    if [ "$QUICK" != "1" ]; then
+        TK_COMM_SMS=8 run_step 08_time_stages_cs8 900 python -m moe_bench.tools.time_tp_stages 64 20
+    fi
 fi
 
 # ---------- 收尾：汇总 + 打包 ----------
@@ -169,6 +175,11 @@ note "完成: PASS=$PASS FAIL=$FAIL"
         [ -f "$f" ] || continue
         echo "--- $(basename "$f")"
         grep -E "verify|FAIL|ok|µs|us/iter|latency|tokens/s|mean" "$f" | tail -8
+    done
+    for f in "$LOGS"/08_*.log; do
+        [ -f "$f" ] || continue
+        echo "--- $(basename "$f")"
+        tail -16 "$f"
     done
 } >> "$SUMMARY" 2>/dev/null
 

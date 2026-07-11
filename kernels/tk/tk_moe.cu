@@ -403,9 +403,15 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &staging,
  *
  * Unlike ddisp:: (two launches: pull-all THEN scatter⊕GEMM), this is ONE
  * launch: comm blocks pull+scatter per token while the GEMM chews row blocks
- * as their counters fill — true AG⊕GEMM overlap. Pull order is ring-offset
- * (own shard first: those slots unblock with local-copy latency only, so the
- * GEMM's first waves start while peers' shards are still in flight).
+ * as their counters fill — true AG⊕GEMM overlap. Pull order is the host/GPU-
+ * built `pull_order` permutation: unique tokens sorted by their MIN gathered
+ * slot, i.e. expert-major. First-round finding (docs/20): a ring-by-source
+ * order drains one source at a time, and since every expert's row blocks mix
+ * all sources, NO row block completes until the last ring stage — the GEMM
+ * stalls behind the whole AllGather. Min-slot order instead pulls each
+ * expert's tokens (all sources interleaved -> all PCIe links busy at once)
+ * before the next expert's, so row blocks become ready progressively and the
+ * GEMM streams right behind the pull front.
  *
  * Padding: tp_slots only covers REAL assignments, so row-block counters are
  * PRE-SEEDED with their padding slack (dpush's proven trick — but purely
@@ -427,6 +433,7 @@ struct globals {
     using counts_gl       = gl<int, 1, 1, 1, -1>;
     using slots_gl        = gl<int, 1, 1, -1, TOP_K>;   // (world*T, TOP_K) gathered slot per assignment
     using slack_gl        = gl<int, 1, 1, 1, -1>;       // (nblk,) per-row-block padding slack
+    using order_gl        = gl<int, 1, 1, 1, -1>;       // (world*T,) pull order (min-slot sorted)
     using barrier_pgl     = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
     pre_tokens_pgl pre_tokens;
     post_tokens_gl activations;    // gathered (expert-sorted, ROW_BLOCK-padded), LOCAL
@@ -435,6 +442,7 @@ struct globals {
     counts_gl padded_tokens_per_expert;
     slots_gl tp_slots;
     slack_gl slack;
+    order_gl pull_order;
     barrier_pgl barrier;
     const int dev_idx;
     const int num_local_experts;   // == E (TP: every expert on every card)
@@ -457,9 +465,10 @@ __device__ inline void dispatch(const globals &G, const int sm_idx) {
     if (lane_id < globals::TOKENS_PER_BLOCK) {
         const int i = sm_idx * globals::TOKENS_PER_BLOCK + lane_id;
         if (i < G.s_max) {
-            // ring: i=0 starts at THIS card's shard, then (dev+1)'s, ... — local
-            // rows land first (no PCIe latency), unblocking the GEMM's first waves.
-            const int d = (i + G.dev_idx * G.num_tokens) % G.s_max;
+            // expert-major pull order (docs/20): consecutive i are one expert's
+            // tokens across ALL sources -> links concurrent, row blocks ready
+            // progressively behind the pull front.
+            const int d = G.pull_order[{i}];
             const int src_dev = d / G.num_tokens;
             const int src_tok = d % G.num_tokens;
             init_semaphore(token_arrived[lane_id], 0, 1);
@@ -512,7 +521,8 @@ void reset_kernel(const __grid_constant__ globals G) {
 }
 void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &post_tokens,
            at::Tensor &weights, at::Tensor &outputs, at::Tensor &padded_tokens_per_expert,
-           at::Tensor &tp_slots, at::Tensor &slack, kittens::py::TKParallelTensor &barrier,
+           at::Tensor &tp_slots, at::Tensor &slack, at::Tensor &pull_order,
+           kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_padded_local_tokens, const int num_tokens) {
     const int dev_idx = barrier.local_rank_;
     // TP geometry: padded_tokens_per_expert covers ALL experts, all of them local.
@@ -527,6 +537,7 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &post_tokens,
     const int num_comp_sms = sm - num_comm_sms;
     const int s_max = static_cast<int>(tp_slots.size(0));
     TORCH_CHECK(s_max == globals::NUM_DEVICES * num_tokens, "tp_slots rows must be world*T");
+    TORCH_CHECK(pull_order.size(0) == s_max, "pull_order must cover world*T tokens");
     globals G {
         .pre_tokens = kittens::py::parallel_tensor_to_pgl<globals::pre_tokens_pgl>(pre_tokens),
         .activations = kittens::py::tensor_to_gl<globals::post_tokens_gl>(post_tokens),
@@ -535,6 +546,7 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &post_tokens,
         .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
         .tp_slots = kittens::py::tensor_to_gl<globals::slots_gl>(tp_slots),
         .slack = kittens::py::tensor_to_gl<globals::slack_gl>(slack),
+        .pull_order = kittens::py::tensor_to_gl<globals::order_gl>(pull_order),
         .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
         .dev_idx = dev_idx, .num_local_experts = num_local_experts,
         .expert_offset = 0,
@@ -1565,6 +1577,35 @@ void gemm_push_kernel(const __grid_constant__ globals G) {
     else
         push_job(G, blockIdx.x - G.num_comp_sms);
 }
+// TP variant (docs/20): PERSISTENT all-hands job drain instead of one short-
+// lived block per job. First-round finding: 2048 job blocks queued on 16 comm
+// SMs = 128 sequential waves of 97KB-smem block churn (~the whole slowdown at
+// low num_comm_sms), and since a TP job depends on its token's MAX slot (the 8
+// experts span the whole table) most jobs only unblock near the GEMM's end.
+// Fix: grid = comp + comm blocks only, all resident; every block claims jobs
+// from an atomic dispenser through `job_order` (max-slot sorted = readiness
+// order, so comm blocks stream the earliest-ready pushes UNDER the GEMM), and
+// comp blocks join the pool the moment their GEMM tasks finish — the tail
+// drains on all ~110 SMs instead of num_comm_sms. Each job claimed exactly
+// once (the single-writer staging/election invariants are untouched).
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void gemm_push_kernel_tp(const __grid_constant__ globals G,
+                         const int *__restrict__ job_order, int *job_next) {
+    const int col_blocks = static_cast<int>(G.weights.cols()) / gemm_config::COL_BLOCK;
+    if (blockIdx.x < G.num_comp_sms) {
+        grouped_gemm_sm120(G, no_gate{}, signal_epilogue{G, col_blocks}, blockIdx.x, G.num_comp_sms);
+        __syncthreads();  // all warps out of the GEMM before push_job reuses smem
+    }
+    __shared__ int s_j;
+    while (true) {
+        if (threadIdx.x == 0) s_j = atomicAdd(job_next, 1);
+        __syncthreads();
+        const int idx = s_j;
+        if (idx >= G.num_jobs) break;
+        push_job(G, job_order[idx]);
+        __syncthreads();  // job's smem fully consumed before the next claim reuses it
+    }
+}
 __global__ __launch_bounds__(256)
 void reset_kernel(const __grid_constant__ globals G) {
     const int nb = (G.num_padded_local_tokens + gemm_config::ROW_BLOCK - 1) / gemm_config::ROW_BLOCK;
@@ -1676,7 +1717,8 @@ void gemm_push_entry_tp(at::Tensor &activations, at::Tensor &weights,
            at::Tensor &expert_outputs, at::Tensor &padded_tokens_per_expert,
            kittens::py::TKParallelTensor &staging, at::Tensor &prered_dst,
            at::Tensor &prered_slots, at::Tensor &prered_w, at::Tensor &local_cnt,
-           at::Tensor &push_expected_l1, kittens::py::TKParallelTensor &barrier,
+           at::Tensor &push_expected_l1, at::Tensor &job_order, at::Tensor &job_next,
+           kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_padded_local_tokens,
            const int num_source_tokens, const int num_jobs, const int seq) {
     const int dev_idx = barrier.local_rank_;
@@ -1685,6 +1727,8 @@ void gemm_push_entry_tp(at::Tensor &activations, at::Tensor &weights,
                 "TP weights first dim must equal the FULL expert count");
     TORCH_CHECK(num_local_experts <= gemm_config::MAX_LOCAL_EXPERTS, "too many experts");
     TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms >= 1");
+    TORCH_CHECK(job_order.size(0) == num_jobs, "job_order must cover num_jobs");
+    TORCH_CHECK(job_next.numel() == 1, "job_next must be a single int counter");
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
     TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
     const int num_comp_sms = sm - num_comm_sms;
@@ -1705,7 +1749,16 @@ void gemm_push_entry_tp(at::Tensor &activations, at::Tensor &weights,
         .num_source_tokens = num_source_tokens, .num_jobs = num_jobs,
         .num_comp_sms = num_comp_sms, .seq = seq
     };
-    _launch_gemm_push(G, padded_tokens_per_expert, num_padded_local_tokens, num_comm_sms);
+    // persistent grid: comp + comm blocks only (jobs come from the dispenser)
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(gemm_push_kernel_tp, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    gemm_push_kernel_tp<<<sm, gemm_config::NUM_THREADS, smem, stream>>>(
+        G, job_order.data_ptr<int>(), job_next.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / gemm_config::ROW_BLOCK + 255) / 256 + 1;
+    reset_kernel<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
 }
 void final_reduce_push_entry(kittens::py::TKParallelTensor &staging, at::Tensor &final_contrib,
            at::Tensor &recv_from, at::Tensor &combine_out, kittens::py::TKParallelTensor &barrier,
