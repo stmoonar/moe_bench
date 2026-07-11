@@ -8,7 +8,12 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 + 全员 dispenser(gemm_push_kernel_tp,job_order 就绪序,comp 块跑完 GEMM 加入排空)+
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
-首轮落地记录见 docs/19。)
+首轮落地记录见 docs/19。
+**【microbench 导入 2026-07-11】**并行工作区(SYNC07101059_2)的 EP microbench 套件
+(`microbench/`,mb1~mb7)+ 实测结果(`microbench/results/20260710_071848/`)+ 任务清单
+(docs/22,原编号19)已导入。平台事实(pull 并发 23.5GB/s 弱路径 vs push 50.9GB/s 强路径
+4SM 打满、comm SM 让渡 8~16%、干扰≈0、vLLM triton 未调优、EP fair 口径 1.34×)直接改写
+TP 路线:**dispatch push 化为必选项**,见 docs/23(TP 第三轮计划)。)
 
 > **【EP 上一轮 2026-07-09】** T6-v0 预归约 + T4 gate+up + T3 schedule GPU化(公平口径)
 + T7 dispatch 去重 + T5 ROW_BLOCK=64,五项落地;NE=256 e2e 7131→5830µs 公平口径超 serial
@@ -153,4 +158,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/19** | **TP 版 tile overlap(tktp,分支 tp_test):AG⊕gate+up GEMM + 本地prered⊕稠密RS push;复用矩阵/调度表/账/上机风险清单/一键脚本** |
 | **docs/20** | **TP 首轮实测归因(0.73× serial:L0 ring 序拉取 + L1 job 块排队)与修复(pull_order/全员 dispenser/time_tp_stages);修复后预期账与天花板提醒** |
 | **docs/21** | **经验:set_default_device 坑(host 表显式 device 纪律)、远程 zip 回流工程实践(timeout/可归因失败/干净编译/sweep 顺手带)、无 profiler 归因三条账、可泛化调度教训** |
+| **docs/22** | **(导入)EP 第三轮计划:microbench 归因(收益分解/平台事实表/P0 口径修复/T10~T15);§0 平台事实两线共享** |
+| **docs/23** | **TP 第三轮计划:mb 事实映射到 TP(pull 弱路径→push 化必选 TP-T1、comm SM 自适应、triton 调优、copy engine 远期);修正预期与报数规范** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

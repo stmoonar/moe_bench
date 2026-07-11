@@ -1,0 +1,21 @@
+ERROR 07-10 07:19:49 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-10 07:19:54 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-10 07:19:54 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-10 07:19:54 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-10 07:19:54 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+[Gloo] Rank 1 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 0 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 3 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 2 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+WARNING 07-10 07:20:00 [fused_moe.py:1090] Using default MoE config. Performance might be sub-optimal! Config file not found at /data/cinnzhang_vllm_td_test/vllm_td-main/vllm/model_executor/layers/fused_moe/configs/E=16,N=3072,device_name=NVIDIA_RTX_PRO_5000_72GB_Blackwell.json
+WARNING 07-10 07:20:00 [fused_moe.py:1090] Using default MoE config. Performance might be sub-optimal! Config file not found at /data/cinnzhang_vllm_td_test/vllm_td-main/vllm/model_executor/layers/fused_moe/configs/E=16,N=3072,device_name=NVIDIA_RTX_PRO_5000_72GB_Blackwell.json
+WARNING 07-10 07:20:00 [fused_moe.py:1090] Using default MoE config. Performance might be sub-optimal! Config file not found at /data/cinnzhang_vllm_td_test/vllm_td-main/vllm/model_executor/layers/fused_moe/configs/E=16,N=3072,device_name=NVIDIA_RTX_PRO_5000_72GB_Blackwell.json
+WARNING 07-10 07:20:00 [fused_moe.py:1090] Using default MoE config. Performance might be sub-optimal! Config file not found at /data/cinnzhang_vllm_td_test/vllm_td-main/vllm/model_executor/layers/fused_moe/configs/E=16,N=3072,device_name=NVIDIA_RTX_PRO_5000_72GB_Blackwell.json
+[mb4] tokens=  128  serial=  1308.6us  tk=  1314.3us (+sched   775us)  x1.00/x0.63  L0pen=   162us L1pen=    40us  relerr=3.44e-03
+[mb4] tokens=  512  serial=  1449.4us  tk=  1330.6us (+sched   779us)  x1.09/x0.69  L0pen=   174us L1pen=    47us  relerr=3.44e-03
+[mb4] tokens= 1024  serial=  1813.9us  tk=  1319.5us (+sched   825us)  x1.37/x0.85  L0pen=   151us L1pen=   100us  relerr=3.43e-03
+[mb4] tokens= 2048  serial=  2912.0us  tk=  1975.8us (+sched   826us)  x1.47/x1.04  L0pen=   255us L1pen=   190us  relerr=3.44e-03
+[mb4] tokens= 5120  serial=  6923.6us  tk=  4915.8us (+sched   822us)  x1.41/x1.21  L0pen=   486us L1pen=   460us  relerr=3.43e-03
+[mb4] tokens= 6648  serial=  9238.2us  tk=  6610.3us (+sched   834us)  x1.40/x1.24  L0pen=   595us L1pen=   622us  relerr=3.43e-03
+[mb4] tokens= 8192  serial= 10941.6us  tk=  7911.1us (+sched   828us)  x1.38/x1.25  L0pen=   966us L1pen=   747us  relerr=3.43e-03
+[saved] /data/cinnzhang_vllm_td_test/xxy/moe_bench/microbench/results/20260710_071848/mb4_fusion.json

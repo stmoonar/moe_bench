@@ -1,0 +1,66 @@
+ERROR 07-10 07:20:17 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-10 07:20:23 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-10 07:20:23 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-10 07:20:23 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-10 07:20:23 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+[Gloo] Rank 0 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 3 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 2 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 1 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[mb5] tokens=  128 k= 1  L0=  1027.6us L1=   387.7us e2e=  1449.0us | gemm0@109=  755.6us gemm1@109=  362.3us
+[mb5] tokens=  128 k= 2  L0=   777.2us L1=   386.7us e2e=  1196.5us | gemm0@108=  751.9us gemm1@108=  361.8us
+[mb5] tokens=  128 k= 4  L0=   806.1us L1=   387.8us e2e=  1219.7us | gemm0@106=  741.0us gemm1@106=  362.0us
+[mb5] tokens=  128 k= 8  L0=   797.1us L1=   423.6us e2e=  1249.0us | gemm0@102=  717.9us gemm1@102=  399.2us
+[mb5] tokens=  128 k=12  L0=   824.2us L1=   415.0us e2e=  1274.5us | gemm0@98=  707.8us gemm1@98=  388.8us
+[mb5] tokens=  128 k=16  L0=   869.9us L1=   403.2us e2e=  1316.4us | gemm0@94=  751.3us gemm1@94=  375.4us
+[mb5] tokens=  128 k=24  L0=   985.6us L1=   389.9us e2e=  1414.6us | gemm0@86=  714.8us gemm1@86=  364.0us
+[mb5] tokens=  128 k=32  L0=  1042.6us L1=   402.2us e2e=  1470.1us | gemm0@78=  718.7us gemm1@78=  376.3us
+[mb5] tokens=  512 k= 1  L0=  2816.4us L1=   408.6us e2e=  3250.5us | gemm0@109=  754.1us gemm1@109=  361.9us
+[mb5] tokens=  512 k= 2  L0=  1484.4us L1=   407.9us e2e=  1917.4us | gemm0@108=  749.4us gemm1@108=  361.4us
+[mb5] tokens=  512 k= 4  L0=   855.3us L1=   409.9us e2e=  1289.4us | gemm0@106=  741.0us gemm1@106=  361.6us
+[mb5] tokens=  512 k= 8  L0=   783.8us L1=   426.1us e2e=  1240.7us | gemm0@102=  715.7us gemm1@102=  397.1us
+[mb5] tokens=  512 k=12  L0=   813.6us L1=   416.8us e2e=  1271.1us | gemm0@98=  706.2us gemm1@98=  388.1us
+[mb5] tokens=  512 k=16  L0=   876.3us L1=   409.6us e2e=  1321.1us | gemm0@94=  752.3us gemm1@94=  376.0us
+[mb5] tokens=  512 k=24  L0=  1029.1us L1=   409.7us e2e=  1474.7us | gemm0@86=  713.2us gemm1@86=  363.4us
+[mb5] tokens=  512 k=32  L0=  1054.7us L1=   410.2us e2e=  1506.6us | gemm0@78=  717.4us gemm1@78=  375.8us
+[mb5] tokens= 1024 k= 1  L0=  5228.8us L1=   459.9us e2e=  5690.1us | gemm0@109=  753.8us gemm1@109=  362.1us
+[mb5] tokens= 1024 k= 2  L0=  2790.2us L1=   458.3us e2e=  3253.3us | gemm0@108=  749.5us gemm1@108=  361.8us
+[mb5] tokens= 1024 k= 4  L0=  1477.1us L1=   457.0us e2e=  1944.6us | gemm0@106=  741.2us gemm1@106=  362.1us
+[mb5] tokens= 1024 k= 8  L0=   847.2us L1=   467.6us e2e=  1319.1us | gemm0@102=  716.0us gemm1@102=  397.4us
+[mb5] tokens= 1024 k=12  L0=   784.2us L1=   461.1us e2e=  1268.8us | gemm0@98=  706.0us gemm1@98=  387.1us
+[mb5] tokens= 1024 k=16  L0=   870.0us L1=   463.8us e2e=  1322.7us | gemm0@94=  753.0us gemm1@94=  376.8us
+[mb5] tokens= 1024 k=24  L0=   912.5us L1=   462.5us e2e=  1401.9us | gemm0@86=  712.5us gemm1@86=  364.1us
+[mb5] tokens= 1024 k=32  L0=   994.2us L1=   465.1us e2e=  1478.2us | gemm0@78=  716.8us gemm1@78=  377.0us
+[mb5] tokens= 2048 k= 1  L0= 11151.2us L1=   684.2us e2e= 11830.8us | gemm0@109= 1016.2us gemm1@109=  505.2us
+[mb5] tokens= 2048 k= 2  L0=  5707.2us L1=   685.9us e2e=  6454.9us | gemm0@108= 1017.8us gemm1@108=  502.1us
+[mb5] tokens= 2048 k= 4  L0=  2983.0us L1=   687.4us e2e=  3743.3us | gemm0@106= 1013.6us gemm1@106=  502.5us
+[mb5] tokens= 2048 k= 8  L0=  1621.4us L1=   678.4us e2e=  2387.1us | gemm0@102= 1065.8us gemm1@102=  551.8us
+[mb5] tokens= 2048 k=12  L0=  1266.9us L1=   715.7us e2e=  2025.7us | gemm0@98= 1119.3us gemm1@98=  571.2us
+[mb5] tokens= 2048 k=16  L0=  1271.9us L1=   719.4us e2e=  2064.8us | gemm0@94= 1181.3us gemm1@94=  569.1us
+[mb5] tokens= 2048 k=24  L0=  1336.8us L1=   757.6us e2e=  2173.8us | gemm0@86= 1200.4us gemm1@86=  590.4us
+[mb5] tokens= 2048 k=32  L0=  1551.6us L1=   791.0us e2e=  2365.1us | gemm0@78= 1231.4us gemm1@78=  652.0us
+[mb5] tokens= 5120 k= 1  L0= 28816.3us L1=  1598.5us e2e= 30531.2us | gemm0@109= 2425.3us gemm1@109= 1303.9us
+[mb5] tokens= 5120 k= 2  L0= 14634.3us L1=  1599.3us e2e= 16452.2us | gemm0@108= 2427.0us gemm1@108= 1307.6us
+[mb5] tokens= 5120 k= 4  L0=  7556.2us L1=  1629.4us e2e=  9430.7us | gemm0@106= 2448.9us gemm1@106= 1334.3us
+[mb5] tokens= 5120 k= 8  L0=  3963.2us L1=  1662.0us e2e=  5841.4us | gemm0@102= 2488.9us gemm1@102= 1369.2us
+[mb5] tokens= 5120 k=12  L0=  3172.5us L1=  1687.3us e2e=  5081.6us | gemm0@98= 2622.4us gemm1@98= 1403.7us
+[mb5] tokens= 5120 k=16  L0=  2998.2us L1=  1779.8us e2e=  4977.7us | gemm0@94= 2643.6us gemm1@94= 1436.4us
+[mb5] tokens= 5120 k=24  L0=  3017.5us L1=  1840.1us e2e=  5102.2us | gemm0@86= 2788.1us gemm1@86= 1452.8us
+[mb5] tokens= 5120 k=32  L0=  3143.4us L1=  1916.9us e2e=  5254.8us | gemm0@78= 3010.6us gemm1@78= 1529.0us
+[mb5] tokens= 6648 k= 1  L0= 38322.5us L1=  2189.9us e2e= 40662.2us | gemm0@109= 3430.8us gemm1@109= 1792.9us
+[mb5] tokens= 6648 k= 2  L0= 19262.4us L1=  2198.7us e2e= 21751.0us | gemm0@108= 3460.4us gemm1@108= 1814.6us
+[mb5] tokens= 6648 k= 4  L0=  9904.9us L1=  2200.9us e2e= 12454.2us | gemm0@106= 3443.4us gemm1@106= 1811.2us
+[mb5] tokens= 6648 k= 8  L0=  5155.5us L1=  2258.4us e2e=  7813.7us | gemm0@102= 3542.5us gemm1@102= 1864.8us
+[mb5] tokens= 6648 k=12  L0=  4190.5us L1=  2335.8us e2e=  6821.1us | gemm0@98= 3650.9us gemm1@98= 1897.1us
+[mb5] tokens= 6648 k=16  L0=  4060.2us L1=  2409.7us e2e=  6668.4us | gemm0@94= 3730.4us gemm1@94= 1923.2us
+[mb5] tokens= 6648 k=24  L0=  4075.0us L1=  2515.1us e2e=  6932.2us | gemm0@86= 3917.7us gemm1@86= 1983.0us
+[mb5] tokens= 6648 k=32  L0=  4357.0us L1=  2636.8us e2e=  7268.2us | gemm0@78= 4171.9us gemm1@78= 2108.7us
+[mb5] tokens= 8192 k= 1  L0= 47138.5us L1=  2555.2us e2e= 50007.5us | gemm0@109= 4005.5us gemm1@109= 2053.2us
+[mb5] tokens= 8192 k= 2  L0= 23881.0us L1=  2583.0us e2e= 26754.4us | gemm0@108= 4028.0us gemm1@108= 2049.8us
+[mb5] tokens= 8192 k= 4  L0= 12200.9us L1=  2591.8us e2e= 15188.6us | gemm0@106= 4042.4us gemm1@106= 2089.9us
+[mb5] tokens= 8192 k= 8  L0=  6333.9us L1=  2647.2us e2e=  9429.8us | gemm0@102= 4160.7us gemm1@102= 2130.5us
+[mb5] tokens= 8192 k=12  L0=  5011.2us L1=  2727.4us e2e=  8050.7us | gemm0@98= 4286.1us gemm1@98= 2175.4us
+[mb5] tokens= 8192 k=16  L0=  4947.4us L1=  2773.3us e2e=  8034.5us | gemm0@94= 4338.3us gemm1@94= 2208.1us
+[mb5] tokens= 8192 k=24  L0=  4952.9us L1=  2922.8us e2e=  8150.9us | gemm0@86= 4522.6us gemm1@86= 2294.2us
+[mb5] tokens= 8192 k=32  L0=  5042.1us L1=  3091.7us e2e=  8462.8us | gemm0@78= 4803.4us gemm1@78= 2438.7us
+[saved] /data/cinnzhang_vllm_td_test/xxy/moe_bench/microbench/results/20260710_071848/mb5_sm_sweep.json

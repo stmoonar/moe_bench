@@ -1,0 +1,1835 @@
+{
+  "meta": {
+    "timestamp": "2026-07-10 07:24:32",
+    "git_commit": "913d5e1",
+    "torch": "2.10.0+cu128",
+    "cuda_visible_devices": "9,11,13,15",
+    "device_name": "NVIDIA RTX PRO 5000 72GB Blackwell",
+    "world": 4,
+    "warmup": 10,
+    "iters": 30,
+    "tk_env": {
+      "TK_DISPATCH": "pull",
+      "TK_COMBINE": "prered_push",
+      "TK_FUSE_GATEUP": "1",
+      "TK_GPU_SCHED": "1",
+      "TK_DEDUP": "0",
+      "TK_ROW_BLOCK": "128"
+    },
+    "token_sweep_total": [
+      128,
+      512,
+      1024,
+      2048,
+      5120,
+      6648,
+      8192
+    ],
+    "shape": {
+      "hidden": 4096,
+      "intermediate": 3072,
+      "num_experts": 64,
+      "topk": 8,
+      "precision": "bf16",
+      "parallel": "ep"
+    },
+    "vllm": "0.1.0",
+    "test": "mb7_pcie_schemes",
+    "row_bytes": 8192,
+    "default_blocks": 16,
+    "sizes": [
+      262144,
+      1048576,
+      2097152,
+      4194304,
+      10485760,
+      13615104,
+      16777216,
+      67108864
+    ],
+    "pairs_note": "pair 下标是 CUDA_VISIBLE_DEVICES 重映射后的逻辑序号"
+  },
+  "rows": [
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 262144,
+      "ms": 0.011471999809145927,
+      "gbps": 22.850767465233787
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "bytes": 262144,
+      "ms": 0.01027199998497963,
+      "gbps": 25.520249258501128
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "bytes": 262144,
+      "ms": 0.010208000428974628,
+      "gbps": 25.680249704528254
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 262144,
+      "ms": 0.01017600018531084,
+      "gbps": 25.76100582018537
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 262144,
+      "ms": 0.010192000307142735,
+      "gbps": 25.72056437403017
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 262144,
+      "ms": 0.010239999741315842,
+      "gbps": 25.60000064671041
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 1048576,
+      "ms": 0.025456000119447708,
+      "gbps": 41.191703137953546
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "bytes": 1048576,
+      "ms": 0.025567999109625816,
+      "gbps": 41.01126550826705
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "bytes": 1048576,
+      "ms": 0.024512000381946564,
+      "gbps": 42.778067218548635
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 1048576,
+      "ms": 0.025599999353289604,
+      "gbps": 40.960001034736656
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 1048576,
+      "ms": 0.025631999596953392,
+      "gbps": 40.908864563365285
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 1048576,
+      "ms": 0.024512000381946564,
+      "gbps": 42.778067218548635
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 2097152,
+      "ms": 0.05011200159788132,
+      "gbps": 41.849296239020426
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "bytes": 2097152,
+      "ms": 0.046032000333070755,
+      "gbps": 45.558567623083356
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "bytes": 2097152,
+      "ms": 0.045024000108242035,
+      "gbps": 46.578535779989444
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 2097152,
+      "ms": 0.04608000069856644,
+      "gbps": 45.51111042116896
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 2097152,
+      "ms": 0.04609600082039833,
+      "gbps": 45.49531331733168
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 2097152,
+      "ms": 0.04504000023007393,
+      "gbps": 46.56198910495782
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 4194304,
+      "ms": 0.08084799721837044,
+      "gbps": 51.87888561631508
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "bytes": 4194304,
+      "ms": 0.0870559997856617,
+      "gbps": 48.179378909284665
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "bytes": 4194304,
+      "ms": 0.08591999858617783,
+      "gbps": 48.816388140336265
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 4194304,
+      "ms": 0.08699199929833412,
+      "gbps": 48.21482474055887
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 4194304,
+      "ms": 0.0870559997856617,
+      "gbps": 48.179378909284665
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 4194304,
+      "ms": 0.0859839990735054,
+      "gbps": 48.78005262833149
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 10485760,
+      "ms": 0.19278400391340256,
+      "gbps": 54.39123468309197
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "bytes": 10485760,
+      "ms": 0.20985600352287292,
+      "gbps": 49.96645234815558
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "bytes": 10485760,
+      "ms": 0.2088319957256317,
+      "gbps": 50.21146287265498
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 10485760,
+      "ms": 0.21062400192022324,
+      "gbps": 49.784259649437416
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 10485760,
+      "ms": 0.21060799807310104,
+      "gbps": 49.78804269513279
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 10485760,
+      "ms": 0.2088640034198761,
+      "gbps": 50.203768137684484
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 13615104,
+      "ms": 0.24958400428295135,
+      "gbps": 54.55118824267548
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "bytes": 13615104,
+      "ms": 0.27132800221443176,
+      "gbps": 50.17950189026166
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "bytes": 13615104,
+      "ms": 0.27031999826431274,
+      "gbps": 50.366617665806075
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 13615104,
+      "ms": 0.27136000990867615,
+      "gbps": 50.17358307357832
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 13615104,
+      "ms": 0.27142399549484253,
+      "gbps": 50.161755135826624
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 13615104,
+      "ms": 0.27030399441719055,
+      "gbps": 50.36959971440998
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 16777216,
+      "ms": 0.3065280020236969,
+      "gbps": 54.73306154490576
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "bytes": 16777216,
+      "ms": 0.3335839956998825,
+      "gbps": 50.29382769038493
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "bytes": 16777216,
+      "ms": 0.331743985414505,
+      "gbps": 50.57278123380995
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 16777216,
+      "ms": 0.3328160047531128,
+      "gbps": 50.40988342025665
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 16777216,
+      "ms": 0.3336479961872101,
+      "gbps": 50.28418030895739
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 16777216,
+      "ms": 0.331727996468544,
+      "gbps": 50.57521878950272
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 67108864,
+      "ms": 1.195472002029419,
+      "gbps": 56.13587259766585
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "bytes": 67108864,
+      "ms": 1.3218240141868591,
+      "gbps": 50.769893177711005
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "bytes": 67108864,
+      "ms": 1.3147680163383484,
+      "gbps": 51.04236121205575
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 67108864,
+      "ms": 1.3178080320358276,
+      "gbps": 50.924612969861975
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 67108864,
+      "ms": 1.3197760581970215,
+      "gbps": 50.84867510907802
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 67108864,
+      "ms": 1.3148159980773926,
+      "gbps": 51.040498517002256
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 262144,
+      "ms": 0.01134399976581335,
+      "gbps": 23.108604144193105
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_pull",
+      "bytes": 262144,
+      "ms": 0.014352000318467617,
+      "gbps": 18.265328468721037
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_push",
+      "bytes": 262144,
+      "ms": 0.010255999863147736,
+      "gbps": 25.56006274356011
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 262144,
+      "ms": 0.014336000196635723,
+      "gbps": 18.285714034903414
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 262144,
+      "ms": 0.014352000318467617,
+      "gbps": 18.265328468721037
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 262144,
+      "ms": 0.01027199998497963,
+      "gbps": 25.520249258501128
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 1048576,
+      "ms": 0.02595200017094612,
+      "gbps": 40.404438698097174
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_pull",
+      "bytes": 1048576,
+      "ms": 0.04089599847793579,
+      "gbps": 25.640063552079006
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_push",
+      "bytes": 1048576,
+      "ms": 0.024560000747442245,
+      "gbps": 42.69446124138257
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 1048576,
+      "ms": 0.04076800122857094,
+      "gbps": 25.72056437403017
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 1048576,
+      "ms": 0.040031999349594116,
+      "gbps": 26.19344566937378
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 1048576,
+      "ms": 0.024607999250292778,
+      "gbps": 42.61118465319867
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 2097152,
+      "ms": 0.04396799951791763,
+      "gbps": 47.69723487522735
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_pull",
+      "bytes": 2097152,
+      "ms": 0.07572800293564796,
+      "gbps": 27.693216758695126
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_push",
+      "bytes": 2097152,
+      "ms": 0.04505600035190582,
+      "gbps": 46.545454181915474
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 2097152,
+      "ms": 0.07574400305747986,
+      "gbps": 27.687366858714004
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 2097152,
+      "ms": 0.07540800049901009,
+      "gbps": 27.810736077367945
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 2097152,
+      "ms": 0.04505600035190582,
+      "gbps": 46.545454181915474
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 4194304,
+      "ms": 0.08303999900817871,
+      "gbps": 50.50944183642027
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_pull",
+      "bytes": 4194304,
+      "ms": 0.14723200350999832,
+      "gbps": 28.487719381711536
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_push",
+      "bytes": 4194304,
+      "ms": 0.08604799956083298,
+      "gbps": 48.743771167332845
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 4194304,
+      "ms": 0.14531199634075165,
+      "gbps": 28.864127571164193
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 4194304,
+      "ms": 0.14532800018787384,
+      "gbps": 28.860948988342113
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 4194304,
+      "ms": 0.08604799956083298,
+      "gbps": 48.743771167332845
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 10485760,
+      "ms": 0.19857600331306458,
+      "gbps": 52.80476908112959
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_pull",
+      "bytes": 10485760,
+      "ms": 0.3583360016345978,
+      "gbps": 29.262368146565787
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_push",
+      "bytes": 10485760,
+      "ms": 0.2088959962129593,
+      "gbps": 50.196079341368886
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 10485760,
+      "ms": 0.36048001050949097,
+      "gbps": 29.08832582749806
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 10485760,
+      "ms": 0.3614720106124878,
+      "gbps": 29.008497731906406
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 10485760,
+      "ms": 0.20892800390720367,
+      "gbps": 50.188389320262196
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 13615104,
+      "ms": 0.2549920082092285,
+      "gbps": 53.39423810031097
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_pull",
+      "bytes": 13615104,
+      "ms": 0.4689919948577881,
+      "gbps": 29.030568003892032
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_push",
+      "bytes": 13615104,
+      "ms": 0.27030399441719055,
+      "gbps": 50.36959971440998
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 13615104,
+      "ms": 0.46483200788497925,
+      "gbps": 29.290375380881688
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 13615104,
+      "ms": 0.4644960016012192,
+      "gbps": 29.31156340004169
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 13615104,
+      "ms": 0.27031999826431274,
+      "gbps": 50.366617665806075
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 16777216,
+      "ms": 0.3041279911994934,
+      "gbps": 55.1649847612841
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_pull",
+      "bytes": 16777216,
+      "ms": 0.5754240155220032,
+      "gbps": 29.156266592002307
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_push",
+      "bytes": 16777216,
+      "ms": 0.3317759931087494,
+      "gbps": 50.567902284903326
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 16777216,
+      "ms": 0.5868960022926331,
+      "gbps": 28.586352495948148
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 16777216,
+      "ms": 0.5875360071659088,
+      "gbps": 28.5552132896979
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 16777216,
+      "ms": 0.3317759931087494,
+      "gbps": 50.567902284903326
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 67108864,
+      "ms": 1.2007359862327576,
+      "gbps": 55.88977491259367
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_pull",
+      "bytes": 67108864,
+      "ms": 2.315200090408325,
+      "gbps": 28.986204811422674
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "sm_push",
+      "bytes": 67108864,
+      "ms": 1.3147200345993042,
+      "gbps": 51.04422404307028
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 67108864,
+      "ms": 2.671583890914917,
+      "gbps": 25.1195046609664
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 67108864,
+      "ms": 2.665135979652405,
+      "gbps": 25.18027767151774
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        2
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 67108864,
+      "ms": 1.314736008644104,
+      "gbps": 51.043603855659065
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 262144,
+      "ms": 0.01071999967098236,
+      "gbps": 24.453732093816154
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_pull",
+      "bytes": 262144,
+      "ms": 0.014271999709308147,
+      "gbps": 18.367713378597575
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_push",
+      "bytes": 262144,
+      "ms": 0.010208000428974628,
+      "gbps": 25.680249704528254
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 262144,
+      "ms": 0.014336000196635723,
+      "gbps": 18.285714034903414
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 262144,
+      "ms": 0.01432000007480383,
+      "gbps": 18.306145155770267
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 262144,
+      "ms": 0.01027199998497963,
+      "gbps": 25.520249258501128
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 1048576,
+      "ms": 0.026399999856948853,
+      "gbps": 39.71878809400826
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_pull",
+      "bytes": 1048576,
+      "ms": 0.040911998599767685,
+      "gbps": 25.630036074697024
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_push",
+      "bytes": 1048576,
+      "ms": 0.02457600086927414,
+      "gbps": 42.66666515751023
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 1048576,
+      "ms": 0.04068800061941147,
+      "gbps": 25.771136060682824
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 1048576,
+      "ms": 0.04086400009691715,
+      "gbps": 25.66014089450598
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 1048576,
+      "ms": 0.024639999493956566,
+      "gbps": 42.55584502983385
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 2097152,
+      "ms": 0.04328000172972679,
+      "gbps": 48.455450928496035
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_pull",
+      "bytes": 2097152,
+      "ms": 0.07577600330114365,
+      "gbps": 27.67567446999872
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_push",
+      "bytes": 2097152,
+      "ms": 0.0451200008392334,
+      "gbps": 46.4794317595946
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 2097152,
+      "ms": 0.07566400244832039,
+      "gbps": 27.716641099344237
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 2097152,
+      "ms": 0.07516799867153168,
+      "gbps": 27.899532208701103
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 2097152,
+      "ms": 0.045104000717401505,
+      "gbps": 46.495919799657614
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 4194304,
+      "ms": 0.08361600339412689,
+      "gbps": 50.161498155203674
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_pull",
+      "bytes": 4194304,
+      "ms": 0.14537599682807922,
+      "gbps": 28.85142039617557
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_push",
+      "bytes": 4194304,
+      "ms": 0.08604799956083298,
+      "gbps": 48.743771167332845
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 4194304,
+      "ms": 0.1451359987258911,
+      "gbps": 28.899129346410522
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 4194304,
+      "ms": 0.14497599750757217,
+      "gbps": 28.931023563269008
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 4194304,
+      "ms": 0.08604799956083298,
+      "gbps": 48.743771167332845
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 10485760,
+      "ms": 0.19838400185108185,
+      "gbps": 52.85587498064082
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_pull",
+      "bytes": 10485760,
+      "ms": 0.3543039858341217,
+      "gbps": 29.59537690583371
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_push",
+      "bytes": 10485760,
+      "ms": 0.2088959962129593,
+      "gbps": 50.196079341368886
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 10485760,
+      "ms": 0.3588639944791794,
+      "gbps": 29.219314730133405
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 10485760,
+      "ms": 0.35953599214553833,
+      "gbps": 29.164701807532577
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 10485760,
+      "ms": 0.2088959962129593,
+      "gbps": 50.196079341368886
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 13615104,
+      "ms": 0.25436800718307495,
+      "gbps": 53.52522178703421
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_pull",
+      "bytes": 13615104,
+      "ms": 0.4665440022945404,
+      "gbps": 29.182893645698307
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_push",
+      "bytes": 13615104,
+      "ms": 0.27030399441719055,
+      "gbps": 50.36959971440998
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 13615104,
+      "ms": 0.4649759978055954,
+      "gbps": 29.2813049797302
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 13615104,
+      "ms": 0.46595199406147003,
+      "gbps": 29.21997152823397
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 13615104,
+      "ms": 0.2703680098056793,
+      "gbps": 50.357673638185
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 16777216,
+      "ms": 0.30396799743175507,
+      "gbps": 55.19402088954023
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_pull",
+      "bytes": 16777216,
+      "ms": 0.5735519826412201,
+      "gbps": 29.25143057258827
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_push",
+      "bytes": 16777216,
+      "ms": 0.3317599892616272,
+      "gbps": 50.57034164167827
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 16777216,
+      "ms": 0.5866879820823669,
+      "gbps": 28.596488273803764
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 16777216,
+      "ms": 0.5868000090122223,
+      "gbps": 28.59102887241188
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 16777216,
+      "ms": 0.3318080008029938,
+      "gbps": 50.56302427728748
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "memcpy_peer",
+      "bytes": 67108864,
+      "ms": 1.2007200121879578,
+      "gbps": 55.89051845460117
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_pull",
+      "bytes": 67108864,
+      "ms": 2.3049919605255127,
+      "gbps": 29.11457616741532
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "sm_push",
+      "bytes": 67108864,
+      "ms": 1.314736008644104,
+      "gbps": 51.043603855659065
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_seq",
+      "bytes": 67108864,
+      "ms": 2.657248020172119,
+      "gbps": 25.25502455568793
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_pull_scat",
+      "bytes": 67108864,
+      "ms": 2.653183937072754,
+      "gbps": 25.29370959257386
+    },
+    {
+      "kind": "scheme",
+      "pair": [
+        0,
+        3
+      ],
+      "scheme": "row_push_scat",
+      "bytes": 67108864,
+      "ms": 1.3147519826889038,
+      "gbps": 51.04298368331822
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "blocks": 1,
+      "bytes": 16777216,
+      "ms": 4.032160043716431,
+      "gbps": 4.160850714778793
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "blocks": 1,
+      "bytes": 16777216,
+      "ms": 0.8355199992656708,
+      "gbps": 20.079969378046375
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "blocks": 2,
+      "bytes": 16777216,
+      "ms": 2.021375894546509,
+      "gbps": 8.299899115876185
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "blocks": 2,
+      "bytes": 16777216,
+      "ms": 0.43617600202560425,
+      "gbps": 38.46432614835868
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "blocks": 4,
+      "bytes": 16777216,
+      "ms": 1.0198400020599365,
+      "gbps": 16.45083146975244
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "blocks": 4,
+      "bytes": 16777216,
+      "ms": 0.33483199775218964,
+      "gbps": 50.10637009792857
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "blocks": 8,
+      "bytes": 16777216,
+      "ms": 0.5151039958000183,
+      "gbps": 32.57054136018294
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "blocks": 8,
+      "bytes": 16777216,
+      "ms": 0.33481600880622864,
+      "gbps": 50.10876289881839
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "blocks": 16,
+      "bytes": 16777216,
+      "ms": 0.3376480042934418,
+      "gbps": 49.68847967903085
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "blocks": 16,
+      "bytes": 16777216,
+      "ms": 0.3346720039844513,
+      "gbps": 50.13032401951214
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_pull",
+      "blocks": 32,
+      "bytes": 16777216,
+      "ms": 0.33689600229263306,
+      "gbps": 49.799391758371335
+    },
+    {
+      "kind": "block_sweep",
+      "pair": [
+        0,
+        1
+      ],
+      "scheme": "sm_push",
+      "blocks": 32,
+      "bytes": 16777216,
+      "ms": 0.3348639905452728,
+      "gbps": 50.10158295217401
+    },
+    {
+      "kind": "pingpong",
+      "pair": [
+        0,
+        1
+      ],
+      "iters": 20000,
+      "rtt_us": 2.1399944
+    },
+    {
+      "kind": "pingpong",
+      "pair": [
+        0,
+        2
+      ],
+      "iters": 20000,
+      "rtt_us": 2.8740827
+    },
+    {
+      "kind": "pingpong",
+      "pair": [
+        0,
+        3
+      ],
+      "iters": 20000,
+      "rtt_us": 2.8679982
+    },
+    {
+      "kind": "concurrent_ring",
+      "direction": "pull",
+      "bytes_per_dev": 33554432,
+      "per_dev_ms": {
+        "0": 0.7167360186576843,
+        "1": 1.428544044494629,
+        "2": 0.7585920095443726,
+        "3": 1.347391963005066
+      },
+      "worst_ms": 1.428544044494629,
+      "aggregate_gbps": 93.95421059452299
+    },
+    {
+      "kind": "concurrent_ring",
+      "direction": "push",
+      "bytes_per_dev": 33554432,
+      "per_dev_ms": {
+        "0": 0.6709759831428528,
+        "1": 0.6732479929924011,
+        "2": 0.6722880005836487,
+        "3": 0.6720319986343384
+      },
+      "worst_ms": 0.6732479929924011,
+      "aggregate_gbps": 199.3585267197594
+    }
+  ]
+}

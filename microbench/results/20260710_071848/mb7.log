@@ -1,0 +1,37 @@
+ERROR 07-10 07:22:59 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+[mb7] pair(0,1)   0MB  memcpy= 22.9  pull= 25.5  push= 25.7  rowpull_scat= 25.7  rowpush_scat= 25.6  GB/s
+[mb7] pair(0,1)   1MB  memcpy= 41.2  pull= 41.0  push= 42.8  rowpull_scat= 40.9  rowpush_scat= 42.8  GB/s
+[mb7] pair(0,1)   2MB  memcpy= 41.8  pull= 45.6  push= 46.6  rowpull_scat= 45.5  rowpush_scat= 46.6  GB/s
+[mb7] pair(0,1)   4MB  memcpy= 51.9  pull= 48.2  push= 48.8  rowpull_scat= 48.2  rowpush_scat= 48.8  GB/s
+[mb7] pair(0,1)  10MB  memcpy= 54.4  pull= 50.0  push= 50.2  rowpull_scat= 49.8  rowpush_scat= 50.2  GB/s
+[mb7] pair(0,1)  12MB  memcpy= 54.6  pull= 50.2  push= 50.4  rowpull_scat= 50.2  rowpush_scat= 50.4  GB/s
+[mb7] pair(0,1)  16MB  memcpy= 54.7  pull= 50.3  push= 50.6  rowpull_scat= 50.3  rowpush_scat= 50.6  GB/s
+[mb7] pair(0,1)  64MB  memcpy= 56.1  pull= 50.8  push= 51.0  rowpull_scat= 50.8  rowpush_scat= 51.0  GB/s
+[mb7] pair(0,2)   0MB  memcpy= 23.1  pull= 18.3  push= 25.6  rowpull_scat= 18.3  rowpush_scat= 25.5  GB/s
+[mb7] pair(0,2)   1MB  memcpy= 40.4  pull= 25.6  push= 42.7  rowpull_scat= 26.2  rowpush_scat= 42.6  GB/s
+[mb7] pair(0,2)   2MB  memcpy= 47.7  pull= 27.7  push= 46.5  rowpull_scat= 27.8  rowpush_scat= 46.5  GB/s
+[mb7] pair(0,2)   4MB  memcpy= 50.5  pull= 28.5  push= 48.7  rowpull_scat= 28.9  rowpush_scat= 48.7  GB/s
+[mb7] pair(0,2)  10MB  memcpy= 52.8  pull= 29.3  push= 50.2  rowpull_scat= 29.0  rowpush_scat= 50.2  GB/s
+[mb7] pair(0,2)  12MB  memcpy= 53.4  pull= 29.0  push= 50.4  rowpull_scat= 29.3  rowpush_scat= 50.4  GB/s
+[mb7] pair(0,2)  16MB  memcpy= 55.2  pull= 29.2  push= 50.6  rowpull_scat= 28.6  rowpush_scat= 50.6  GB/s
+[mb7] pair(0,2)  64MB  memcpy= 55.9  pull= 29.0  push= 51.0  rowpull_scat= 25.2  rowpush_scat= 51.0  GB/s
+[mb7] pair(0,3)   0MB  memcpy= 24.5  pull= 18.4  push= 25.7  rowpull_scat= 18.3  rowpush_scat= 25.5  GB/s
+[mb7] pair(0,3)   1MB  memcpy= 39.7  pull= 25.6  push= 42.7  rowpull_scat= 25.7  rowpush_scat= 42.6  GB/s
+[mb7] pair(0,3)   2MB  memcpy= 48.5  pull= 27.7  push= 46.5  rowpull_scat= 27.9  rowpush_scat= 46.5  GB/s
+[mb7] pair(0,3)   4MB  memcpy= 50.2  pull= 28.9  push= 48.7  rowpull_scat= 28.9  rowpush_scat= 48.7  GB/s
+[mb7] pair(0,3)  10MB  memcpy= 52.9  pull= 29.6  push= 50.2  rowpull_scat= 29.2  rowpush_scat= 50.2  GB/s
+[mb7] pair(0,3)  12MB  memcpy= 53.5  pull= 29.2  push= 50.4  rowpull_scat= 29.2  rowpush_scat= 50.4  GB/s
+[mb7] pair(0,3)  16MB  memcpy= 55.2  pull= 29.3  push= 50.6  rowpull_scat= 28.6  rowpush_scat= 50.6  GB/s
+[mb7] pair(0,3)  64MB  memcpy= 55.9  pull= 29.1  push= 51.0  rowpull_scat= 25.3  rowpush_scat= 51.0  GB/s
+[mb7] blocks= 1  pull=  4.2GB/s  push= 20.1GB/s
+[mb7] blocks= 2  pull=  8.3GB/s  push= 38.5GB/s
+[mb7] blocks= 4  pull= 16.5GB/s  push= 50.1GB/s
+[mb7] blocks= 8  pull= 32.6GB/s  push= 50.1GB/s
+[mb7] blocks=16  pull= 49.7GB/s  push= 50.1GB/s
+[mb7] blocks=32  pull= 49.8GB/s  push= 50.1GB/s
+[mb7] pingpong pair(0,1)  RTT=2.14us
+[mb7] pingpong pair(0,2)  RTT=2.87us
+[mb7] pingpong pair(0,3)  RTT=2.87us
+[mb7] concurrent ring pull: worst=1429us  aggregate=94.0GB/s (单卡 23.5GB/s)
+[mb7] concurrent ring push: worst=673us  aggregate=199.4GB/s (单卡 49.8GB/s)
+[saved] /data/cinnzhang_vllm_td_test/xxy/moe_bench/microbench/results/20260710_071848/mb7_pcie_schemes.json
