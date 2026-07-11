@@ -291,8 +291,12 @@ class TKFusedTP(DistributedScheme):
                 "padded": self.padded, "tp_slots": self.tp_slots,
                 "prered_w": self.prered_w, "slack": self.slack,
                 "pull_order": self.pull_order, "job_order": self.job_order,
-                "push_order": self.push_order,
             }
+            # push_order is only consumed by the (frozen) push dispatch — keep
+            # it out of the timed per-iter rebuild on the pull path (docs/26:
+            # sched is the largest single compressible slice, 277µs @ 12%).
+            if self.dispatch_mode == "push":
+                self._sched_out["push_order"] = self.push_order
             self._sched_graph = None  # captured lazily on first run()
 
         # ---- weights (x @ W layout, W = (K, N)) ----

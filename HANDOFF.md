@@ -9,7 +9,14 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第五轮 2026-07-11·当前状态】**首次全绿并**超 serial**:pull 路径 NE=64/T=512
+**【TP 第六轮 2026-07-11·当前状态】**32/32 全过。comm 拐点确认=24(32/40 反降);
+**RB64 翻盘 NE=256(4950 vs serial 5287 = 1.07×,padding 归零净赚 477µs)**;首份分阶段
+归因落地:GEMM-alone 1486µs(~210TFLOP/s,远快于预估)、L0 暴露 254、L1 暴露 186、
+**sched 277µs 是最大可压项(12%)**(已做第一刀:pull 不再重建 push_order);理论地板
+~1900µs(1.38×)。当前:NE=64 **2301/1.14×**、NE=128 1.09×、NE=256(RB64) 1.07×。
+**新异常:T=1024 双峰(med 10020/min 4210,comm24;comm16 上轮稳定 4325)**→ 脚本已加
+06b 对照+两档归因,下轮裁决。终数前必须 TP-T3(triton 调优)。docs/26。
+**【TP 第五轮(历史)】**首次全绿并**超 serial**:pull 路径 NE=64/T=512
 **2290µs vs serial 2630 = 1.15×**(comm_sms=24,fair 口径;T=1024 1.16×,NE=128 1.05×)。
 docs/20 修复兑现(3613→2363,-35%)。push 路径(TP-T1)正确但慢于 pull → **冻结**
 (TP 是 GEMM-bound,mb 带宽差不在关键路径;docs/25 §2)。遗留:NE=256 0.97×(50% padding
@@ -177,4 +184,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/23** | **TP 第三轮计划:mb 事实映射到 TP(pull 弱路径→push 化必选 TP-T1、comm SM 自适应、triton 调优、copy engine 远期);修正预期与报数规范** |
 | **docs/24** | **TP 第四轮:barrier 混用 UB(bar0 混计数→illegal instruction)修复(专用命名 barrier);TP-T1 push 化落地(canonical 布局/push_order/tppdisp 三角色/chunk 水位);EP P1 口径修复** |
 | **docs/25** | **TP 第五轮:首次超 serial(1.11~1.15×,docs/20 修复兑现-35%);push 冻结归因(GEMM-bound+scatter 粒度);NE=256 padding→RB64、comm_sms 拐点、预期账对数与微基准外推教训** |
+| **docs/26** | **TP 第六轮:comm 拐点=24 确认、RB64 翻盘 NE=256(1.07×)、首份分阶段归因(GEMM 1486µs/sched 277 最大可压项/理论地板 1900µs);T=1024 双峰异常待裁决** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

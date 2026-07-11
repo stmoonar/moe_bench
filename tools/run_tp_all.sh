@@ -168,6 +168,13 @@ else
             run_step "06_tktp_t${T}"   600 python -m moe_bench.tools.run_tktp 64 --scheme tktp \
                 --no-verify --iters 30 --tokens "$T" --json "$JSONS/tktp_t${T}.json"
         done
+        # ---------- 6b. T=1024 双峰异常对照(docs/26: comm24 时 med 10020/min 4210) ----------
+        run_step 06b_tktp_t1024_cs16 600 env TK_COMM_SMS=16 \
+            python -m moe_bench.tools.run_tktp 64 --scheme tktp --no-verify --iters 30 \
+            --tokens 1024 --json "$JSONS/tktp_t1024_cs16.json"
+        run_step 06b_stages_t1024      900 python -m moe_bench.tools.time_tp_stages 64 20 1024
+        run_step 06b_stages_t1024_cs16 900 env TK_COMM_SMS=16 \
+            python -m moe_bench.tools.time_tp_stages 64 20 1024
         # ---------- 7. NE sweep 性能 ----------
         for NE in 128 256; do
             run_step "07_serial_ne${NE}" 600 python -m moe_bench.tools.run_tktp "$NE" --scheme serial \
@@ -202,7 +209,7 @@ note "完成: PASS=$PASS FAIL=$FAIL"
         echo "--- $(basename "$f")"
         grep -E "verify|FAIL|ok|µs|us/iter|latency|tokens/s|mean" "$f" | tail -8
     done
-    for f in "$LOGS"/08_*.log; do
+    for f in "$LOGS"/06b_stages*.log "$LOGS"/08*.log; do
         [ -f "$f" ] || continue
         echo "--- $(basename "$f")"
         tail -16 "$f"

@@ -6,7 +6,7 @@ comm / drain cost of each fused stage is directly readable:
   L0 exposure = t(L0 fused) - t(L0 GEMM alone)     (AG + gate stalls)
   L1 exposure = t(L1 fused) - t(L1 GEMM alone)     (prered/push drain)
 
-  python -m moe_bench.tools.time_tp_stages [ne] [iters]
+  python -m moe_bench.tools.time_tp_stages [ne] [iters] [tokens_per_rank]
 
 Per-stage numbers are the MAX across ranks (slowest gates), mean over iters.
 cuda.synchronize between stages perturbs overlap slightly but the fused
@@ -21,7 +21,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _worker(rank, world, init_method, ne, iters):
+def _worker(rank, world, init_method, ne, iters, tokens):
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     torch.set_default_device(device)
@@ -38,12 +38,12 @@ def _worker(rank, world, init_method, ne, iters):
     cfg = MoEBenchConfig(
         hidden_size=4096, intermediate_size=3072, num_experts=ne, topk=8,
         parallel_mode=ParallelMode.TP, world_size=world, precision=Precision.BF16,
-        num_tokens=[512], routing=RoutingConfig(distribution=Distribution.BALANCED),
+        num_tokens=[tokens], routing=RoutingConfig(distribution=Distribution.BALANCED),
         distributed=True, verify=False, device="cuda")
     ctx = DistContext(rank=rank, world_size=world, local_rank=rank,
                       device=device, group=None)
     weights = make_weights(cfg, rank)
-    problem = make_problem(cfg, 512, rank=rank, weights=weights)
+    problem = make_problem(cfg, tokens, rank=rank, weights=weights)
     s = TKFusedTP()
     s.setup(problem, ctx)
 
@@ -131,7 +131,7 @@ def _worker(rank, world, init_method, ne, iters):
     t = torch.tensor([acc[k] / iters for k in stages], device=device)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     if rank == 0:
-        print(f"\n== tktp stage attribution (NE={ne}, T=512, iters={iters}, "
+        print(f"\n== tktp stage attribution (NE={ne}, T={tokens}, iters={iters}, "
               f"dispatch={s.dispatch_mode}, comm_sms={s.num_comm_sms}, "
               f"push_sms={s.num_push_sms}, max over ranks, us) ==")
         for k, v in zip(stages, t.tolist()):
@@ -147,10 +147,11 @@ def _worker(rank, world, init_method, ne, iters):
 def main():
     ne = int(sys.argv[1]) if len(sys.argv) > 1 else 64
     iters = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+    tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 512
     world = 4
     from vllm.utils.network_utils import get_open_port
     init_method = f"tcp://localhost:{get_open_port()}"
-    mp.spawn(_worker, args=(world, init_method, ne, iters), nprocs=world, join=True)
+    mp.spawn(_worker, args=(world, init_method, ne, iters, tokens), nprocs=world, join=True)
 
 
 if __name__ == "__main__":
