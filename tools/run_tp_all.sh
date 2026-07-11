@@ -108,6 +108,9 @@ run_step() {  # run_step <名字> <超时秒> <命令...>
         tail -20 "$log" | sed 's/^/      /' >> "$SUMMARY"
         FAIL=$((FAIL+1))
     fi
+    # 环境干扰取证(docs/27: 双峰随轮次在配置间游走): 每步结束记录全卡时钟/占用
+    nvidia-smi --query-gpu=index,clocks.sm,temperature.gpu,utilization.gpu,memory.used \
+        --format=csv,noheader,nounits 2>/dev/null | sed "s/^/${name},/" >> "$OUT/clocks_per_step.csv"
 }
 
 cd "$PARENT_DIR"
@@ -169,6 +172,9 @@ else
                 --no-verify --iters 30 --tokens "$T" --json "$JSONS/tktp_t${T}.json"
         done
         # ---------- 6b. T=1024 双峰异常对照(docs/26: comm24 时 med 10020/min 4210) ----------
+        run_step 06b_tktp_t1024_rep 600 \
+            python -m moe_bench.tools.run_tktp 64 --scheme tktp --no-verify --iters 30 \
+            --tokens 1024 --json "$JSONS/tktp_t1024_rep.json"
         run_step 06b_tktp_t1024_cs16 600 env TK_COMM_SMS=16 \
             python -m moe_bench.tools.run_tktp 64 --scheme tktp --no-verify --iters 30 \
             --tokens 1024 --json "$JSONS/tktp_t1024_cs16.json"
@@ -190,6 +196,10 @@ else
         run_step 07b_tktp_ne256_rb64 600 env TK_ROW_BLOCK=64 \
             python -m moe_bench.tools.run_tktp 256 --scheme tktp --no-verify --iters 30 \
             --json "$JSONS/tktp_ne256_rb64.json"
+        # 重复第二次(docs/27: 上轮此档双峰, 同 session 复跑判内因/外因)
+        run_step 07b_tktp_ne256_rb64_rep 600 env TK_ROW_BLOCK=64 \
+            python -m moe_bench.tools.run_tktp 256 --scheme tktp --no-verify --iters 30 \
+            --json "$JSONS/tktp_ne256_rb64_rep.json"
     fi
 
     # ---------- 8. 分阶段归因(docs/09 三件套: 各阶段 + GEMM-alone 对照) ----------
@@ -198,6 +208,16 @@ else
     if [ "$QUICK" != "1" ]; then
         run_step 08_time_stages_cs8 900 env TK_COMM_SMS=8 python -m moe_bench.tools.time_tp_stages 64 20
     fi
+fi
+
+# ---------- 9. TP-T3: vLLM triton 调优(可选, TUNE=1 打开, 0.5~2h) ----------
+if [ "${TUNE:-0}" = "1" ] && [ "${SKIP_ALL:-0}" != "1" ]; then
+    run_step 09_tune_vllm_tp 10800 bash "$MOE_DIR/tools/tune_vllm_moe_tp.sh"
+    # 调优后立刻复测 serial 基线(json 已装入 vllm configs)
+    run_step 09_serial_tuned_512 600 python -m moe_bench.tools.run_tktp 64 --scheme serial \
+        --no-verify --iters 50 --json "$JSONS/serial_tuned_ne64_t512.json"
+    run_step 09_serial_tuned_t1024 600 python -m moe_bench.tools.run_tktp 64 --scheme serial \
+        --no-verify --iters 30 --tokens 1024 --json "$JSONS/serial_tuned_t1024.json"
 fi
 
 # ---------- 收尾：汇总 + 打包 ----------

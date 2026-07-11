@@ -9,7 +9,13 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第六轮 2026-07-11·当前状态】**32/32 全过。comm 拐点确认=24(32/40 反降);
+**【TP 第七轮 2026-07-11·当前状态】**35/35 全过。**T=1024 异常解除且创最佳比率
+(4199 vs 5021 = 1.20×)**;NE=64 2264(1.16×)、NE=128 1.11×。双峰漂移(上轮 t1024→本轮
+ne256_rb64,且 serial_t256 也离群)→ **环境干扰假说**(min 恰等稳定轮值);已加取证:每步
+clocks 快照 + 波动档同 session 重复跑,下轮裁决。**TP-T3 调优脚本就绪**(tools/
+tune_vllm_moe_tp.sh,TP 形状 E=64/N=768;一键脚本 TUNE=1 开 step 09)——报终数前最后
+一块。docs/27。
+**【TP 第六轮(历史)】**32/32 全过。comm 拐点确认=24(32/40 反降);
 **RB64 翻盘 NE=256(4950 vs serial 5287 = 1.07×,padding 归零净赚 477µs)**;首份分阶段
 归因落地:GEMM-alone 1486µs(~210TFLOP/s,远快于预估)、L0 暴露 254、L1 暴露 186、
 **sched 277µs 是最大可压项(12%)**(已做第一刀:pull 不再重建 push_order);理论地板
@@ -185,4 +191,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/24** | **TP 第四轮:barrier 混用 UB(bar0 混计数→illegal instruction)修复(专用命名 barrier);TP-T1 push 化落地(canonical 布局/push_order/tppdisp 三角色/chunk 水位);EP P1 口径修复** |
 | **docs/25** | **TP 第五轮:首次超 serial(1.11~1.15×,docs/20 修复兑现-35%);push 冻结归因(GEMM-bound+scatter 粒度);NE=256 padding→RB64、comm_sms 拐点、预期账对数与微基准外推教训** |
 | **docs/26** | **TP 第六轮:comm 拐点=24 确认、RB64 翻盘 NE=256(1.07×)、首份分阶段归因(GEMM 1486µs/sched 277 最大可压项/理论地板 1900µs);T=1024 双峰异常待裁决** |
+| **docs/27** | **TP 第七轮:T=1024 解除(1.20× 最佳)、双峰漂移+serial 离群→环境干扰假说与取证(clocks_per_step/重复跑);TP-T3 调优脚本就绪(TUNE=1);报数纪律(波动档看 min+重复一致性)** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
