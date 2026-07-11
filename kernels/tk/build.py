@@ -10,7 +10,7 @@ import importlib.util
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TK_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "ThunderKittens"))
-_COMMON = os.path.join(_TK_ROOT, "tileoverlap", "common", "sm120_common.cuh")
+_COMMON = os.path.abspath(os.path.join(_HERE, "..", "tileoverlap", "common", "sm120_common.cuh"))
 
 
 def _nvcc_flags():

@@ -15,6 +15,17 @@
 
 ## 2. 当前状态(全部已提交,分支 tk_dev)
 
+> **【仓库结构重构 2026-07-11】** ThunderKittens 已改为**正式 git submodule**
+> (`.gitmodules`,钉在上游 `02e9acbd`,TK 核心零改动)。原先压在 TK 本地提交里的
+> 自研代码 `ThunderKittens/tileoverlap/` 已整体迁至 **`kernels/tileoverlap/`**,
+> 由 moe_bench 自己追踪(TK 内留有 `tileoverlap-archive` 分支存档旧提交,仅本地)。
+> 路径已同步修正:各 `Makefile` include `../../../ThunderKittens/kernels/common.mk`、
+> benchmark 脚本 sys.path 指向 `../../../ThunderKittens/kernels/parallel`、
+> `kernels/tk/build.py` 的 `_COMMON` 指向 `kernels/tileoverlap/common/sm120_common.cuh`。
+> 新 clone 后需 `git submodule update --init`。**服务器侧
+> (`/data/cinnzhang_vllm_td_test/xxy/moe_bench`)尚未做同样的目录调整**,下次上
+> 服务器时需同步(迁移目录 + git pull 本仓库),否则两边结构不一致。
+
 > **【默认形状已改 2026-07-09】** 默认 shape 现为 **E=64, TOP_K=8, hidden=4096,
 > gate_up=6144(intermediate=3072)**,512 token/rank, bf16 EP world=4(E_local=16,
 > 每专家 ~256 token,padding 少)。config.py / configs/tk_ep_bf16.yaml / 各 tool 默认

@@ -5,7 +5,7 @@ processes the way the moe_bench harness spawns them? Mirrors distributed._worker
 import os
 import sys
 
-sys.path.insert(0, "/data/cinnzhang_vllm_td_test/xxy/moe_bench/ThunderKittens/tileoverlap/02_moe_dispatch_gemm")
+sys.path.insert(0, "/data/cinnzhang_vllm_td_test/xxy/moe_bench/kernels/tileoverlap/02_moe_dispatch_gemm")
 
 import torch
 import torch.distributed as dist
