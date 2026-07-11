@@ -99,6 +99,10 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 
 - **远端原子会丢增量**(高并发散射 red.add,probe 弱压力测不出)→ docs/08。
   跨卡完成检测只用"本地 atom.acq_rel 选举 + 单写者 st.release.sys"两阶段协议。
+- **worker 里 set_default_device(cuda) 劫持无显式 device 的张量创建**(host 调度表
+  必须每处写 device="cpu",本地 CPU 测试测不出)→ docs/21 §1。
+- **block-per-job 是反模式**(大 smem 下按块调度粒度串行排空)→ 常驻块 + 原子
+  dispenser + 就绪序;拉取/到达序要对齐**消费序**而不是源的远近 → docs/21 §4、docs/20。
 - **group::store 行映射置换**(warpgroup 交织,改 CONSUMER_WARPS 数必重推)→ docs/05。
 - **新方案必须全档位扫 NE∈{64,128,256}**,单点结论会误导 → docs/10 §7。
 - **协议正确性靠隔离裁决**(xx-only debug 入口 + 30 迭代 + 双重对账),
@@ -148,4 +152,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/18** | **T6-v1:combine 预归约 push 化(边算边推 + 水位选举,消 barrier+零重叠);layer1 融合损失 283→192µs,默认** |
 | **docs/19** | **TP 版 tile overlap(tktp,分支 tp_test):AG⊕gate+up GEMM + 本地prered⊕稠密RS push;复用矩阵/调度表/账/上机风险清单/一键脚本** |
 | **docs/20** | **TP 首轮实测归因(0.73× serial:L0 ring 序拉取 + L1 job 块排队)与修复(pull_order/全员 dispenser/time_tp_stages);修复后预期账与天花板提醒** |
+| **docs/21** | **经验:set_default_device 坑(host 表显式 device 纪律)、远程 zip 回流工程实践(timeout/可归因失败/干净编译/sweep 顺手带)、无 profiler 归因三条账、可泛化调度教训** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
