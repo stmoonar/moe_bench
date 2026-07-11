@@ -84,10 +84,22 @@ def _worker(rank, world, init_method, ne, iters):
             s.tk.pcie_device_barrier(s.barrier_l0, s._l0_seq)
         timed("tok_copy", st_copy)
 
-        timed("L0_fused", lambda: s.tk.moe_tp_dispatch_gemm(
-            s.pre_tokens, s.gathered, s.w_gateup, s.gateup_out, s.padded,
-            s.tp_slots, s.slack, s.pull_order, s.barrier_l0, s.num_comm_sms,
-            s.num_padded_total, s.num_tokens))
+        def st_l0():
+            if s.dispatch_mode == "push":
+                s._l0_seq += 1
+                s.l0_push_cnt.zero_()
+                s.tk.moe_tp_dispatch_push_gemm(
+                    s.pre_tokens, s.ag_staging, s.gathered, s.w_gateup,
+                    s.gateup_out, s.padded, s.tp_slots, s.slack, s.push_order,
+                    s.l0_push_cnt, s.barrier_l0, s.num_push_sms,
+                    max(s.num_comm_sms - s.num_push_sms, 1),
+                    s.num_padded_total, s.num_tokens, s._l0_seq)
+            else:
+                s.tk.moe_tp_dispatch_gemm(
+                    s.pre_tokens, s.gathered, s.w_gateup, s.gateup_out, s.padded,
+                    s.tp_slots, s.slack, s.pull_order, s.barrier_l0,
+                    s.num_comm_sms, s.num_padded_total, s.num_tokens)
+        timed("L0_fused", st_l0)
 
         timed("silu", lambda: torch.mul(
             F.silu(s.gateup_out[:, :s.inter]), s.gateup_out[:, s.inter:], out=s.act))
@@ -120,7 +132,8 @@ def _worker(rank, world, init_method, ne, iters):
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     if rank == 0:
         print(f"\n== tktp stage attribution (NE={ne}, T=512, iters={iters}, "
-              f"comm_sms={s.num_comm_sms}, max over ranks, us) ==")
+              f"dispatch={s.dispatch_mode}, comm_sms={s.num_comm_sms}, "
+              f"push_sms={s.num_push_sms}, max over ranks, us) ==")
         for k, v in zip(stages, t.tolist()):
             print(f"  {k:14} {v:10.1f}")
         l0 = dict(zip(stages, t.tolist()))

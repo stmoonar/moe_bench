@@ -134,10 +134,13 @@ else
 
     # ---------- 3. 正确性对拍（harness 自动 verify vs reference_moe） ----------
     run_step 03_correct_ne64            600 python -m moe_bench.tools.run_tktp 64  --iters 10
+    run_step 03p_correct_ne64_push 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 --iters 10
     if [ "$QUICK" != "1" ]; then
         run_step 03_correct_ne128       600 python -m moe_bench.tools.run_tktp 128 --iters 10
         run_step 03_correct_ne256       900 python -m moe_bench.tools.run_tktp 256 --iters 10
         run_step 03_correct_ne64_skewed 600 python -m moe_bench.tools.run_tktp 64  --iters 10 --dist skewed
+        run_step 03p_correct_ne256_push 900 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 256 --iters 10
+        run_step 03p_correct_skewed_push 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 --iters 10 --dist skewed
     fi
 
     # ---------- 4. 性能：serial baseline vs tktp（同 harness 同 config） ----------
@@ -145,12 +148,23 @@ else
         --no-verify --iters 50 --json "$JSONS/serial_ne64_t512.json"
     run_step 04_bench_tktp_512   600 python -m moe_bench.tools.run_tktp 64 --scheme tktp \
         --no-verify --iters 50 --json "$JSONS/tktp_ne64_t512.json"
+    run_step 04p_bench_push_512 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_push_ne64_t512.json"
+    # push 路径的 comm SM 组合扫描(push_sms, comm_sms): push 只要 4 SM 打满(mb6)
+    for CFG in "4 8" "4 12" "4 16" "2 8"; do
+        set -- $CFG
+        run_step "04p_sweep_p${1}_c${2}" 600 \
+            env TK_TP_DISPATCH=push TK_TP_PUSH_SMS=$1 TK_COMM_SMS=$2 \
+            python -m moe_bench.tools.run_tktp 64 \
+            --scheme tktp --no-verify --iters 30 --json "$JSONS/tktp_push_p${1}_c${2}.json"
+    done
 
     if [ "$QUICK" != "1" ]; then
         # ---------- 5. comm SM 预算 sweep（experience/12：PCIe 上 2~8 起步） ----------
         for CS in 4 8 16 24; do
-            TK_COMM_SMS=$CS run_step "05_sweep_commsms_${CS}" 600 \
-                python -m moe_bench.tools.run_tktp 64 --scheme tktp --no-verify --iters 30 \
+            run_step "05_sweep_commsms_${CS}" 600 \
+                env TK_COMM_SMS=$CS python -m moe_bench.tools.run_tktp 64 \
+                --scheme tktp --no-verify --iters 30 \
                 --json "$JSONS/tktp_commsms${CS}.json"
         done
         # ---------- 6. token 数 sweep ----------
@@ -171,8 +185,9 @@ else
 
     # ---------- 8. 分阶段归因(docs/09 三件套: 各阶段 + GEMM-alone 对照) ----------
     run_step 08_time_stages 900 python -m moe_bench.tools.time_tp_stages 64 20
+    run_step 08p_time_stages_push 900 env TK_TP_DISPATCH=push python -m moe_bench.tools.time_tp_stages 64 20
     if [ "$QUICK" != "1" ]; then
-        TK_COMM_SMS=8 run_step 08_time_stages_cs8 900 python -m moe_bench.tools.time_tp_stages 64 20
+        run_step 08_time_stages_cs8 900 env TK_COMM_SMS=8 python -m moe_bench.tools.time_tp_stages 64 20
     fi
 fi
 

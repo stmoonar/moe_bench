@@ -566,6 +566,230 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &post_tokens,
 } // namespace tpdisp
 
 /* ===================================================================== *
+ * 2d. TP PUSH AllGather-dispatch ⊕ grouped GEMM (layer0, TP-T1; docs/23).
+ *
+ * Microbench verdict (docs/22 §0): SM pull is the WEAK path on this box
+ * (cross-pair 29GB/s, 23.5GB/s/card under 4-way concurrency, needs 16 SMs);
+ * SM push is the STRONG path (50.9GB/s, 4 SMs saturate, zero concurrent
+ * degradation). TP's AllGather is dense and routing-independent, so the push
+ * form is trivial: source card s TMA-pushes its own shard rows into every
+ * peer's ag_staging plane [s] (single writer, no atomics), in the CANONICAL
+ * min-slot order (tp_slots must be identical on all ranks — the schedule
+ * builders drop the per-rank ring for this), with a per-(dst, CHUNK-of-rows)
+ * watermark: local acq_rel election -> single-writer st.release.sys seq into
+ * the dst's barrier row 2+s, col chunk (the proven preredpush chain).
+ *
+ * One persistent launch, three roles:
+ *   [0, comp)                    grouped GEMM, gate = row-block counter == RB
+ *   [comp, comp+push)            push_role: my shard -> peers (strong path)
+ *   [comp+push, comp+push+scat)  scatter_role: consume (src, pos) in arrival
+ *                                order — wait chunk watermark (remote srcs
+ *                                only; own shard reads pre_tokens directly,
+ *                                so no self-dependency), copy the row to its
+ *                                TOP_K gathered slots, bump row-block counters.
+ * All blocks resident (no churn); scatter spins only on REMOTE watermarks,
+ * which peers' resident push blocks deliver -> deadlock-free.
+ * ===================================================================== */
+namespace tppdisp {
+struct globals {
+    using cfg = gemm_config;
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    static constexpr int TOP_K = 8;
+    static constexpr int CHUNK = 64;   // rows per watermark chunk (per source)
+    using token_vec = sv_bf<H>;
+    static constexpr int TOKENS_PER_BLOCK = cfg::DYNAMIC_SHARED_MEMORY / sizeof(token_vec);
+    using pre_tokens_pgl  = pgl<gl<bf16, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
+    using staging_pgl     = pgl<gl<bf16, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;  // (world*T, H), plane s = rows [s*T, s*T+T)
+    using post_tokens_gl  = gl<bf16, 1, 1, -1, H, token_vec, cfg::A_tile>;
+    using weights_gl      = gl<bf16, 1, -1, -1, -1, cfg::B_tile>;
+    using outputs_gl      = gl<bf16, 1, 1, -1, -1>;
+    using counts_gl       = gl<int, 1, 1, 1, -1>;
+    using slots_gl        = gl<int, 1, 1, -1, TOP_K>;
+    using slack_gl        = gl<int, 1, 1, 1, -1>;
+    using order2d_gl      = gl<int, 1, 1, -1, -1>;     // push_order (world, T)
+    using cnt_gl          = gl<int, 1, 1, 1, -1>;      // (world*nchunks,) local election counters
+    using barrier_pgl     = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    pre_tokens_pgl pre_tokens;
+    staging_pgl ag_staging;
+    post_tokens_gl activations;
+    weights_gl weights;
+    outputs_gl outputs;
+    counts_gl padded_tokens_per_expert;
+    slots_gl tp_slots;
+    slack_gl slack;
+    order2d_gl push_order;
+    cnt_gl push_cnt;
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int num_local_experts;    // == E
+    const int expert_offset;        // == 0
+    const int num_padded_local_tokens;
+    const int num_tokens;           // per-card T
+    const int s_max;                // world * T
+    const int nchunks;              // ceil(T / CHUNK)
+    const int num_comp_sms;
+    const int num_push_sms;
+    const int num_scatter_sms;
+    const int seq;
+};
+// push role: persistent lanes stream MY shard rows to every peer's plane [me]
+// in push_order (canonical min-slot order == every consumer's scatter order),
+// electing the per-(dst, chunk) watermark after each chunk fully commits.
+__device__ inline void push_role(const globals &G, const int pb_idx) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::token_vec (&token)[globals::TOKENS_PER_BLOCK] =
+        al.allocate<typename globals::token_vec, globals::TOKENS_PER_BLOCK>();
+    __shared__ semaphore token_arrived[globals::TOKENS_PER_BLOCK];
+    const int lane_id = threadIdx.x;
+    if (lane_id >= globals::TOKENS_PER_BLOCK) return;
+    init_semaphore(token_arrived[lane_id], 0, 1);
+    int phase = 0;
+    const int stride = G.num_push_sms * globals::TOKENS_PER_BLOCK;
+    for (int p = pb_idx * globals::TOKENS_PER_BLOCK + lane_id; p < G.num_tokens; p += stride) {
+        const int tok = G.push_order[{G.dev_idx, p}];
+        tma::expect_bytes(token_arrived[lane_id], sizeof(typename globals::token_vec));
+        tma::load_async(token[lane_id], G.pre_tokens[G.dev_idx], {tok, 0}, token_arrived[lane_id]);
+        wait(token_arrived[lane_id], phase);
+        phase ^= 1;
+        const int dst_row = G.dev_idx * G.num_tokens + tok;
+        #pragma unroll
+        for (int d = 0; d < globals::NUM_DEVICES; d++)
+            if (d != G.dev_idx)
+                tma::store_async(G.ag_staging[d], token[lane_id], {dst_row, 0});
+        tma::store_async_wait();   // my row committed on every peer
+        const int chunk = p / globals::CHUNK;
+        const int expected = min(globals::CHUNK, G.num_tokens - chunk * globals::CHUNK);
+        #pragma unroll
+        for (int d = 0; d < globals::NUM_DEVICES; d++) {
+            if (d == G.dev_idx) continue;
+            int old;
+            asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                         : "=r"(old) : "l"(&G.push_cnt[{d * G.nchunks + chunk}]) : "memory");
+            if (old + 1 == expected) {   // last row of this chunk for dst d: elected
+                __threadfence_system();
+                pcie_sync::signal_slot(G.barrier, d, 2 + G.dev_idx, chunk, G.seq);
+            }
+        }
+    }
+}
+// scatter role: persistent block-per-token rounds in ARRIVAL order (i encodes
+// (pos, src) with pos major — earliest chunks of every source first).
+__device__ inline void scatter_role(const globals &G, const int sb_idx) {
+    constexpr int H = globals::H, VEC = 8, HVEC = H / VEC;
+    for (int i = sb_idx; i < G.s_max; i += G.num_scatter_sms) {
+        const int s = i % globals::NUM_DEVICES;
+        const int p = i / globals::NUM_DEVICES;
+        const int tok = G.push_order[{s, p}];
+        if (threadIdx.x == 0 && s != G.dev_idx)
+            pcie_sync::wait_slot(G.barrier, G.dev_idx, 2 + s, p / globals::CHUNK, G.seq);
+        __syncthreads();   // watermark acquired -> whole block may read the row
+        const int drow = s * G.num_tokens + tok;
+        const bf16 *src = (s == G.dev_idx)
+            ? &G.pre_tokens[G.dev_idx][{tok, 0}]      // own shard: never staged
+            : &G.ag_staging[G.dev_idx][{drow, 0}];
+        const float4 *src_v = reinterpret_cast<const float4 *>(src);
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) {
+            const int slot = G.tp_slots[{drow, k}];
+            if (slot < 0) continue;
+            float4 *dst_v = reinterpret_cast<float4 *>(&G.activations[{slot, 0}]);
+            for (int c = threadIdx.x; c < HVEC; c += blockDim.x)
+                dst_v[c] = src_v[c];
+        }
+        __syncthreads();   // all copies of this token done before signaling
+        if (threadIdx.x == 0) {
+            __threadfence();   // gpu-scope: block's writes visible before counters
+            #pragma unroll
+            for (int k = 0; k < globals::TOP_K; k++) {
+                const int slot = G.tp_slots[{drow, k}];
+                if (slot >= 0)
+                    asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
+                                 :: "l"(&G.barrier[G.dev_idx][{slot / gemm_config::ROW_BLOCK}]), "r"(1) : "memory");
+            }
+        }
+    }
+}
+struct dispatch_gate {
+    const globals &G;
+    __device__ inline void operator()(int row_idx) const {
+        int v;
+        asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        while (v != gemm_config::ROW_BLOCK) {
+            __nanosleep(32);
+            asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        }
+    }
+};
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void kernel(const __grid_constant__ globals G) {
+    if (blockIdx.x < G.num_comp_sms)
+        grouped_gemm_sm120(G, dispatch_gate{G}, blockIdx.x, G.num_comp_sms);
+    else if (blockIdx.x < G.num_comp_sms + G.num_push_sms)
+        push_role(G, blockIdx.x - G.num_comp_sms);
+    else
+        scatter_role(G, blockIdx.x - G.num_comp_sms - G.num_push_sms);
+}
+__global__ __launch_bounds__(256)
+void reset_kernel(const __grid_constant__ globals G) {
+    const int nb = (G.num_padded_local_tokens + gemm_config::ROW_BLOCK - 1) / gemm_config::ROW_BLOCK;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < nb; i += gridDim.x * blockDim.x)
+        G.barrier[G.dev_idx][{i}] = G.slack[{i}];
+}
+void entry(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTensor &ag_staging,
+           at::Tensor &post_tokens, at::Tensor &weights, at::Tensor &outputs,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &tp_slots, at::Tensor &slack,
+           at::Tensor &push_order, at::Tensor &push_cnt,
+           kittens::py::TKParallelTensor &barrier, const int num_push_sms,
+           const int num_scatter_sms, const int num_padded_local_tokens,
+           const int num_tokens, const int seq) {
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
+    TORCH_CHECK(weights.size(0) == num_local_experts,
+                "TP weights first dim must equal the FULL expert count");
+    TORCH_CHECK(num_local_experts <= gemm_config::MAX_LOCAL_EXPERTS, "too many experts");
+    TORCH_CHECK(tp_slots.size(1) == globals::TOP_K, "tp_slots second dim must be TOP_K");
+    TORCH_CHECK(push_order.size(0) == globals::NUM_DEVICES && push_order.size(1) == num_tokens,
+                "push_order must be (world, T)");
+    TORCH_CHECK(num_push_sms >= 1 && num_scatter_sms >= 1, "need >=1 push and scatter block");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_push_sms + num_scatter_sms < sm, "comm blocks must leave room for compute");
+    const int num_comp_sms = sm - num_push_sms - num_scatter_sms;
+    const int s_max = static_cast<int>(tp_slots.size(0));
+    TORCH_CHECK(s_max == globals::NUM_DEVICES * num_tokens, "tp_slots rows must be world*T");
+    const int nchunks = (num_tokens + globals::CHUNK - 1) / globals::CHUNK;
+    TORCH_CHECK(push_cnt.numel() >= globals::NUM_DEVICES * nchunks, "push_cnt too small");
+    globals G {
+        .pre_tokens = kittens::py::parallel_tensor_to_pgl<globals::pre_tokens_pgl>(pre_tokens),
+        .ag_staging = kittens::py::parallel_tensor_to_pgl<globals::staging_pgl>(ag_staging),
+        .activations = kittens::py::tensor_to_gl<globals::post_tokens_gl>(post_tokens),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .tp_slots = kittens::py::tensor_to_gl<globals::slots_gl>(tp_slots),
+        .slack = kittens::py::tensor_to_gl<globals::slack_gl>(slack),
+        .push_order = kittens::py::tensor_to_gl<globals::order2d_gl>(push_order),
+        .push_cnt = kittens::py::tensor_to_gl<globals::cnt_gl>(push_cnt),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_local_experts = num_local_experts,
+        .expert_offset = 0,
+        .num_padded_local_tokens = num_padded_local_tokens, .num_tokens = num_tokens,
+        .s_max = s_max, .nchunks = nchunks, .num_comp_sms = num_comp_sms,
+        .num_push_sms = num_push_sms, .num_scatter_sms = num_scatter_sms, .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel<<<sm, gemm_config::NUM_THREADS, smem, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / gemm_config::ROW_BLOCK + 255) / 256 + 1;
+    reset_kernel<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace tppdisp
+
+/* ===================================================================== *
  * 2b. Dispatch via source-side PUSH ⊕ grouped GEMM (layer0, optimization #1).
  *
  * Reverses 2's pull. Each card is both a SOURCE (pushes its own tokens out to
@@ -1594,8 +1818,15 @@ void gemm_push_kernel_tp(const __grid_constant__ globals G,
     const int col_blocks = static_cast<int>(G.weights.cols()) / gemm_config::COL_BLOCK;
     if (blockIdx.x < G.num_comp_sms) {
         grouped_gemm_sm120(G, no_gate{}, signal_epilogue{G, col_blocks}, blockIdx.x, G.num_comp_sms);
-        __syncthreads();  // all warps out of the GEMM before push_job reuses smem
+        // Join ALL warps on a DEDICATED named barrier before reusing smem.
+        // NOT __syncthreads(): that is hw barrier 0 with a 288-thread count,
+        // while inside the GEMM the consumer group still cycles barrier 0/1
+        // with a 256-thread count (producer lanes 1..31 exit the GEMM
+        // immediately) — concurrent mixed-count arrivals on one barrier are
+        // UB (observed as cudaErrorIllegalInstruction, round 4 / docs/24).
+        asm volatile("bar.sync 2, %0;" :: "n"(gemm_config::NUM_THREADS));
     }
+    // Post-join (or comm block): barrier 0 is free again, __syncthreads is safe.
     __shared__ int s_j;
     while (true) {
         if (threadIdx.x == 0) s_j = atomicAdd(job_next, 1);
@@ -1798,5 +2029,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_gemm_prered_push_fused", &preredpush::gemm_push_entry);
     m.def("moe_final_reduce_push", &preredpush::final_reduce_push_entry);
     m.def("moe_tp_dispatch_gemm", &tpdisp::entry);
+    m.def("moe_tp_dispatch_push_gemm", &tppdisp::entry);
     m.def("moe_tp_gemm_prered_push", &preredpush::gemm_push_entry_tp);
 }

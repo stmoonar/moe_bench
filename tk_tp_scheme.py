@@ -55,11 +55,16 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
         wait for the LAST ring stage, stalling the GEMM behind the whole AG);
       - job_order (world*T,) int32: jobs sorted by MAX slot = readiness order
         for the layer1 dispenser (docs/20);
+      - push_order (world, T) int32: source s's tokens sorted by their MIN slot
+        — the order card s PUSHES its shard in TP-T1 (docs/23), which must be
+        byte-identical on every rank (producer and consumers replay it for the
+        chunk-watermark position mapping);
       - num_padded_total: gathered rows (= sum(padded)).
 
-    Slot order within an expert is (ring_offset, src_tok, kpos) with
-    ring_offset = (src_dev - rank) % world. The layout is purely LOCAL in TP
-    (nothing cross-card depends on it), so each rank ordering its own is safe.
+    Slot order within an expert is CANONICAL (src_dev, src_tok, kpos) —
+    identical on every rank. docs/23: the push dispatch requires a layout all
+    ranks agree on (the old per-rank ring made push_order rank-dependent), and
+    "own shard first" was already proven useless in docs/20.
     """
     top_k = topk_ids.shape[1]
     all_topk = torch.empty(world_size, num_tokens, top_k, device=device,
@@ -85,8 +90,7 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     S = world_size * num_tokens
     tp_slots = torch.full((S, top_k), -1, dtype=torch.int32, device="cpu")
     tp_w = torch.zeros((S, top_k), dtype=torch.float32, device="cpu")
-    for i in range(world_size):
-        src_dev = (rank + i) % world_size  # ring, own shard first
+    for src_dev in range(world_size):  # canonical: src_dev ascending on EVERY rank
         for src_tok in range(num_tokens):
             j = src_dev * num_tokens + src_tok
             for kpos, eid in enumerate(all_topk_cpu[src_dev, src_tok].tolist()):
@@ -113,10 +117,14 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     pull_order = torch.argsort(mins * S + torch.arange(S, device="cpu")).to(torch.int32)
     maxs = tp_slots.max(dim=1).values.long()
     job_order = torch.argsort(maxs * S + torch.arange(S, device="cpu")).to(torch.int32)
+    # docs/23 TP-T1: per-source push order = that source's tokens by min slot.
+    # Canonical layout makes this identical on all ranks (min slots are unique
+    # within a row, argsort stability irrelevant).
+    push_order = torch.argsort(mins.view(world_size, num_tokens), dim=1).to(torch.int32)
 
     return (padded.to(torch.int32).to(device), tp_slots.to(device),
             tp_w.to(device), slack.to(device), pull_order.to(device),
-            job_order.to(device), num_padded_total)
+            job_order.to(device), push_order.to(device), num_padded_total)
 
 
 def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out):
@@ -141,8 +149,9 @@ def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out)
     N = world_size * T * top_k
 
     eid = all_topk.reshape(N).long()
-    ring = (out["src_dev_grid"] - rank) % world_size
-    key = ((eid * world_size + ring) * T + out["src_tok_grid"]) * top_k + out["kpos_grid"]
+    # canonical order within an expert = (src_dev, src_tok, kpos) = flat index n
+    # (docs/23: all ranks must build the SAME layout for the push dispatch).
+    key = eid * N + torch.arange(N, device=device)
     order = torch.argsort(key)
     eid_s = eid[order]
 
@@ -176,15 +185,18 @@ def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out)
     tmp.scatter_(0, idx, slackv)
     out["slack"].copy_(tmp[:nb_total])
 
-    # docs/20 orders (see host golden for rationale)
+    # docs/20 + docs/23 orders (see host golden for rationale)
     S = world_size * T
     tpl = out["tp_slots"].long()
+    mins = tpl.min(dim=1).values
     out["pull_order"].copy_(
-        torch.argsort(tpl.min(dim=1).values * S + torch.arange(S, device=device))
-        .to(torch.int32))
+        torch.argsort(mins * S + torch.arange(S, device=device)).to(torch.int32))
     out["job_order"].copy_(
         torch.argsort(tpl.max(dim=1).values * S + torch.arange(S, device=device))
         .to(torch.int32))
+    if "push_order" in out:
+        out["push_order"].copy_(
+            torch.argsort(mins.view(world_size, T), dim=1).to(torch.int32))
 
 
 class TKFusedTP(DistributedScheme):
@@ -218,7 +230,7 @@ class TKFusedTP(DistributedScheme):
         self.tk = _bmod.build_and_load(world, hidden=H, row_block=ROW_BLOCK)
 
         # ---- host golden schedule (not timed) ----
-        (padded, tp_slots, tp_w, slack, pull_order, job_order,
+        (padded, tp_slots, tp_w, slack, pull_order, job_order, push_order,
          num_padded_total) = _build_tp_schedules(
             problem.topk_ids, problem.topk_weights, num_tokens, world,
             num_experts, ctx.rank, device)
@@ -228,10 +240,22 @@ class TKFusedTP(DistributedScheme):
         self.slack = slack.contiguous()
         self.pull_order = pull_order.contiguous()
         self.job_order = job_order.contiguous()
+        self.push_order = push_order.contiguous()
         self.num_padded_total = num_padded_total
         self.num_jobs = world * num_tokens
         # layer1 dispenser counter (docs/20), zeroed each iter (same-stream)
         self.job_next = torch.zeros(1, dtype=torch.int32, device=device)
+        # TP-T1 (docs/23): dispatch data plane. "pull" = tpdisp (weak path,
+        # 23.5GB/s under 4-way concurrency, 16 comm SMs); "push" = tppdisp
+        # (strong path 50.9GB/s, 4 SMs saturate, chunk watermarks). Default
+        # pull until push wins all tiers (rollback policy docs/23).
+        self.dispatch_mode = os.environ.get("TK_TP_DISPATCH", "pull")
+        # per-(dst, chunk) election counters, zeroed each iter; CHUNK=64 must
+        # match tppdisp::globals::CHUNK.
+        self._nchunks = (num_tokens + 63) // 64
+        self.l0_push_cnt = torch.zeros(world * self._nchunks, dtype=torch.int32,
+                                       device=device)
+        self.num_push_sms = int(os.environ.get("TK_TP_PUSH_SMS", "4"))
 
         # ---- layer1 constants (routing-independent in TP) ----
         # prered_dst: job j -> (src_dev, src_tok) of the dense job space.
@@ -267,6 +291,7 @@ class TKFusedTP(DistributedScheme):
                 "padded": self.padded, "tp_slots": self.tp_slots,
                 "prered_w": self.prered_w, "slack": self.slack,
                 "pull_order": self.pull_order, "job_order": self.job_order,
+                "push_order": self.push_order,
             }
             self._sched_graph = None  # captured lazily on first run()
 
@@ -308,6 +333,13 @@ class TKFusedTP(DistributedScheme):
         self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
                                   local_rank=lr, local_world_size=lws, multicast=False)
         self.combine_staging.data_.zero_()
+        # TP-T1 push dispatch staging: peer-writable (world*T, H); plane s is
+        # written only by source card s (own plane unused — own shard is read
+        # straight from pre_tokens, which also breaks any self-dependency).
+        if self.dispatch_mode == "push":
+            self.ag_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
+                                 local_rank=lr, local_world_size=lws, multicast=False)
+            self.ag_staging.data_.zero_()
         self.combine_out = torch.zeros(num_tokens, H, device=device, dtype=torch.bfloat16)
 
         self.num_comm_sms = int(os.environ.get("TK_COMM_SMS", "16"))
@@ -346,11 +378,23 @@ class TKFusedTP(DistributedScheme):
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
 
         # layer0: AllGather-dedup dispatch ⊕ gate+up GEMM (one launch)
-        tk.moe_tp_dispatch_gemm(self.pre_tokens, self.gathered, self.w_gateup,
-                                self.gateup_out, self.padded, self.tp_slots,
-                                self.slack, self.pull_order, self.barrier_l0,
-                                self.num_comm_sms, self.num_padded_total,
-                                self.num_tokens)
+        if self.dispatch_mode == "push":
+            # TP-T1 (docs/23): strong-path push + chunk watermarks + resident
+            # scatter. seq gates the watermark slots (monotonic, no reset).
+            self._l0_seq += 1
+            self.l0_push_cnt.zero_()
+            tk.moe_tp_dispatch_push_gemm(
+                self.pre_tokens, self.ag_staging, self.gathered, self.w_gateup,
+                self.gateup_out, self.padded, self.tp_slots, self.slack,
+                self.push_order, self.l0_push_cnt, self.barrier_l0,
+                self.num_push_sms, max(self.num_comm_sms - self.num_push_sms, 1),
+                self.num_padded_total, self.num_tokens, self._l0_seq)
+        else:
+            tk.moe_tp_dispatch_gemm(self.pre_tokens, self.gathered, self.w_gateup,
+                                    self.gateup_out, self.padded, self.tp_slots,
+                                    self.slack, self.pull_order, self.barrier_l0,
+                                    self.num_comm_sms, self.num_padded_total,
+                                    self.num_tokens)
 
         # silu(gate) * up on the halves (up compute hid under the AG comm)
         inter = self.inter

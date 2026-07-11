@@ -102,7 +102,7 @@ def check_builders(mod, ROW_BLOCK=128):
                 all_ids, all_w = _make_topk(world, T, ne, topk, dist_kind, 0)
                 _STATE["ids"], _STATE["w"] = all_ids, all_w
                 with RequireExplicitDevice():
-                    (padded_g, slots_g, w_g, slack_g, pull_g, job_g,
+                    (padded_g, slots_g, w_g, slack_g, pull_g, job_g, pusho_g,
                      P) = mod._build_tp_schedules(all_ids[rank], all_w[rank],
                                                   T, world, ne, rank, "cpu")
                 N = world * T * topk
@@ -117,6 +117,7 @@ def check_builders(mod, ROW_BLOCK=128):
                     "slack": torch.zeros(P // ROW_BLOCK, dtype=torch.int32, device="cpu"),
                     "pull_order": torch.zeros(world * T, dtype=torch.int32, device="cpu"),
                     "job_order": torch.zeros(world * T, dtype=torch.int32, device="cpu"),
+                    "push_order": torch.zeros(world, T, dtype=torch.int32, device="cpu"),
                 }
                 with RequireExplicitDevice():
                     mod._build_tp_schedules_gpu(all_ids, all_w, world, ne, rank, out)
@@ -126,7 +127,8 @@ def check_builders(mod, ROW_BLOCK=128):
                                        ("prered_w", out["prered_w"], w_g),
                                        ("slack", out["slack"], slack_g),
                                        ("pull_order", out["pull_order"], pull_g),
-                                       ("job_order", out["job_order"], job_g)]:
+                                       ("job_order", out["job_order"], job_g),
+                                       ("push_order", out["push_order"], pusho_g)]:
                     if got.shape != ref.shape or not torch.equal(got, ref):
                         fails.append(f"[{tag}] {name} host/GPU MISMATCH")
                 flat = slots_g.reshape(-1).long()
@@ -144,6 +146,19 @@ def check_builders(mod, ROW_BLOCK=128):
                         fails.append(f"[{tag}] {name} not a permutation")
                     elif not bool((key[o][1:] > key[o][:-1]).all()):
                         fails.append(f"[{tag}] {name} not sorted by its key")
+                # push_order: per-source permutation of [0,T), sorted by min slot,
+                # and CANONICAL — identical whichever rank builds it (TP-T1).
+                mins2 = slots_g.min(dim=1).values.view(world, T)
+                for srow in range(world):
+                    o = pusho_g[srow].long()
+                    if o.unique().numel() != T:
+                        fails.append(f"[{tag}] push_order[{srow}] not a permutation")
+                    elif not bool((mins2[srow][o][1:] > mins2[srow][o][:-1]).all()):
+                        fails.append(f"[{tag}] push_order[{srow}] not sorted")
+                if rank == 0:
+                    canon = pusho_g.clone()
+                elif not torch.equal(pusho_g, canon):
+                    fails.append(f"[{tag}] push_order differs from rank 0 (not canonical)")
     return fails
 
 
@@ -172,7 +187,7 @@ def check_dataflow(mod):
 
     staging = [torch.zeros(world, T, H, device="cpu") for _ in range(world)]
     for r in range(world):
-        (padded, tp_slots, tp_w, _slack, _po, _jo, P) = mod._build_tp_schedules(
+        (padded, tp_slots, tp_w, _slack, _po, _jo, _pso, P) = mod._build_tp_schedules(
             ids[r], w[r], T, world, E, r, "cpu")
         gathered = torch.zeros(P, H, device="cpu")
         gathered[tp_slots.view(-1).long()] = X.repeat_interleave(topk, dim=0)

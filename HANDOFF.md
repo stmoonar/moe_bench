@@ -9,6 +9,11 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
+**【TP 第四轮 2026-07-11】**第四轮死于 gemm_push_kernel_tp 的 barrier 混用 UB
+(__syncthreads=bar0@288 与 GEMM consumer group 的 bar0@256 并发混计数 → illegal
+instruction),已改专用命名 barrier(bar.sync 2)汇合;同轮落地 **TP-T1 dispatch push 化**
+(canonical 布局 + push_order + tppdisp 三角色常驻 kernel + chunk 水位,TK_TP_DISPATCH=push)
+与 **EP P1 口径修复**。docs/24。
 **【microbench 导入 2026-07-11】**并行工作区(SYNC07101059_2)的 EP microbench 套件
 (`microbench/`,mb1~mb7)+ 实测结果(`microbench/results/20260710_071848/`)+ 任务清单
 (docs/22,原编号19)已导入。平台事实(pull 并发 23.5GB/s 弱路径 vs push 50.9GB/s 强路径
@@ -42,13 +47,14 @@ TP 路线:**dispatch push 化为必选项**,见 docs/23(TP 第三轮计划)。)
 > **【默认形状已改 2026-07-09】** 默认 shape 现为 **E=64, TOP_K=8, hidden=4096,
 > gate_up=6144(intermediate=3072)**,512 token/rank, bf16 EP world=4(E_local=16,
 > 每专家 ~256 token,padding 少)。config.py / configs/tk_ep_bf16.yaml / 各 tool 默认
-> 已同步。此 shape 下 **tkfused 1963µs vs serial 2905µs = 1.48×**(公平口径,combine
-> 预归约 push 化 T6-v1 默认,对拍 rel_err 4.43e-3 ok;`bench_shape_4096` / `run_tkfused`)。
+> 已同步。此 shape 下 fair 口径 **tkfused ~2170µs vs serial 2905µs ≈ 1.34×**
+> (P1 修复后 schedule ~205µs 计入默认路径;旧记录 1963µs/1.48× **漏计 sched**,
+> 见 docs/22 P1 与 microbench mb3_report_sched205us;对拍 rel_err 4.43e-3 ok)。
 > 下面 §2 里 NE=256/hidden=7168 的历史数字是旧 shape 的记录,保留备查。
 
 - **正确性**:tkfused 全链路对拍 reference_moe 通过(bf16, EP, 4 卡, rel_err ~4.4e-3)。
-- **性能(新默认 shape E=64/hidden=4096)**:tkfused **1963µs vs serial 2905µs**(快 1.48×,
-  T6-v1 combine push 化默认;v0 prered 为 2331µs)。
+- **性能(新默认 shape E=64/hidden=4096,fair 口径)**:tkfused **~2170µs vs serial
+  2905µs(1.34×)**;旧数字 1963µs/1.48× 漏计 sched(docs/22 P1,已修)。v0 prered 为 2331+sched。
 - **combine 三条路径**:`TK_COMBINE=prered_push`(默认,T6-v1,docs/18,边算边推)|
   `prered`(v0,barrier+pull,docs/13)| `pull`(旧 moe_gemm_combine_fused)。
 - **性能(旧 shape NE=256/hidden=7168,历史记录)**:tkfused 5832µs vs serial 7063µs(1.21×)。
@@ -106,6 +112,9 @@ TP 路线:**dispatch push 化为必选项**,见 docs/23(TP 第三轮计划)。)
   跨卡完成检测只用"本地 atom.acq_rel 选举 + 单写者 st.release.sys"两阶段协议。
 - **worker 里 set_default_device(cuda) 劫持无显式 device 的张量创建**(host 调度表
   必须每处写 device="cpu",本地 CPU 测试测不出)→ docs/21 §1。
+- **persistent kernel 角色混跑先盘点 named barrier**(__syncthreads 就是 bar0;GEMM
+  consumer group 按 256 计数,全块 288 计数并发混用同一 barrier = UB/illegal
+  instruction)→ docs/24 §1。
 - **block-per-job 是反模式**(大 smem 下按块调度粒度串行排空)→ 常驻块 + 原子
   dispenser + 就绪序;拉取/到达序要对齐**消费序**而不是源的远近 → docs/21 §4、docs/20。
 - **group::store 行映射置换**(warpgroup 交织,改 CONSUMER_WARPS 数必重推)→ docs/05。
@@ -160,4 +169,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/21** | **经验:set_default_device 坑(host 表显式 device 纪律)、远程 zip 回流工程实践(timeout/可归因失败/干净编译/sweep 顺手带)、无 profiler 归因三条账、可泛化调度教训** |
 | **docs/22** | **(导入)EP 第三轮计划:microbench 归因(收益分解/平台事实表/P0 口径修复/T10~T15);§0 平台事实两线共享** |
 | **docs/23** | **TP 第三轮计划:mb 事实映射到 TP(pull 弱路径→push 化必选 TP-T1、comm SM 自适应、triton 调优、copy engine 远期);修正预期与报数规范** |
+| **docs/24** | **TP 第四轮:barrier 混用 UB(bar0 混计数→illegal instruction)修复(专用命名 barrier);TP-T1 push 化落地(canonical 布局/push_order/tppdisp 三角色/chunk 水位);EP P1 口径修复** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

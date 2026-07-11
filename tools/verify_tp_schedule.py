@@ -54,7 +54,7 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
     topk_weights = all_w[rank].contiguous()
 
     # ---- host golden ----
-    (padded_g, slots_g, w_g, slack_g, pull_g, job_g, P) = _build_tp_schedules(
+    (padded_g, slots_g, w_g, slack_g, pull_g, job_g, pusho_g, P) = _build_tp_schedules(
         topk_ids, topk_weights, T, world, ne, rank, device)
 
     # ---- GPU builder ----
@@ -70,6 +70,7 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
         "slack": torch.zeros(P // ROW_BLOCK, dtype=torch.int32, device=device),
         "pull_order": torch.zeros(world * T, dtype=torch.int32, device=device),
         "job_order": torch.zeros(world * T, dtype=torch.int32, device=device),
+        "push_order": torch.zeros(world, T, dtype=torch.int32, device=device),
     }
     _build_tp_schedules_gpu(all_ids, all_w, world, ne, rank, out)
 
@@ -79,7 +80,8 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
                            ("prered_w", out["prered_w"], w_g),
                            ("slack", out["slack"], slack_g),
                            ("pull_order", out["pull_order"], pull_g),
-                           ("job_order", out["job_order"], job_g)]:
+                           ("job_order", out["job_order"], job_g),
+                           ("push_order", out["push_order"], pusho_g)]:
         if got.shape != ref.shape:
             fails.append(f"{name} shape {tuple(got.shape)} != host {tuple(ref.shape)}")
         elif not torch.equal(got, ref):
@@ -121,6 +123,22 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
             k = key[o]
             if not bool((k[1:] > k[:-1]).all()):
                 fails.append(f"{name} not sorted by its slot key")
+    # push_order (docs/23): per-source permutation sorted by min slot; canonical
+    # across ranks is adjudicated by the cross-rank all_reduce below (any rank
+    # disagreeing fails its own sortedness/equality checks identically).
+    mins2 = slots_g.min(dim=1).values.view(world, T)
+    for srow in range(world):
+        o = pusho_g[srow].long()
+        if o.unique().numel() != T:
+            fails.append(f"push_order[{srow}] not a permutation")
+        elif not bool((mins2[srow][o][1:] > mins2[srow][o][:-1]).all()):
+            fails.append(f"push_order[{srow}] not sorted by min slot")
+    # canonical check: all ranks must hold the SAME push_order (byte compare via
+    # all_reduce of a hash-like sum of rank0-broadcast diff)
+    ref = pusho_g.clone()
+    dist.broadcast(ref, src=0)
+    if not torch.equal(ref, pusho_g):
+        fails.append("push_order differs from rank 0 (not canonical)")
 
     nfail = torch.tensor(len(fails), device=device)
     dist.all_reduce(nfail, op=dist.ReduceOp.SUM)

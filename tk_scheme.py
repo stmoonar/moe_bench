@@ -678,7 +678,12 @@ class TKFusedEP(DistributedScheme):
         # fixed (routing invariant per problem), so this only rewrites the index
         # CONTENTS of pre-allocated tables; num_padded_local / num_jobs are
         # asserted unchanged. Only active on the default path (pull + prered).
-        if self.gpu_schedule and self.dispatch_mode == "pull" and self.combine_mode == "prered":
+        # P1 (docs/22): include prered_push — the DEFAULT combine — in the timed
+        # GPU schedule rebuild. The old `== "prered"` skipped it, so the default
+        # path's e2e (1963µs / "1.48×") never paid the ~205µs sched cost; fair
+        # numbers are ~2170µs / 1.34× (microbench mb3_report_sched205us).
+        if self.gpu_schedule and self.dispatch_mode == "pull" \
+                and self.combine_mode in ("prered", "prered_push"):
             torch.distributed.all_gather_into_tensor(self._all_topk, self._topk_ids_local)
             torch.distributed.all_gather_into_tensor(self._all_w, self._topk_w_local)
             # The pure-compute builder (no NCCL, fixed shapes, fixed tensor
