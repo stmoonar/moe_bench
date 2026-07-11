@@ -9,6 +9,12 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
+**【TP 第五轮 2026-07-11·当前状态】**首次全绿并**超 serial**:pull 路径 NE=64/T=512
+**2290µs vs serial 2630 = 1.15×**(comm_sms=24,fair 口径;T=1024 1.16×,NE=128 1.05×)。
+docs/20 修复兑现(3613→2363,-35%)。push 路径(TP-T1)正确但慢于 pull → **冻结**
+(TP 是 GEMM-bound,mb 带宽差不在关键路径;docs/25 §2)。遗留:NE=256 0.97×(50% padding
+→ 下轮 RB=64)、T=256 0.98×、comm_sms 拐点未到(默认已提 24,扫到 40)、time_tp_stages
+签名 bug 已修(下轮拿 L0/L1 暴露归因)、TP-T3 triton 调优基线未做(报终数前必须)。docs/25。
 **【TP 第四轮 2026-07-11】**第四轮死于 gemm_push_kernel_tp 的 barrier 混用 UB
 (__syncthreads=bar0@288 与 GEMM consumer group 的 bar0@256 并发混计数 → illegal
 instruction),已改专用命名 barrier(bar.sync 2)汇合;同轮落地 **TP-T1 dispatch push 化**
@@ -170,4 +176,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/22** | **(导入)EP 第三轮计划:microbench 归因(收益分解/平台事实表/P0 口径修复/T10~T15);§0 平台事实两线共享** |
 | **docs/23** | **TP 第三轮计划:mb 事实映射到 TP(pull 弱路径→push 化必选 TP-T1、comm SM 自适应、triton 调优、copy engine 远期);修正预期与报数规范** |
 | **docs/24** | **TP 第四轮:barrier 混用 UB(bar0 混计数→illegal instruction)修复(专用命名 barrier);TP-T1 push 化落地(canonical 布局/push_order/tppdisp 三角色/chunk 水位);EP P1 口径修复** |
+| **docs/25** | **TP 第五轮:首次超 serial(1.11~1.15×,docs/20 修复兑现-35%);push 冻结归因(GEMM-bound+scatter 粒度);NE=256 padding→RB64、comm_sms 拐点、预期账对数与微基准外推教训** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |

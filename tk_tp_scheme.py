@@ -342,7 +342,11 @@ class TKFusedTP(DistributedScheme):
             self.ag_staging.data_.zero_()
         self.combine_out = torch.zeros(num_tokens, H, device=device, dtype=torch.bfloat16)
 
-        self.num_comm_sms = int(os.environ.get("TK_COMM_SMS", "16"))
+        # docs/25: pull path e2e improves through 24 comm SMs (2366@16 ->
+        # 2290@24, round 5) — TP is GEMM-bound but the L0 dispatch queue AND
+        # the L1 dispenser both live on comm blocks; 24 is the measured best
+        # so far (32/40 swept next round for the knee).
+        self.num_comm_sms = int(os.environ.get("TK_COMM_SMS", "24"))
         self._l0_seq = 0
         self._l1_seq = 0
 

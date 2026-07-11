@@ -43,7 +43,7 @@ def _worker(rank, world, init_method, ne, iters):
     ctx = DistContext(rank=rank, world_size=world, local_rank=rank,
                       device=device, group=None)
     weights = make_weights(cfg, rank)
-    problem = make_problem(cfg, 512, rank=rank, weights=weights, device=device)
+    problem = make_problem(cfg, 512, rank=rank, weights=weights)
     s = TKFusedTP()
     s.setup(problem, ctx)
 
