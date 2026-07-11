@@ -1,0 +1,341 @@
+# SPDX-License-Identifier: Apache-2.0
+"""TK fused MoE scheme (bf16, TP) for the distributed benchmark.
+
+TP shards the INTERMEDIATE dim (every card holds all E experts, thin), so the
+layer's cross-card traffic is dense and routing-independent:
+
+  1. AllGather ⊕ gate+up GEMM   (layer0 fused, moe_tp_dispatch_gemm)
+       every unique (src_dev, src_tok) row is pulled ONCE cross-card (ring
+       order, own shard first) and scattered to its TOP_K expert-sorted
+       gathered slots locally — the T7 dedup insight is the NATURAL TP form,
+       since all top-k experts of every token live on this card.
+  2. act = silu(gate) * up      (torch, on the [gate | up] halves)
+  3. W2 GEMM ⊕ prered-push      (layer1 fused, moe_tp_gemm_prered_push)
+       the top-k weighted combine is FULLY LOCAL in TP (T6 prered with all
+       TOP_K hits local); the cross-card step degenerates to a dense
+       ReduceScatter of (T, H) partial rows, done with the verified T6-v1
+       push + watermark protocol (edge-triggered, streams under the GEMM).
+  4. moe_final_reduce_push      (source card sums the world partial planes)
+
+All communication is PCIe-safe (experience/12): unicast pull/push, local
+red.release.gpu counters, st.release.sys slot signals — no remote atomics,
+no multimem. Kernels are shared with the EP scheme (tk_scheme.py); only the
+dispatch data plane (pull-once-scatter-TOP_K) and the entry geometry
+(expert_offset=0, all experts local) are TP-specific.
+
+bf16 only, TOP_K must equal the kernels' compile-time TOP_K (8).
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn.functional as F
+
+from .config import ParallelMode
+from .context import DistContext
+from .data import MoEProblem
+from .schemes import DistributedScheme
+from .tk_scheme import ROW_BLOCK
+
+
+def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
+                        num_experts, rank, device):
+    """Host golden TP schedule (setup only, not timed). Produces:
+      - padded (num_experts,) int32: per-expert ROW_BLOCK-padded token counts
+        over the FULL world*T batch (identical on every rank);
+      - tp_slots (world*T, TOP_K) int32: gathered slot of every assignment,
+        row j = src_dev*T + src_tok, column = kpos. This ONE table drives both
+        layer0 (dispatch scatters the pulled token row to slots) and layer1
+        (prered gathers the same slots' W2 rows) — in TP they are the same map.
+      - tp_w (world*T, TOP_K) float32: routing weight per assignment;
+      - slack (nblk,) int32: ROW_BLOCK - real tokens per row block (counter seed);
+      - num_padded_total: gathered rows (= sum(padded)).
+
+    Slot order within an expert is (ring_offset, src_tok, kpos) with
+    ring_offset = (src_dev - rank) % world — own shard first, so the earliest
+    row blocks of every expert fill from local copies while peer shards are
+    still in flight. The layout is purely LOCAL in TP (nothing cross-card
+    depends on it), so each rank ordering its own ring is safe.
+    """
+    top_k = topk_ids.shape[1]
+    all_topk = torch.empty(world_size, num_tokens, top_k, device=device,
+                           dtype=topk_ids.dtype)
+    torch.distributed.all_gather_into_tensor(all_topk, topk_ids.contiguous())
+    all_w = torch.empty(world_size, num_tokens, top_k, device=device,
+                        dtype=torch.float32)
+    torch.distributed.all_gather_into_tensor(all_w, topk_weights.float().contiguous())
+    all_topk_cpu = all_topk.cpu()
+    all_w_cpu = all_w.cpu()
+
+    counts = torch.bincount(all_topk.view(-1), minlength=num_experts).cpu().long()
+    padded = (counts + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK
+    num_padded_total = int(padded.sum())
+
+    write_pos = torch.cat([
+        torch.zeros(1, dtype=torch.int64),
+        torch.cumsum(padded[:-1], dim=0)
+    ]).tolist()
+    S = world_size * num_tokens
+    tp_slots = torch.full((S, top_k), -1, dtype=torch.int32)
+    tp_w = torch.zeros((S, top_k), dtype=torch.float32)
+    for i in range(world_size):
+        src_dev = (rank + i) % world_size  # ring, own shard first
+        for src_tok in range(num_tokens):
+            j = src_dev * num_tokens + src_tok
+            for kpos, eid in enumerate(all_topk_cpu[src_dev, src_tok].tolist()):
+                slot = write_pos[eid]
+                write_pos[eid] += 1
+                tp_slots[j, kpos] = slot
+                tp_w[j, kpos] = float(all_w_cpu[src_dev, src_tok, kpos])
+
+    nblk = num_padded_total // ROW_BLOCK
+    slack = torch.zeros(nblk, dtype=torch.int32)
+    blk = 0
+    for e in range(num_experts):
+        real_e = int(counts[e])
+        for b in range(int(padded[e]) // ROW_BLOCK):
+            real_in = max(0, min(ROW_BLOCK, real_e - b * ROW_BLOCK))
+            slack[blk] = ROW_BLOCK - real_in
+            blk += 1
+
+    return (padded.to(torch.int32).to(device), tp_slots.to(device),
+            tp_w.to(device), slack.to(device), num_padded_total)
+
+
+def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out):
+    """GPU-vectorized rebuild of the TP schedule tables, element-for-element
+    identical to the host `_build_tp_schedules` golden (tools/verify_tp_schedule
+    adjudicates). Called each run() and counted in timing — the fair analogue of
+    serial's per-run routing all_gathers + moe_align_block_size (docs/07 P1,
+    docs/14). Same single-argsort trick as the EP builder: slot = rank of the
+    assignment in the total order (eid, ring, src_tok, kpos), every key unique
+    (bijection over flattened all_topk) so stability is not required.
+
+    In TP every assignment is local, so there is no trash-row redirect; and the
+    layer1 tables (push_expected_l1 / recv_from / final_contrib / prered_dst)
+    are routing-INDEPENDENT constants (every card holds all experts), set once
+    in setup and not rebuilt here.
+
+    Fixed shapes, no host sync, no bincount — CUDA-graph capturable.
+    """
+    device = all_topk.device
+    T = all_topk.shape[1]
+    top_k = all_topk.shape[2]
+    N = world_size * T * top_k
+
+    eid = all_topk.reshape(N).long()
+    ring = (out["src_dev_grid"] - rank) % world_size
+    key = ((eid * world_size + ring) * T + out["src_tok_grid"]) * top_k + out["kpos_grid"]
+    order = torch.argsort(key)
+    eid_s = eid[order]
+
+    # per-expert counts + padding (scatter_add: capture-safe, unlike bincount)
+    counts = torch.zeros(num_experts, dtype=torch.long, device=device)
+    counts.scatter_add_(0, eid, torch.ones_like(eid))
+    padded = (counts + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK
+    out["padded"].copy_(padded.to(torch.int32))
+    grp_start = torch.zeros(num_experts, dtype=torch.long, device=device)
+    grp_start[1:] = torch.cumsum(counts, dim=0)[:-1]
+    pos_in_expert = torch.arange(N, device=device) - grp_start[eid_s]
+    padded_base = torch.zeros(num_experts, dtype=torch.long, device=device)
+    padded_base[1:] = torch.cumsum(padded, dim=0)[:-1]
+    slot_sorted = padded_base[eid_s] + pos_in_expert
+
+    # tp_slots: scatter each sorted assignment's slot back to its original flat
+    # index n = (src_dev*T + src_tok)*top_k + kpos == row/col of the table.
+    slot_by_n = torch.empty(N, dtype=torch.int32, device=device)
+    slot_by_n.scatter_(0, order, slot_sorted.to(torch.int32))
+    out["tp_slots"].copy_(slot_by_n.view(world_size * T, top_k))
+    # weights: flat n already IS (j, kpos) — no reorder needed.
+    out["prered_w"].copy_(all_w.reshape(world_size * T, top_k))
+
+    # slack: only the tail block of each expert carries (padded - real); scatter
+    # via a trash slot for empty experts (capture-safe, no boolean compaction).
+    nb_total = out["slack"].shape[0]
+    tail_blk = (padded_base + padded) // ROW_BLOCK - 1          # (E,)
+    slackv = (padded - counts).to(torch.int32)
+    idx = torch.where(padded > 0, tail_blk, torch.full_like(tail_blk, nb_total))
+    tmp = torch.zeros(nb_total + 1, dtype=torch.int32, device=device)
+    tmp.scatter_(0, idx, slackv)
+    out["slack"].copy_(tmp[:nb_total])
+
+
+class TKFusedTP(DistributedScheme):
+    name = "tktp"
+
+    def setup(self, problem: MoEProblem, ctx: DistContext) -> None:
+        cfg = problem.config
+        assert cfg.parallel_mode == ParallelMode.TP, "TKFusedTP is TP-only"
+        assert problem.quant_config is None, "TKFusedTP is bf16-only (no fp8 yet)"
+        assert cfg.topk == 8, "kernels compile TOP_K=8"
+        self.ctx = ctx
+        self.problem = problem
+        H = cfg.hidden_size
+        inter = cfg.intermediate_shard          # I / world (TP shard)
+        world = ctx.world_size
+        num_tokens = problem.num_tokens         # per-rank T
+        num_experts = cfg.num_experts
+        device = problem.hidden_states.device
+        self.H, self.inter, self.num_tokens, self.top_k = H, inter, num_tokens, cfg.topk
+        # GEMM template constraints (sm120_common.cuh)
+        assert H % 64 == 0 and H % 128 == 0, "hidden must be tile-aligned"
+        assert (2 * inter) % 128 == 0, "gate_up shard % COL_BLOCK"
+        assert inter % 64 == 0, "intermediate shard % RED_BLOCK"
+
+        from importlib.util import spec_from_file_location, module_from_spec
+        _build_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "kernels", "tk", "build.py")
+        _spec = spec_from_file_location("_tk_build", _build_py)
+        _bmod = module_from_spec(_spec)
+        _spec.loader.exec_module(_bmod)
+        self.tk = _bmod.build_and_load(world, hidden=H, row_block=ROW_BLOCK)
+
+        # ---- host golden schedule (not timed) ----
+        (padded, tp_slots, tp_w, slack, num_padded_total) = _build_tp_schedules(
+            problem.topk_ids, problem.topk_weights, num_tokens, world,
+            num_experts, ctx.rank, device)
+        self.padded = padded
+        self.tp_slots = tp_slots.contiguous()
+        self.prered_w = tp_w.contiguous()
+        self.slack = slack.contiguous()
+        self.num_padded_total = num_padded_total
+        self.num_jobs = world * num_tokens
+
+        # ---- layer1 constants (routing-independent in TP) ----
+        # prered_dst: job j -> (src_dev, src_tok) of the dense job space.
+        nj = self.num_jobs
+        self.prered_dst = torch.empty(nj, 2, dtype=torch.int32, device=device)
+        self.prered_dst[:, 0] = (torch.arange(nj, device=device) // num_tokens).to(torch.int32)
+        self.prered_dst[:, 1] = (torch.arange(nj, device=device) % num_tokens).to(torch.int32)
+        # every card holds all experts -> every job non-empty, every card
+        # contributes to every token: dense expected counts / contrib masks.
+        self.push_expected_l1 = torch.full((world,), num_tokens,
+                                           dtype=torch.int32, device=device)
+        self.recv_from = torch.ones(world, dtype=torch.int32, device=device)
+        self.final_contrib = torch.ones(num_tokens, world,
+                                        dtype=torch.int32, device=device)
+        self.combine_local_cnt = torch.zeros(world, dtype=torch.int32, device=device)
+
+        # ---- GPU schedule rebuild (T3 fairness: counted in run()) ----
+        self.gpu_schedule = os.environ.get("TK_GPU_SCHED", "1") == "1"
+        if self.gpu_schedule:
+            N = world * num_tokens * self.top_k
+            ar = torch.arange(N, device=device)
+            self._all_topk = torch.empty(world, num_tokens, self.top_k,
+                                         device=device, dtype=problem.topk_ids.dtype)
+            self._all_w = torch.empty(world, num_tokens, self.top_k,
+                                      device=device, dtype=torch.float32)
+            self._topk_ids_local = problem.topk_ids.contiguous()
+            self._topk_w_local = problem.topk_weights.float().contiguous()
+            self._num_experts = num_experts
+            self._sched_out = {
+                "src_dev_grid": ar // (num_tokens * self.top_k),
+                "src_tok_grid": (ar // self.top_k) % num_tokens,
+                "kpos_grid": ar % self.top_k,
+                "padded": self.padded, "tp_slots": self.tp_slots,
+                "prered_w": self.prered_w, "slack": self.slack,
+            }
+            self._sched_graph = None  # captured lazily on first run()
+
+        # ---- weights (x @ W layout, W = (K, N)) ----
+        w1 = problem.w1                                     # (E, 2*inter, H), [gate; up]
+        self.w_gateup = w1.transpose(1, 2).contiguous()     # (E, H, 2*inter), [gate | up]
+        self.w2 = problem.w2.transpose(1, 2).contiguous()   # (E, inter, H)
+
+        # ---- buffers ----
+        TK = self.tk.TKParallelTensor
+        lr, lws = ctx.local_rank, world
+        P = num_padded_total
+        # peer-readable token shard (dispatch pull source)
+        self.pre_tokens = TK((num_tokens, H), dtype=torch.bfloat16, local_rank=lr,
+                             local_world_size=lws, multicast=False)
+        bar_cols = max(P // ROW_BLOCK + 1, 32)
+        # barrier_l0: row 0 = dispatch row-block counters (slack-seeded), row 1 =
+        # pcie_barrier_all slots. barrier_l1: row 0 = W2 col-block counters,
+        # row 1 = local W2 completion signal, rows 2+d = card d's combine watermark.
+        self.barrier_l0 = TK((2 + world, bar_cols), dtype=torch.int, local_rank=lr,
+                             local_world_size=lws, multicast=False)
+        self.barrier_l1 = TK((2 + world, bar_cols), dtype=torch.int, local_rank=lr,
+                             local_world_size=lws, multicast=False)
+        self.barrier_l0.data_.zero_()
+        self.barrier_l1.data_.zero_()
+        # seed dispatch counters with padding slack (restored by the kernel's
+        # reset-to-slack after each iteration; padding slots are never scattered).
+        nblk = P // ROW_BLOCK
+        self.barrier_l0.data_[0, :nblk].copy_(self.slack)
+
+        # LOCAL workspaces (TP: peers never touch gathered / expert_out).
+        # zeros so never-written padding rows stay clean bf16.
+        self.gathered = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
+        self.gateup_out = torch.zeros(P, 2 * inter, device=device, dtype=torch.bfloat16)
+        self.act = torch.zeros(P, inter, device=device, dtype=torch.bfloat16)
+        self.expert_out = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
+        # peer-writable combine staging: plane d (rows [d*T, d*T+T)) is written
+        # only by card d (single writer, no atomics).
+        self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
+                                  local_rank=lr, local_world_size=lws, multicast=False)
+        self.combine_staging.data_.zero_()
+        self.combine_out = torch.zeros(num_tokens, H, device=device, dtype=torch.bfloat16)
+
+        self.num_comm_sms = int(os.environ.get("TK_COMM_SMS", "16"))
+        self._l0_seq = 0
+        self._l1_seq = 0
+
+    def run(self) -> torch.Tensor:
+        tk = self.tk
+        # T3 fairness: rebuild the schedule tables on GPU inside the timed
+        # region (serial pays its routing all_gathers + alignment per run).
+        # Table shapes/addresses are fixed (routing invariant per problem);
+        # the pure-compute builder is CUDA-graph captured after first use.
+        if self.gpu_schedule:
+            torch.distributed.all_gather_into_tensor(self._all_topk, self._topk_ids_local)
+            torch.distributed.all_gather_into_tensor(self._all_w, self._topk_w_local)
+            if self._sched_graph is None:
+                _build_tp_schedules_gpu(self._all_topk, self._all_w,
+                                        self.ctx.world_size, self._num_experts,
+                                        self.ctx.rank, self._sched_out)  # warmup
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    _build_tp_schedules_gpu(self._all_topk, self._all_w,
+                                            self.ctx.world_size, self._num_experts,
+                                            self.ctx.rank, self._sched_out)
+                self._sched_graph = g
+            else:
+                self._sched_graph.replay()
+
+        # barrier BEFORE overwriting pre_tokens (no peer still pulling last
+        # iter's tokens) and AFTER (my tokens visible before peers pull).
+        self._l0_seq += 1
+        tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
+        self.pre_tokens.data_.copy_(self.problem.hidden_states)
+        self._l0_seq += 1
+        tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
+
+        # layer0: AllGather-dedup dispatch ⊕ gate+up GEMM (one launch)
+        tk.moe_tp_dispatch_gemm(self.pre_tokens, self.gathered, self.w_gateup,
+                                self.gateup_out, self.padded, self.tp_slots,
+                                self.slack, self.barrier_l0, self.num_comm_sms,
+                                self.num_padded_total, self.num_tokens)
+
+        # silu(gate) * up on the halves (up compute hid under the AG comm)
+        inter = self.inter
+        torch.mul(F.silu(self.gateup_out[:, :inter]),
+                  self.gateup_out[:, inter:], out=self.act)
+
+        # layer1: W2 GEMM ⊕ local top-k prered ⊕ push (dense ReduceScatter),
+        # then the source-side reduce over the world partial planes.
+        self._l1_seq += 1
+        self.combine_local_cnt.zero_()
+        tk.moe_tp_gemm_prered_push(self.act, self.w2, self.expert_out, self.padded,
+                                   self.combine_staging, self.prered_dst,
+                                   self.tp_slots, self.prered_w,
+                                   self.combine_local_cnt, self.push_expected_l1,
+                                   self.barrier_l1, self.num_comm_sms,
+                                   self.num_padded_total, self.num_tokens,
+                                   self.num_jobs, self._l1_seq)
+        tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
+                                 self.recv_from, self.combine_out, self.barrier_l1,
+                                 self.num_tokens, self._l1_seq)
+        return self.combine_out

@@ -2,9 +2,15 @@
 
 > 新 session 从这里接手。读完本文 + 最新一篇 docs/ 即可继续。
 
-**最后更新**:2026-07-09(本轮:T6-v0 预归约 + T4 gate+up + T3 schedule GPU化(公平口径)
-+ T7 dispatch 去重 + T5 ROW_BLOCK=64,五项落地;**NE=256 e2e 7131→5830µs 公平口径超 serial
-7063 的 1.21×**,见 docs/13~16)
+**最后更新**:2026-07-11(本轮:**TP 版 tile overlap(tktp scheme)落地,分支 tp_test**,
+docs/19。kernel 新增 tpdisp(AG去重拉取⊕gate+up GEMM)+ preredpush TP 入口;layer1 复用
+T6-v1 push+水位协议(TP 下 top-k 预归约完全本地、跨卡退化为稠密 RS)。本地已验证:调度表
+host/GPU 逐元素一致 + 不变量全过(NE×分布×rank 全档),CPU 数据流模拟对拍 rel 3.7e-7。
+**尚未上机**:一键脚本 tools/run_tp_all.sh(编译→裁决→对拍→bench→打包zip),等实测结果回流)
+
+> **【EP 上一轮 2026-07-09】** T6-v0 预归约 + T4 gate+up + T3 schedule GPU化(公平口径)
++ T7 dispatch 去重 + T5 ROW_BLOCK=64,五项落地;NE=256 e2e 7131→5830µs 公平口径超 serial
+7063 的 1.21×,见 docs/13~16。
 
 ## 1. 项目一句话
 
@@ -138,4 +144,5 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/16** | **T5:ROW_BLOCK=64 编译期开关;揭示 padding 非纯浪费(满效率算),小 tile 效率折损抵消,默认保持 128** |
 | **docs/17** | **通算重叠与融合损失分析:layer0 融合 +30%、layer1 +56% 且通信零重叠(T6-v1 目标)** |
 | **docs/18** | **T6-v1:combine 预归约 push 化(边算边推 + 水位选举,消 barrier+零重叠);layer1 融合损失 283→192µs,默认** |
+| **docs/19** | **TP 版 tile overlap(tktp,分支 tp_test):AG⊕gate+up GEMM + 本地prered⊕稠密RS push;复用矩阵/调度表/账/上机风险清单/一键脚本** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
