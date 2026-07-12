@@ -1,22 +1,24 @@
 #!/usr/bin/env python
-"""TP-T3 v2:vLLM triton fused_moe 的无 ray 本机调优器(docs/28)。
+"""TP-T3 v2.1:vLLM triton fused_moe 的无 ray 本机调优器(docs/28/29)。
 
-第八轮取证:benchmark_moe.py --tune 的 ray 在本机(256 核共享机)卡死在
-CoreWorker RegisterClient 2.5h,被 run_step 的 timeout SIGTERM 掉,一个
-trial 都没跑。本脚本不用 ray:
+第八轮教训(ray 卡死)见 docs/28;第九轮教训(docs/29):v2 直接按
+"key=token 数 M"写 config 文件,e2e 只有 T=1024 兑现收益,T=256/512 反而
+变差——查表键与真实 lookup 的 M 可能不一致(如按 M×topk),且 648 选 1
+的小 iters 初扫有赢家诅咒。v2.1 加 finalize 终审阶段,不再盲写:
 
-  - 编排进程按 GPU 数把 config 空间切片,每片一个子进程
-    (CUDA_VISIBLE_DEVICES 各钉一张卡),纯 subprocess,零外部依赖;
-  - worker 直接按 serial 基线的口径调 vllm 的 fused_experts
-    (bf16、E 个全量 expert、N=768 分片 intermediate、topk=8 全命中),
-    monkeypatch try_get_optimal_moe_config 注入候选 config;
-  - patch 有效性在跑之前先自证(计数器 + 两个极端 config 的耗时差),
-    失效立刻退出并打印诊断(vllm 版本/模块路径/dir),避免整轮白跑;
-  - 产物与 vllm 官方 tune 同格式:E=<E>,N=768,device_name=<dev>.json,
-    装入 vllm configs 目录后 serial 基线自动变快(验证点:serial 日志
-    不再出现 "Using default MoE config")。
+  1. 初扫(4 卡分片,iters=8):每 M 留 top-4 入围,不定终名次;
+  2. finalize(单卡):
+     a. 删掉旧 config 文件,记录真实 lookup:用 M=1000 探针跑一次
+        fused_experts,从 try_get_optimal_moe_config 收到的实参里找
+        1000(键=M)还是 8000(键=M×topk),自校准写键映射;
+     b. 记录各 M 的 vllm 默认 config(文件缺失时 orig 的返回值);
+     c. 入围 config + 默认 config 复审(iters=30),消赢家诅咒;
+        无净增益的 M 档显式写入默认 config(钉死行为,防近邻键污染);
+     d. 按校准后的键写文件,装入 vllm configs 目录;
+     e. 端到端自证:走真实查表路径(不打 patch)确认每个 M 选中的
+        config 与预期一致、耗时与复审值吻合,打印 PASS/FAIL。
 
-用法(编排模式,默认 4 卡并行,单个 E 约 30~40 分钟):
+用法(编排模式,默认 4 卡并行,单个 E 约 15~20 分钟):
   python tune_moe_tp_noray.py --gpus 9,11,13,15 --num-experts 64
   python tune_moe_tp_noray.py --gpus 9 --smoke          # <2min 自检
 """
@@ -36,6 +38,7 @@ HIDDEN = 4096
 INTER_SHARD = 768
 TOPK = 8
 BATCHES = [512, 1024, 2048, 4096, 8192]
+PROBE_M = 1000  # lookup 键校准探针:1000/8000 与形状常数(768/1536/4096/8)无碰撞
 
 # sm120 单 block smem 上限(RTX Pro 5000 Blackwell 实测 99KB optin)。
 SMEM_LIMIT = 99 * 1024
@@ -69,8 +72,12 @@ def config_space() -> list[dict]:
     return space
 
 
+def _cfg_key(cfg: dict) -> tuple:
+    return tuple(sorted(cfg.items()))
+
+
 # --------------------------------------------------------------------------
-# worker:单 GPU 上跑自己那片 config
+# 注入与记录
 # --------------------------------------------------------------------------
 
 
@@ -84,56 +91,48 @@ def _diag_dump(fm) -> None:
 
 
 class ConfigPatcher:
-    """把候选 config 注进 fused_experts 的查表路径。
+    """把候选 config 注进 fused_experts 的查表路径,并记录真实 lookup。
 
-    首选 monkeypatch try_get_optimal_moe_config(该名字在 vllm 里多年稳定,
-    fused_experts 通过模块全局引用它,patch 模块属性即生效);没有该符号时
-    退化为"写 config 文件 + get_moe_configs.cache_clear()"。两条路都带
-    调用计数,由 verify() 用行为差异做最终裁决。
+    monkeypatch try_get_optimal_moe_config(该名字在 vllm 里多年稳定,
+    fused_experts 通过模块全局引用它,patch 模块属性即生效):
+    - current 非 None 时返回候选 config;
+    - current 为 None 时透传 orig,并记录实参里的 int(校准键映射)与
+      orig 的返回值(即 vllm 实际选中的 config)。
     """
 
     def __init__(self, fm):
         self.fm = fm
         self.current: dict | None = None
         self.calls = 0
-        if hasattr(fm, "try_get_optimal_moe_config"):
-            self.mode = "monkeypatch"
-            self._orig = fm.try_get_optimal_moe_config
-
-            def patched(*args, **kwargs):
-                self.calls += 1
-                if self.current is not None:
-                    return dict(self.current)
-                return self._orig(*args, **kwargs)
-
-            fm.try_get_optimal_moe_config = patched
-        elif hasattr(fm, "get_moe_configs") and hasattr(
-            fm.get_moe_configs, "cache_clear"
-        ):
-            self.mode = "config-file"
-            self._cfg_path = None  # set 时写文件
-        else:
+        self.last_ints: list[int] = []
+        self.last_result: dict | None = None
+        if not hasattr(fm, "try_get_optimal_moe_config"):
             _diag_dump(fm)
             raise RuntimeError(
-                "vllm fused_moe 里既没有 try_get_optimal_moe_config 也没有可清缓存的 "
-                "get_moe_configs,无法注入 config,见上方 [diag]"
+                "vllm fused_moe 里没有 try_get_optimal_moe_config,无法注入/记录,"
+                "见上方 [diag]"
             )
+        self._orig = fm.try_get_optimal_moe_config
 
-    def set(self, cfg: dict | None, num_experts: int) -> None:
-        self.current = cfg
-        if self.mode == "config-file":
-            path = os.path.join(
-                os.path.dirname(self.fm.__file__), "configs", _config_filename(self.fm, num_experts)
-            )
-            if cfg is None:
-                if os.path.exists(path):
-                    os.remove(path)
-            else:
-                with open(path, "w") as f:
-                    json.dump({"1": cfg}, f)  # 单键,任意 M 就近命中
-            self.fm.get_moe_configs.cache_clear()
-            self._cfg_path = path
+        def patched(*args, **kwargs):
             self.calls += 1
+            if self.current is not None:
+                return dict(self.current)
+            ints = []
+            for a in list(args) + list(kwargs.values()):
+                if isinstance(a, bool):
+                    continue
+                if isinstance(a, int):
+                    ints.append(a)
+                elif hasattr(a, "__iter__") and not isinstance(a, (str, dict)):
+                    ints.extend(x for x in a if isinstance(x, int))
+            self.last_ints = ints
+            res = self._orig(*args, **kwargs)
+            if isinstance(res, dict):
+                self.last_result = dict(res)
+            return res
+
+        fm.try_get_optimal_moe_config = patched
 
 
 def _config_filename(fm, num_experts: int) -> str:
@@ -152,28 +151,41 @@ def _config_filename(fm, num_experts: int) -> str:
     return f"E={num_experts},N={INTER_SHARD},device_name={dev.replace(' ', '_')}.json"
 
 
-def _build_inputs(torch, num_experts: int):
-    """按 serial(schemes.py SerialNaive)的口径造输入:bf16 全量 E、
-    分片 N、topk=8 balanced 随机路由。每个 M 一套,预分配复用。"""
-    dev = "cuda"
-    dt = torch.bfloat16
-    g = torch.Generator(device=dev).manual_seed(0)
-    w1 = torch.randn(num_experts, 2 * INTER_SHARD, HIDDEN, device=dev, dtype=dt, generator=g) / 32
-    w2 = torch.randn(num_experts, HIDDEN, INTER_SHARD, device=dev, dtype=dt, generator=g) / 32
-    per_m = {}
-    for m in BATCHES:
-        hidden = torch.randn(m, HIDDEN, device=dev, dtype=dt, generator=g)
-        scores = torch.rand(m, num_experts, device=dev, generator=g)
-        topk_ids = torch.topk(scores, TOPK, dim=-1).indices.to(torch.int32)
-        logits = torch.randn(m, TOPK, device=dev, generator=g)
-        topk_weights = torch.softmax(logits, dim=-1).float()
-        per_m[m] = (hidden, topk_ids, topk_weights)
-    return w1, w2, per_m
+def _configs_dir(fm) -> str:
+    return os.path.join(os.path.dirname(fm.__file__), "configs")
+
+
+def _clear_moe_config_cache(fm) -> None:
+    if hasattr(fm, "get_moe_configs") and hasattr(fm.get_moe_configs, "cache_clear"):
+        fm.get_moe_configs.cache_clear()
+
+
+# --------------------------------------------------------------------------
+# 输入与计时(口径对齐 schemes.py SerialNaive)
+# --------------------------------------------------------------------------
+
+
+def _build_weights(torch, num_experts: int):
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w1 = torch.randn(num_experts, 2 * INTER_SHARD, HIDDEN, device="cuda",
+                     dtype=torch.bfloat16, generator=g) / 32
+    w2 = torch.randn(num_experts, HIDDEN, INTER_SHARD, device="cuda",
+                     dtype=torch.bfloat16, generator=g) / 32
+    return w1, w2, g
+
+
+def _build_batch(torch, g, num_experts: int, m: int):
+    hidden = torch.randn(m, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g)
+    scores = torch.rand(m, num_experts, device="cuda", generator=g)
+    topk_ids = torch.topk(scores, TOPK, dim=-1).indices.to(torch.int32)
+    logits = torch.randn(m, TOPK, device="cuda", generator=g)
+    topk_weights = torch.softmax(logits, dim=-1).float()
+    return hidden, topk_ids, topk_weights
 
 
 def _make_call(fm, w1, w2, num_experts):
-    """按当前 vllm 版本的 fused_experts 签名组 kwargs(能带的都带上,
-    与 serial 调用一致;quant_config bf16 为 None,缺省即可)。"""
+    """按当前 vllm 版本的 fused_experts 签名组 kwargs(与 serial 调用一致;
+    quant_config bf16 为 None)。"""
     import inspect
 
     sig = inspect.signature(fm.fused_experts)
@@ -211,76 +223,80 @@ def _bench(torch, call, inputs, iters=10, warmup=3) -> float:
     return start.elapsed_time(end) * 1000.0 / iters  # us
 
 
-def worker(args) -> None:
-    import torch
-    import vllm.model_executor.layers.fused_moe.fused_moe as fm
-
-    torch.manual_seed(0)
-    patcher = ConfigPatcher(fm)
-    if patcher.mode == "config-file" and args.num_shards > 1:
-        raise RuntimeError(
-            "回退到了 config-file 注入模式,多 shard 会互踩同一个 config 文件;"
-            "请用单卡重跑:--gpus <一张卡>"
-        )
-    w1, w2, per_m = _build_inputs(torch, args.num_experts)
-    call = _make_call(fm, w1, w2, args.num_experts)
-    print(
-        f"[worker {args.shard}] dev={torch.cuda.get_device_name(0)} "
-        f"patch={patcher.mode} file={_config_filename(fm, args.num_experts)}",
-        flush=True,
-    )
-
-    # -- patch 有效性自证:极端 config 行为差 + 调用计数 --
+def _self_check(torch, patcher, call, per_m, num_experts: int, shard: int) -> None:
+    """开跑前自证注入有效:调用计数 + 极端 config 耗时差(阈值 2%)。"""
     m_probe = 2048
     slow_cfg = {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2}
     fast_cfg = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 3}
-    patcher.set(None, args.num_experts)
+    patcher.current = None
     t_default = _bench(torch, call, per_m[m_probe])
-    patcher.set(slow_cfg, args.num_experts)
+    patcher.current = slow_cfg
     t_slow = _bench(torch, call, per_m[m_probe])
-    patcher.set(fast_cfg, args.num_experts)
+    patcher.current = fast_cfg
     t_fast = _bench(torch, call, per_m[m_probe])
+    patcher.current = None
     out = call(*per_m[m_probe])
     if patcher.calls == 0 or torch.isnan(out).any():
-        _diag_dump(fm)
+        _diag_dump(patcher.fm)
         raise RuntimeError(
             f"patch 无效或输出 NaN:calls={patcher.calls} nan={torch.isnan(out).any()}"
         )
     spread = abs(t_slow - t_fast) / max(min(t_slow, t_fast), 1e-6)
     print(
-        f"[worker {args.shard}] self-check M={m_probe}: default={t_default:.1f}us "
+        f"[worker {shard}] self-check M={m_probe}: default={t_default:.1f}us "
         f"slow={t_slow:.1f}us fast={t_fast:.1f}us spread={spread:.1%} "
         f"calls={patcher.calls}",
         flush=True,
     )
     if spread < 0.02:
-        _diag_dump(fm)
+        _diag_dump(patcher.fm)
         raise RuntimeError(
             f"极端 config 耗时差仅 {spread:.1%},注入疑似未生效(阈值 2%)"
         )
+
+
+# --------------------------------------------------------------------------
+# worker:单 GPU 初扫自己那片 config,每 M 留 top-4
+# --------------------------------------------------------------------------
+
+
+def worker(args) -> None:
+    import torch
+
+    import vllm.model_executor.layers.fused_moe.fused_moe as fm
+
+    torch.manual_seed(0)
+    patcher = ConfigPatcher(fm)
+    w1, w2, g = _build_weights(torch, args.num_experts)
+    per_m = {m: _build_batch(torch, g, args.num_experts, m) for m in BATCHES}
+    call = _make_call(fm, w1, w2, args.num_experts)
+    print(
+        f"[worker {args.shard}] dev={torch.cuda.get_device_name(0)} "
+        f"file={_config_filename(fm, args.num_experts)}",
+        flush=True,
+    )
+    _self_check(torch, patcher, call, per_m, args.num_experts, args.shard)
     if args.smoke:
         print(f"[worker {args.shard}] smoke OK", flush=True)
         json.dump({"smoke": "ok"}, open(args.out, "w"))
         return
 
-    # -- 正式扫描:本 shard 的 config 片,config 为外层(摊薄编译),M 为内层 --
+    # 初扫:本 shard 的 config 片,config 为外层(摊薄编译),M 为内层;
+    # 每 M 维护 top-4 入围名单,终名次交给 finalize 复审。
     space = config_space()[args.shard :: args.num_shards]
-    default_us = {}
-    patcher.set(None, args.num_experts)
-    for m in BATCHES:
-        default_us[str(m)] = _bench(torch, call, per_m[m])
-    best: dict[str, dict] = {}
+    tops: dict[str, list] = {str(m): [] for m in BATCHES}
     n_fail = 0
     for i, cfg in enumerate(space):
-        patcher.set(cfg, args.num_experts)
+        patcher.current = cfg
         try:
             for m in BATCHES:
                 us = _bench(torch, call, per_m[m], iters=8, warmup=2)
-                k = str(m)
-                if k not in best or us < best[k]["us"]:
-                    best[k] = {"us": us, "config": cfg}
+                lst = tops[str(m)]
+                lst.append({"us": us, "config": cfg})
+                lst.sort(key=lambda r: r["us"])
+                del lst[4:]
         except Exception:
             n_fail += 1  # OutOfResources / 编译失败等,正常淘汰
             try:
@@ -288,23 +304,155 @@ def worker(args) -> None:
             except Exception:
                 pass
         if (i + 1) % 25 == 0:
+            b = tops["2048"][0]["us"] if tops["2048"] else float("nan")
             print(
                 f"[worker {args.shard}] {i + 1}/{len(space)} fail={n_fail} "
-                f"best@2048={best.get('2048', {}).get('us', float('nan')):.1f}us",
+                f"best@2048={b:.1f}us",
                 flush=True,
             )
-    patcher.set(None, args.num_experts)  # config-file 模式下清掉试探文件
+    patcher.current = None
     json.dump(
-        {"best": best, "default_us": default_us, "n_fail": n_fail,
-         "n_tried": len(space), "shard": args.shard},
+        {"top": tops, "n_fail": n_fail, "n_tried": len(space), "shard": args.shard},
         open(args.out, "w"), indent=1,
     )
     print(f"[worker {args.shard}] done: {len(space)} tried, {n_fail} failed", flush=True)
 
 
 # --------------------------------------------------------------------------
-# orchestrator:切片 -> 子进程 -> 合并 -> 装配 config
+# finalize:单 GPU 终审 + 键校准 + 写文件 + 端到端自证
 # --------------------------------------------------------------------------
+
+
+def finalize(args) -> None:
+    import torch
+
+    import vllm.model_executor.layers.fused_moe.fused_moe as fm
+
+    torch.manual_seed(0)
+    patcher = ConfigPatcher(fm)
+    fname = _config_filename(fm, args.num_experts)
+    cfg_path = os.path.join(_configs_dir(fm), fname)
+    # 旧文件先删掉:a) 默认 config 记录需要走"文件缺失"路径;b) 本轮要重写
+    if os.path.exists(cfg_path):
+        os.remove(cfg_path)
+        print(f"[finalize] 移除旧 config: {cfg_path}", flush=True)
+    _clear_moe_config_cache(fm)
+
+    w1, w2, g = _build_weights(torch, args.num_experts)
+    per_m = {m: _build_batch(torch, g, args.num_experts, m) for m in BATCHES}
+    call = _make_call(fm, w1, w2, args.num_experts)
+
+    # a) 键映射校准:M=1000 探针,看 lookup 实参里是 1000 还是 1000*topk
+    probe = _build_batch(torch, g, args.num_experts, PROBE_M)
+    patcher.current = None
+    call(*probe)
+    torch.cuda.synchronize()
+    if PROBE_M in patcher.last_ints:
+        key_of = lambda m: m  # noqa: E731
+        mapping = "M(token 数)"
+    elif PROBE_M * TOPK in patcher.last_ints:
+        key_of = lambda m: m * TOPK  # noqa: E731
+        mapping = f"M*topk(×{TOPK})"
+    else:
+        key_of = lambda m: m  # noqa: E731
+        mapping = f"未识别(ints={patcher.last_ints}),按 M 兜底"
+    print(f"[finalize] lookup 键映射: {mapping}", flush=True)
+
+    # b) 各 M 的默认 config + 默认耗时(文件已删,orig 走 default 路径)
+    default_cfg: dict[str, dict] = {}
+    default_us: dict[str, float] = {}
+    for m in BATCHES:
+        patcher.current = None
+        patcher.last_result = None
+        us = _bench(torch, call, per_m[m], iters=args.iters, warmup=5)
+        default_us[str(m)] = us
+        if patcher.last_result is None:
+            raise RuntimeError("未捕获到默认 config(orig 返回非 dict?)")
+        default_cfg[str(m)] = patcher.last_result
+
+    # c) 入围复审(大 iters 消赢家诅咒;无净增益档写默认 config 钉死行为)
+    finalists = json.load(open(args.finalists))
+    final: dict[str, dict] = {}
+    report = []
+    for m in BATCHES:
+        k = str(m)
+        seen = set()
+        cands = []
+        for r in finalists.get(k, []):
+            ck = _cfg_key(r["config"])
+            if ck not in seen:
+                seen.add(ck)
+                cands.append(r["config"])
+        best_us, best_cfg = default_us[k], None  # None = 默认胜出
+        for cfg in cands:
+            patcher.current = cfg
+            try:
+                us = _bench(torch, call, per_m[m], iters=args.iters, warmup=5)
+            except Exception:
+                continue
+            if us < best_us:
+                best_us, best_cfg = us, cfg
+        patcher.current = None
+        chosen = best_cfg if best_cfg is not None else default_cfg[k]
+        final[k] = chosen
+        report.append((m, default_us[k], best_us, best_cfg is not None, chosen))
+
+    # d) 按校准后的键写文件(键碰撞防御)
+    keyed = {str(key_of(m)): final[str(m)] for m in BATCHES}
+    if len(keyed) != len(BATCHES):
+        raise RuntimeError(f"键映射产生碰撞: {sorted(keyed)}")
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_tune")
+    os.makedirs(backup_dir, exist_ok=True)
+    for dst in (cfg_path, os.path.join(backup_dir, fname)):
+        with open(dst, "w") as f:
+            json.dump(keyed, f, indent=1)
+        print(f"[finalize] 写入 {dst}", flush=True)
+
+    # e) 端到端自证:真实查表路径(current=None 透传 orig)选中的 config
+    #    必须与预期一致,耗时与复审值吻合(±3% 为 PASS,超出打 WARN 供人裁)
+    _clear_moe_config_cache(fm)
+    print(f"\n[finalize] E={args.num_experts} 终表(us, iters={args.iters}):")
+    print(f"  {'M':>6} {'default':>9} {'final':>9} {'gain':>7} {'e2e':>9}  verdict")
+    n_bad = 0
+    for m, d_us, b_us, tuned_won, chosen in report:
+        k = str(m)
+        patcher.current = None
+        patcher.last_result = None
+        e2e_us = _bench(torch, call, per_m[m], iters=args.iters, warmup=5)
+        picked = patcher.last_result
+        ok_cfg = picked is not None and _cfg_key(picked) == _cfg_key(chosen)
+        ok_us = e2e_us <= b_us * 1.03
+        verdict = "PASS" if (ok_cfg and ok_us) else "WARN"
+        if not (ok_cfg and ok_us):
+            n_bad += 1
+        gain = (d_us - b_us) / d_us
+        src = "tuned" if tuned_won else "default(钉死)"
+        print(
+            f"  {m:>6} {d_us:>9.1f} {b_us:>9.1f} {gain:>6.1%} {e2e_us:>9.1f}  "
+            f"{verdict} [{src}] {chosen if ok_cfg else f'选中={picked} 预期={chosen}'}",
+            flush=True,
+        )
+    if n_bad:
+        raise RuntimeError(f"{n_bad} 个 M 档端到端自证未过(见上方 WARN)")
+    print("[finalize] 端到端自证全部 PASS", flush=True)
+
+
+# --------------------------------------------------------------------------
+# orchestrator:切片 -> 初扫子进程 -> 合并入围 -> finalize 子进程
+# --------------------------------------------------------------------------
+
+
+def _spawn(cmd_extra: list[str], gpu: str, log_path: str) -> tuple:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu
+    log = open(log_path, "w")
+    cmd = [sys.executable, os.path.abspath(__file__)] + cmd_extra
+    return subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT), log
+
+
+def _tail(path: str, n: int = 30) -> str:
+    with open(path) as f:
+        return "".join(f.readlines()[-n:])
 
 
 def orchestrate(args) -> int:
@@ -316,22 +464,18 @@ def orchestrate(args) -> int:
         "build_tune", f"tune_tp_noray_E{args.num_experts}",
     )
     os.makedirs(workdir, exist_ok=True)
+
     procs = []
     for i, g in enumerate(gpus):
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = g
         out = os.path.join(workdir, f"shard_{i}.json")
         if os.path.exists(out):
             os.remove(out)
-        log = open(os.path.join(workdir, f"shard_{i}.log"), "w")
-        cmd = [
-            sys.executable, os.path.abspath(__file__),
-            "--worker", "--shard", str(i), "--num-shards", str(len(gpus)),
-            "--num-experts", str(args.num_experts), "--out", out,
-        ]
+        extra = ["--worker", "--shard", str(i), "--num-shards", str(len(gpus)),
+                 "--num-experts", str(args.num_experts), "--out", out]
         if args.smoke:
-            cmd.append("--smoke")
-        procs.append((subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT), out, log))
+            extra.append("--smoke")
+        p, log = _spawn(extra, g, os.path.join(workdir, f"shard_{i}.log"))
+        procs.append((p, out, log))
         print(f"[tune-tp] shard {i} -> GPU {g} (log: {log.name})", flush=True)
 
     failed = False
@@ -341,52 +485,38 @@ def orchestrate(args) -> int:
         if rc != 0 or not os.path.exists(out):
             failed = True
             print(f"[tune-tp] shard {i} FAILED rc={rc},log 尾部:", file=sys.stderr)
-            with open(log.name) as f:
-                sys.stderr.write("".join(f.readlines()[-30:]))
+            sys.stderr.write(_tail(log.name))
     if failed:
         return 1
     if args.smoke:
         print("[tune-tp] smoke OK(patch 生效,口径可跑)")
         return 0
 
-    # 合并各 shard,按 M 取最优
-    merged: dict[str, dict] = {}
-    default_us: dict[str, float] = {}
+    # 合并入围名单(每 M 取全局 top-6,去重)
+    finalists: dict[str, list] = {str(m): [] for m in BATCHES}
     for _, out, _ in procs:
         d = json.load(open(out))
-        default_us = default_us or d["default_us"]
-        for k, v in d["best"].items():
-            if k not in merged or v["us"] < merged[k]["us"]:
-                merged[k] = v
-    final = {k: merged[k]["config"] for k in sorted(merged, key=int)}
+        for k, lst in d["top"].items():
+            finalists[k].extend(lst)
+    for k in finalists:
+        finalists[k].sort(key=lambda r: r["us"])
+        del finalists[k][6:]
+    fin_path = os.path.join(workdir, "finalists.json")
+    json.dump(finalists, open(fin_path, "w"), indent=1)
 
-    # 定位安装目录与文件名(用与 worker 相同的 vllm)
-    probe = subprocess.run(
-        [sys.executable, "-c",
-         "import os, vllm.model_executor.layers.fused_moe.fused_moe as fm;"
-         "print(os.path.join(os.path.dirname(fm.__file__), 'configs'))"],
-        capture_output=True, text=True,
+    # finalize:单卡终审 + 键校准 + 写文件 + 自证
+    p, log = _spawn(
+        ["--finalize", "--finalists", fin_path,
+         "--num-experts", str(args.num_experts), "--iters", str(args.iters)],
+        gpus[0], os.path.join(workdir, "finalize.log"),
     )
-    cfg_dir = probe.stdout.strip().splitlines()[-1]
-    fname_probe = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), "--print-filename",
-         "--num-experts", str(args.num_experts)],
-        capture_output=True, text=True,
-    )
-    fname = fname_probe.stdout.strip().splitlines()[-1]
-    for dst_dir in (cfg_dir, os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_tune")):
-        os.makedirs(dst_dir, exist_ok=True)
-        dst = os.path.join(dst_dir, fname)
-        with open(dst, "w") as f:
-            json.dump(final, f, indent=1)
-        print(f"[tune-tp] 写入 {dst}")
-
-    print(f"\n[tune-tp] E={args.num_experts} 结果(us):")
-    print(f"  {'M':>6} {'default':>9} {'tuned':>9} {'gain':>7}")
-    for k in sorted(merged, key=int):
-        d0, d1 = default_us.get(k, float("nan")), merged[k]["us"]
-        gain = (d0 - d1) / d0 if d0 == d0 else float("nan")
-        print(f"  {k:>6} {d0:>9.1f} {d1:>9.1f} {gain:>6.1%}  {merged[k]['config']}")
+    print(f"[tune-tp] finalize -> GPU {gpus[0]} (log: {log.name})", flush=True)
+    rc = p.wait()
+    log.close()
+    print(_tail(log.name, 60))
+    if rc != 0:
+        print("[tune-tp] finalize FAILED", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -394,8 +524,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpus", default=os.environ.get("MB_GPUS", os.environ.get("CUDA_VISIBLE_DEVICES", "9,11,13,15")))
     ap.add_argument("--num-experts", type=int, default=64)
-    ap.add_argument("--smoke", action="store_true", help="单卡 2 config 自检,<2min")
+    ap.add_argument("--iters", type=int, default=30, help="finalize 复审迭代数")
+    ap.add_argument("--smoke", action="store_true", help="单卡自检,<2min")
     ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--finalize", action="store_true")
+    ap.add_argument("--finalists", default="")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
     ap.add_argument("--out", default="")
@@ -408,6 +541,9 @@ def main() -> int:
         return 0
     if args.worker:
         worker(args)
+        return 0
+    if args.finalize:
+        finalize(args)
         return 0
     return orchestrate(args)
 

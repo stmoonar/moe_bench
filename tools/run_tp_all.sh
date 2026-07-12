@@ -115,6 +115,17 @@ run_step() {  # run_step <名字> <超时秒> <命令...>
 
 cd "$PARENT_DIR"
 
+# ---------- 0a. 复位 TP 调优 config（docs/29: 上一轮 TUNE 产物装在 vllm configs
+# 里会让 04/06/07 的 serial 悄悄变成调优口径, 与历史失去可比性; 09 会重新生成） ----------
+run_step 00_reset_tuned_cfg 120 python -c "
+import glob, os
+import vllm.model_executor.layers.fused_moe.fused_moe as fm
+d = os.path.join(os.path.dirname(fm.__file__), 'configs')
+for f in glob.glob(os.path.join(d, 'E=*,N=768,device_name=*.json')):
+    os.remove(f); print('removed', f)
+print('reset done')
+"
+
 # ---------- 0b. CPU 预检（无 GPU 依赖：设备守卫 + 表裁决 + 数据流模拟） ----------
 run_step 00_preflight_cpu 600 python "$MOE_DIR/tools/preflight_tp_cpu.py"
 if [ "$FAIL" -gt 0 ]; then

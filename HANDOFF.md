@@ -9,7 +9,18 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第八轮 2026-07-12·当前状态】**39/40(唯一 FAIL=09 调优本体)。
+**【TP 第九轮 2026-07-12·当前状态】**42/42 全过,TP-T3 v2 无 ray 调优 3 分钟
+跑完(vs v1 ray 黑洞 2.5h),09v PASS。**kernel 级增益 3~7%,但 e2e 只有
+T=1024 兑现(5025→4883,−142µs),T=256/512 反而 +13/+44µs**——主嫌:vLLM
+查表键可能按 M×topk 而非 token 数,三档全部就近命中 8192 键拿到 M=4096 的
+赢家 config;次嫌:iters=8 初扫赢家诅咒。已升级 v2.1:**finalize 终审**
+(键映射 M=1000 探针自校准、入围 top-6 复审 iters=30、无增益档钉死默认
+config、写完走真实查表路径端到端自证,WARN 即 FAIL);run_tp_all 新增
+00_reset_tuned_cfg(开跑删旧调优 config,保 04/06/07 未调优口径可比)。
+其余档位第三轮连续稳定:t512 2261(1.16×)、t1024 4176(1.17× vs tuned)、
+comm 拐点 24 四连庄。**下一步:重跑 TUNE=1 看键映射结论+finalize 终表,
+按 tuned serial 报终数;比率压薄再上 sched 第二刀**。docs/29。
+**【TP 第八轮(历史)】**39/40(唯一 FAIL=09 调优本体)。
 **环境干扰假说裁决=确认(外因)**:两个历史波动档同 session 重复全部一致到 0.1%,
 双峰三轮游走+serial 中招+clocks 取证(GPU0 被别人占 59.9GB)收口;报数纪律改为
 "med 为准,出双峰当轮重跑取重复一致值"。全档复现第七轮:1.16×/1.20×/1.10×/
@@ -205,5 +216,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/26** | **TP 第六轮:comm 拐点=24 确认、RB64 翻盘 NE=256(1.07×)、首份分阶段归因(GEMM 1486µs/sched 277 最大可压项/理论地板 1900µs);T=1024 双峰异常待裁决** |
 | **docs/27** | **TP 第七轮:T=1024 解除(1.20× 最佳)、双峰漂移+serial 离群→环境干扰假说与取证(clocks_per_step/重复跑);TP-T3 调优脚本就绪(TUNE=1);报数纪律(波动档看 min+重复一致性)** |
 | **docs/28** | **TP 第八轮:环境假说裁决=确认(外因,重复跑全一致+clocks 取证);TP-T3 v1 尸检(ray 卡死 RegisterClient 2.5h 零 trial)与 v2 无 ray 重写(subprocess 分片/注入自证/smem 预过滤/E 三档);step 09 全网格+自动裁决** |
+| **docs/29** | **TP 第九轮:TP-T3 v2 跑通(kernel 级 3~7%)但 e2e 收益错位(仅 T=1024 兑现,主嫌查表键 M×topk 错位/次嫌赢家诅咒);v2.1 finalize 终审(键探针自校准+复审+钉死默认+端到端自证);00_reset_tuned_cfg 保口径可比** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |
