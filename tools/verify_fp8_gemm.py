@@ -86,7 +86,7 @@ def main():
         ref[e * rows_e:(e + 1) * rows_e] = a_deq[e * rows_e:(e + 1) * rows_e] @ w_deq.T
 
     task_next.zero_()
-    tk.grouped_gemm_fp8(A_q, A_s, W_q, W_s, out, padded, blk_expert, task_next, 0)
+    tk.grouped_gemm_fp8(A_q, A_s, W_q, W_s, out, padded, blk_expert, task_next, 0, False)
     torch.cuda.synchronize()
     rel = (out.float() - ref).norm() / ref.norm()
     ok = rel < 5e-3
@@ -110,15 +110,21 @@ def main():
 
     def run_fp8():
         task_next.zero_()
-        tk.grouped_gemm_fp8(A_q, A_s, W_q, W_s, out, padded, blk_expert, task_next, 0)
+        tk.grouped_gemm_fp8(A_q, A_s, W_q, W_s, out, padded, blk_expert, task_next, 0, False)
+
+    def run_raw():  # 裸 mma 上限探针(docs/38: 裁决 fp32 累加税假说)
+        task_next.zero_()
+        tk.grouped_gemm_fp8(A_q, A_s, W_q, W_s, out, padded, blk_expert, task_next, 0, True)
 
     W_bf_kn = W_bf.transpose(1, 2).contiguous()  # bf16 参考要 (E, K, N)
     t8 = bench(run_fp8)
+    traw = bench(run_raw)
     t16 = bench(lambda: tk.grouped_gemm(A_bf, W_bf_kn, out_bf, padded, 0))
     fl = 2.0 * P * K * N
     print(f"[fp8 gemm] fp8 {t8:8.1f}us ({fl / t8 / 1e6:6.1f} TFLOP/s)   "
+          f"raw {traw:8.1f}us ({fl / traw / 1e6:6.1f} TFLOP/s)   "
           f"bf16 {t16:8.1f}us ({fl / t16 / 1e6:6.1f} TFLOP/s)   "
-          f"speedup {t16 / t8:.2f}x  (target >= 1.8x)")
+          f"speedup {t16 / t8:.2f}x  raw-cap {t16 / traw:.2f}x")
     return 0 if ok else 1
 
 

@@ -510,7 +510,10 @@ struct gemm_config_fp8 {
  *   G.w_scales    : gl<float, 1, -1(E), -1(N/128), -1(K/128)>
  * 其余(gate/epilogue/store/blk_expert/task_next)与 bf16 dispenser 相同。
  */
-template <bool COL_MAJOR = false, typename Globals, typename Gate, typename Epilogue, typename Store>
+/* RESCALE=false = 裸 mma 吞吐探针(docs/38):跳过重标定 FFMA 与 scale 读,
+ * 结果不正确,只用于测 fp8+fp32acc 的硬上限,裁决 "GeForce fp32 累加税"
+ * 假说(mma.f32.e4m3 指令率 = f16 版的一半 → fp8 峰值 ≈ bf16 峰值)。 */
+template <bool COL_MAJOR = false, bool RESCALE = true, typename Globals, typename Gate, typename Epilogue, typename Store>
 __device__ inline void grouped_gemm_sm120_fp8_dispenser(
         const Globals &G, const Gate &gate, const Epilogue &epilogue, const Store &store,
         const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks) {
@@ -627,7 +630,7 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
                 stage = (stage + 1) % cfg::PIPELINE_STAGES;
 
                 // 量化块(K=128)边界: fp32 重标定并入主累加器(scale 用预取值)
-                if ((red_idx % STEPS_PER_SCALE) == STEPS_PER_SCALE - 1) {
+                if (RESCALE && (red_idx % STEPS_PER_SCALE) == STEPS_PER_SCALE - 1) {
                     const float s0 = s0_n * bsc_n;
                     const float s1 = s1_n * bsc_n;
                     const int kblk1 = red_idx / STEPS_PER_SCALE + 1;
@@ -649,7 +652,8 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
                 }
             }
 
-            store(acc, row_idx, col_idx);
+            if constexpr (RESCALE) store(acc, row_idx, col_idx);
+            else store(sub, row_idx, col_idx);   // raw 探针: 存未标定值
             consumers::sync(0);
             epilogue(row_idx, col_idx);
             warp::arrive(task_done[q]);

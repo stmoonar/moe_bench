@@ -203,10 +203,19 @@ void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_exper
                                      plain_store_policy<globals::outputs_gl>{G.outputs},
                                      blk_expert, task_next, num_tasks);
 }
+// 裸 mma 吞吐探针(docs/38): 跳过重标定, 结果错, 只测 fp8+f32acc 硬上限
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void kernel_raw(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+                int *__restrict__ task_next, const int num_tasks) {
+    grouped_gemm_sm120_fp8_dispenser<false, false>(
+        G, no_gate{}, noop_epilogue{},
+        plain_store_policy<globals::outputs_gl>{G.outputs},
+        blk_expert, task_next, num_tasks);
+}
 void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
            const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
            const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
-           at::Tensor &task_next, const int expert_offset) {
+           at::Tensor &task_next, const int expert_offset, const bool raw) {
     using cfg = gemm_config_fp8;
     // 布局(docs/38): weights = B^T (E, N, K)(w1 原始布局, 免转置),
     // w_scales (E, N/128, K/128); mma_ABt + row-layout 加载。
@@ -237,9 +246,15 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;
-    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
-        G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks);
+    if (raw) {
+        CUDACHECK(cudaFuncSetAttribute(kernel_raw, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel_raw<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks);
+    } else {
+        CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks);
+    }
     CUDACHECK(cudaGetLastError());
 }
 } // namespace gg8

@@ -9,7 +9,17 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【FP8 P0 定标+P1 落码 2026-07-12·分支 fp8_tp·当前状态】**P0 定标完成:
+**【FP8 P1 裁决中 2026-07-12·分支 fp8_tp·当前状态】**P1 两轮:**正确性一次
+全对**(两档形状 rel_err 1.68e-3,scale 行映射/B^T+mma_ABt/重标定全对);TK
+平台坑沉淀(col-layout fp8 加载没写完 → B 转置 (E,N,K)+row ldmatrix+mma_ABt,
+副产品 w1 免转置)。性能 283 TFLOP/s = 1.29×(预取假说证伪,仅 +1.5%)。
+**fp32 累加税假说**(docs/38):GeForce 系 mma.f32.e4m3 指令率减半 → fp8 峰值
+≈ bf16 峰值 289,我们已在 98% 税后天花板;f16 累加有 128-K 块溢出风险(RMS
+92k>65504)无免费出路。**raw 探针已落码**(grouped_gemm_fp8(...,raw=True) 跳
+过重标定测硬上限):raw≈290 → 税坐实,按修订账进 P2(e2e ~1770 ≈ 1.17× vs
+serial fp8 2074);raw>350 → 查 FFMA/流水深度。**下一步:
+`STEPS='^00_|^01_|^02f_' bash tools/run_tp_all.sh` 看 raw-cap**。docs/38。
+**【FP8 P0 定标+P1 落码(历史)】**P0 定标完成:
 **serial fp8 = 2074(T=512)/4030(T=1024)**,vllm triton fp8 仅 1.27× 自家
 bf16;**serial fp8 已快过我们 bf16 融合(2115)——fp8 是保住领先的必需品**。
 我方 fp8 靶:~1500(比率 ~1.38×)。⚠️ serial fp8 verify FAIL(rel_err
