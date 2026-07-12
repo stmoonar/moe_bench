@@ -19,7 +19,7 @@
 #   bash moe_bench/tools/tune_vllm_moe_tp.sh
 set -euo pipefail
 
-GPUS="${MB_GPUS:-${CUDA_VISIBLE_DEVICES:-9,11,13,15}}"
+GPUS="${MB_GPUS:-${CUDA_VISIBLE_DEVICES:-8,10,12,14}}"
 TUNE_E="${TUNE_E:-64}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

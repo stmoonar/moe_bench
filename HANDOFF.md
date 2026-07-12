@@ -253,7 +253,7 @@ TP 路线:**dispatch push 化为必选项**,见 docs/23(TP 第三轮计划)。)
 
 在 moe_bench 里用 ThunderKittens 实现通算融合的 EP MoE 层(dispatch⊕GEMM、GEMM⊕combine
 单 kernel 融合,不做 stream overlap 降级方案),对比 vLLM serial baseline。
-平台:16×RTX Pro 5000(sm120)PCIe,用 4 卡组(优先 9,11,13,15),无 NVLink、
+平台:16×RTX Pro 5000(sm120)PCIe,用 4 卡组(优先 8,10,12,14),无 NVLink、
 **远端原子高并发不可靠**(docs/08)、无 multimem。
 
 ## 2. 当前状态(全部已提交,分支 tk_dev)
@@ -365,12 +365,12 @@ source /data/cinnzhang_vllm_td_test/venvs/vllm-td/bin/activate
 cd /data/cinnzhang_vllm_td_test/xxy          # 必须在上级目录跑 -m moe_bench.*
 nvidia-smi                                    # 跑前确认卡空闲
 # 对拍(全链路 vs reference_moe)
-CUDA_VISIBLE_DEVICES=9,11,13,15 python -m moe_bench.tools.run_tkfused 64
+CUDA_VISIBLE_DEVICES=8,10,12,14 python -m moe_bench.tools.run_tkfused 64
 # benchmark(bf16 EP;--distributed 必带,--scheme 单值,分别跑 tkfused / serial)
-CUDA_VISIBLE_DEVICES=9,11,13,15 python -m moe_bench.bench --distributed --scheme tkfused \
+CUDA_VISIBLE_DEVICES=8,10,12,14 python -m moe_bench.bench --distributed --scheme tkfused \
     --mode ep --precision bf16 --world-size 4 --no-verify --num-tokens 512
 # dispatch-only 隔离计时
-CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time_dispatch 256 10 50
+CUDA_VISIBLE_DEVICES=8,10,12,14 TK_DISPATCH=push3 python -m moe_bench.tools.time_dispatch 256 10 50
 ```
 
 **默认路径 = pull dispatch + prered combine + fused gate+up + GPU schedule(计入 run)。**

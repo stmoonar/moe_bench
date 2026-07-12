@@ -82,7 +82,7 @@ for line in out.strip().splitlines():
     idx, mem, util = [int(x.strip()) for x in line.split(",")]
     if mem > 2000 or util > 10:
         busy.add(idx)
-for grp in ("9,11,13,15", "8,10,12,14", "1,3,5,7", "0,2,4,6"):
+for grp in ("8,10,12,14", "9,11,13,15", "1,3,5,7", "0,2,4,6"):
     ids = [int(x) for x in grp.split(",")]
     if all(i not in busy for i in ids):
         print(grp)

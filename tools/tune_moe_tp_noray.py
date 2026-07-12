@@ -19,7 +19,7 @@
         config 与预期一致、耗时与复审值吻合,打印 PASS/FAIL。
 
 用法(编排模式,默认 4 卡并行,单个 E 约 15~20 分钟):
-  python tune_moe_tp_noray.py --gpus 9,11,13,15 --num-experts 64
+  python tune_moe_tp_noray.py --gpus 8,10,12,14 --num-experts 64
   python tune_moe_tp_noray.py --gpus 9 --smoke          # <2min 自检
 """
 
@@ -522,7 +522,7 @@ def orchestrate(args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gpus", default=os.environ.get("MB_GPUS", os.environ.get("CUDA_VISIBLE_DEVICES", "9,11,13,15")))
+    ap.add_argument("--gpus", default=os.environ.get("MB_GPUS", os.environ.get("CUDA_VISIBLE_DEVICES", "8,10,12,14")))
     ap.add_argument("--num-experts", type=int, default=64)
     ap.add_argument("--iters", type=int, default=30, help="finalize 复审迭代数")
     ap.add_argument("--smoke", action="store_true", help="单卡自检,<2min")
