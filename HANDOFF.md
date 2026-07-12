@@ -164,6 +164,11 @@ TP 路线:**dispatch push 化为必选项**,见 docs/23(TP 第三轮计划)。)
 
 ## 4. 踩坑索引(改代码前必读)
 
+- **`kernels/tk/sm120_common.cuh` 是构建产物,不是源文件**(build.py 每次编译
+  前从正本 `kernels/tileoverlap/common/sm120_common.cuh` 覆盖拷贝,且被
+  .gitignore)。改 GEMM 模板必须改正本;改了副本 = 不进 git + 下次编译被覆盖
+  (第十轮首跑 01_build 就死在这,符号未定义)。
+
 - **远端原子会丢增量**(高并发散射 red.add,probe 弱压力测不出)→ docs/08。
   跨卡完成检测只用"本地 atom.acq_rel 选举 + 单写者 st.release.sys"两阶段协议。
 - **worker 里 set_default_device(cuda) 劫持无显式 device 的张量创建**(host 调度表
