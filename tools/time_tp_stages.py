@@ -21,7 +21,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _worker(rank, world, init_method, ne, iters, tokens):
+def _worker(rank, world, init_method, ne, iters, tokens, fp8):
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     torch.set_default_device(device)
@@ -37,7 +37,8 @@ def _worker(rank, world, init_method, ne, iters, tokens):
 
     cfg = MoEBenchConfig(
         hidden_size=4096, intermediate_size=3072, num_experts=ne, topk=8,
-        parallel_mode=ParallelMode.TP, world_size=world, precision=Precision.BF16,
+        parallel_mode=ParallelMode.TP, world_size=world,
+        precision=Precision.FP8 if fp8 else Precision.BF16,
         num_tokens=[tokens], routing=RoutingConfig(distribution=Distribution.BALANCED),
         distributed=True, verify=False, device="cuda")
     ctx = DistContext(rank=rank, world_size=world, local_rank=rank,
@@ -87,13 +88,29 @@ def _worker(rank, world, init_method, ne, iters, tokens):
         def st_copy():
             s._l0_seq += 1
             s.tk.pcie_device_barrier(s.barrier_l0, s._l0_seq)
-            s.pre_tokens.data_.copy_(s.problem.hidden_states)
+            if s.fp8:  # 源端 1×128 量化(docs/39, 与 scheme.run 相同)
+                x = s.problem.hidden_states.view(s.num_tokens, s.H // 128, 128)
+                scale = (x.abs().amax(dim=-1, keepdim=True).float()
+                         .clamp_min(1e-8) / 448.0)
+                s.pre_tokens.data_.copy_(
+                    (x / scale).to(torch.float8_e4m3fn).view(s.num_tokens, s.H))
+                s.pre_scales.data_.copy_(scale.view(s.num_tokens, s.H // 128))
+            else:
+                s.pre_tokens.data_.copy_(s.problem.hidden_states)
             s._l0_seq += 1
             s.tk.pcie_device_barrier(s.barrier_l0, s._l0_seq)
         timed("tok_copy", st_copy)
 
         def st_l0():
-            if s.dispatch_mode == "push":
+            if s.fp8:
+                s.gemm_next.zero_()
+                s.tk.moe_tp_dispatch_gemm_fp8(
+                    s.pre_tokens, s.pre_scales, s.gathered, s.gathered_scales,
+                    s.w_gateup_fp8, s.w1_il_scales, s.act, s.padded,
+                    s.tp_slots, s.slack, s.pull_order, s.blk_expert,
+                    s.gemm_next, s.barrier_l0, s.num_comm_sms,
+                    s.num_padded_total, s.num_tokens)
+            elif s.dispatch_mode == "push":
                 s._l0_seq += 1
                 s.l0_push_cnt.zero_()
                 s.tk.moe_tp_dispatch_push_gemm(
@@ -153,7 +170,16 @@ def _worker(rank, world, init_method, ne, iters, tokens):
         # references: same GEMMs, no comm/prered (gathered/act already populated).
         # GLU 路径的 L0 参考 = 同款 dispenser+GLU store 的纯算版(苹果对苹果:
         # L0_fused 里已含 silu,参考也得含),否则退回 plain grouped_gemm。
-        if s.l0_glu:
+        if s.fp8:
+            # gg8 是 plain store(输出 (P, 2I)), 少了 GLU epilogue —— bf16 实测
+            # GLU 在 GEMM 级零开销(969 vs 978), 参考仍然苹果对苹果。
+            def st_l0_alone_fp8():
+                ref_task_next.zero_()
+                s.tk.grouped_gemm_fp8(s.gathered, s.gathered_scales,
+                                      s.w_gateup_fp8, s.w1_il_scales, ref_gateup,
+                                      s.padded, s.blk_expert, ref_task_next, 0, False)
+            timed("L0_gemm_alone", st_l0_alone_fp8)
+        elif s.l0_glu:
             def st_l0_alone():
                 ref_task_next.zero_()
                 s.tk.grouped_gemm_glu(s.gathered, s.w_gateup_il, ref_act,
@@ -181,7 +207,7 @@ def _worker(rank, world, init_method, ne, iters, tokens):
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     if rank == 0:
         print(f"\n== tktp stage attribution (NE={ne}, T={tokens}, iters={iters}, "
-              f"dispatch={s.dispatch_mode}, l0={s.l0_mode}"
+              f"{'fp8, ' if s.fp8 else ''}dispatch={s.dispatch_mode}, l0={s.l0_mode}"
               f"{'+glu' if s.l0_glu else ''}, l1={s.l1_mode}, "
               f"comm_sms={s.num_comm_sms}, "
               f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.num_push_sms}, "
@@ -201,13 +227,16 @@ def _worker(rank, world, init_method, ne, iters, tokens):
 
 
 def main():
-    ne = int(sys.argv[1]) if len(sys.argv) > 1 else 64
-    iters = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-    tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 512
+    args = [a for a in sys.argv[1:] if a != "fp8"]
+    fp8 = "fp8" in sys.argv
+    ne = int(args[0]) if len(args) > 0 else 64
+    iters = int(args[1]) if len(args) > 1 else 20
+    tokens = int(args[2]) if len(args) > 2 else 512
     world = 4
     from vllm.utils.network_utils import get_open_port
     init_method = f"tcp://localhost:{get_open_port()}"
-    mp.spawn(_worker, args=(world, init_method, ne, iters, tokens), nprocs=world, join=True)
+    mp.spawn(_worker, args=(world, init_method, ne, iters, tokens, fp8),
+             nprocs=world, join=True)
 
 
 if __name__ == "__main__":

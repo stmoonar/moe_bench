@@ -210,6 +210,15 @@ else
     run_step 04f8_bench_tktp_fp8_t1024 600 python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --precision fp8 --no-verify --iters 30 --tokens 1024 \
         --json "$JSONS/tktp_fp8_t1024.json"
+    # ---------- 5f. fp8 comm_sms 重扫(docs/40: AG 字节减半, 拐点应左移) ----------
+    for CS in 8 12 16 24; do
+        run_step "05f_fp8_commsms_${CS}" 600 \
+            env TK_COMM_SMS=$CS python -m moe_bench.tools.run_tktp 64 \
+            --scheme tktp --precision fp8 --no-verify --iters 30 \
+            --json "$JSONS/tktp_fp8_commsms${CS}.json"
+    done
+    # ---------- 8f. fp8 分阶段归因 ----------
+    run_step 08f_time_stages_fp8 900 python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     run_step 04f_bench_serial_fp8_512 600 python -m moe_bench.tools.run_tktp 64 \
         --scheme serial --precision fp8 --no-verify --iters 50 \
         --json "$JSONS/serial_fp8_ne64_t512.json"
