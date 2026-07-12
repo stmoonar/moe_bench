@@ -152,6 +152,53 @@ __device__ inline void grouped_gemm_sm120(const Globals &G, const Gate &gate, co
     grouped_gemm_sm120(G, gate, no_epilogue{}, sm_idx, num_sms);
 }
 
+/* ---- output store policies (docs/30) -------------------------------------
+ * The consumer group's register->global store is a policy so layer0 can fuse
+ * the SwiGLU activation into the GEMM epilogue instead of a separate torch
+ * silu pass over 75MB of HBM traffic. Called by EVERY consumer warp with its
+ * own accumulator (group<CONSUMER_WARPS>::store composes the full tile). */
+
+/** Default: store the full COL_BLOCK-wide fp32 accumulator as bf16. */
+template <typename OutGL>
+struct plain_store_policy {
+    const OutGL &out;
+    __device__ inline void operator()(rt_fl<16, gemm_config::COL_BLOCK> &acc,
+                                      int row_idx, int col_idx) const {
+        kittens::group<gemm_config::CONSUMER_WARPS>::store(out, acc, {row_idx, col_idx});
+    }
+};
+
+/** SwiGLU store: weights are column-INTERLEAVED per COL_BLOCK so each output
+ * tile is [gate(64) | up(64)] for the SAME intermediate columns. Compute
+ * act = silu(gate) * up in fp32 registers and store the 64-wide act tile at
+ * the same tile coordinate (act tensor is (rows, inter), 64-col tile units).
+ * More accurate than the old path (silu on fp32 accs, not on rounded bf16).
+ * NOTE: the A-load strip permutation (store_strip, docs/05) depends only on
+ * CONSUMER_WARPS, not tile width, so acc rows line up for the 64-wide store
+ * exactly as for the 128-wide one. */
+template <typename OutGL>
+struct glu_store_policy {
+    const OutGL &out;
+    __device__ inline void operator()(rt_fl<16, gemm_config::COL_BLOCK> &acc,
+                                      int row_idx, int col_idx) const {
+        constexpr int HW = gemm_config::COL_BLOCK / 32;  // half-width in 16-col base tiles
+        rt_fl<16, gemm_config::COL_BLOCK / 2> act;
+        #pragma unroll
+        for (int j = 0; j < HW; j++) {
+            #pragma unroll
+            for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
+                const float2 g = acc.tiles[0][j].data[k];
+                const float2 u = acc.tiles[0][j + HW].data[k];
+                float2 r;
+                r.x = (g.x / (1.0f + __expf(-g.x))) * u.x;
+                r.y = (g.y / (1.0f + __expf(-g.y))) * u.y;
+                act.tiles[0][j].data[k] = r;
+            }
+        }
+        kittens::group<gemm_config::CONSUMER_WARPS>::store(out, act, {row_idx, col_idx});
+    }
+};
+
 /**
  * Same as above, plus an output Epilogue functor called by the consumer group
  * right after each (row_idx, col_idx) tile is stored to G.outputs. Signature:
@@ -269,6 +316,135 @@ __device__ inline void grouped_gemm_sm120(const Globals &G, const Gate &gate, co
                 epilogue(row_idx, col_idx);
             }
             task_id -= num_blocks;
+        }
+    }
+}
+
+/**
+ * Dispenser-fed grouped GEMM (docs/30). Same math/pipeline as the static-walk
+ * grouped_gemm_sm120, but tasks come from a GLOBAL atomic counter so blocks
+ * can join LATE: layer0's comm blocks finish the AllGather pulls and then
+ * take GEMM tasks instead of idling (the static walk pre-assigns tasks by
+ * sm_idx, which is why the 24 comm SMs used to sit dead for the L0 tail).
+ *
+ * Task space is flat: task t -> row block t/col_blocks, col block t%col_blocks;
+ * the row block's expert comes from the blk_expert table (rebuilt with the
+ * schedule, host-golden adjudicated). Claim order == the static walk's
+ * expert-major order, so the readiness pipelining vs pull_order is unchanged.
+ *
+ * The producer streams claimed tasks to the consumer warps through a small
+ * smem descriptor ring (TASK_Q=2, mbarrier handshake, same phasebit pattern
+ * as the stage pipeline) — the 3-stage input pipeline runs CONTINUOUSLY
+ * across task boundaries, exactly like the static walk (no per-task block
+ * barrier, no pipeline drain). Sentinel row=-1 terminates the consumers.
+ *
+ * Store is a policy (plain_store_policy / glu_store_policy above); the
+ * Globals only need .activations and .weights here.
+ */
+struct noop_epilogue { __device__ inline void operator()(int, int) const {} };
+
+template <typename Globals, typename Gate, typename Epilogue, typename Store>
+__device__ inline void grouped_gemm_sm120_dispenser(
+        const Globals &G, const Gate &gate, const Epilogue &epilogue, const Store &store,
+        const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks) {
+    using cfg = gemm_config;
+    using consumers = kittens::group<cfg::CONSUMER_WARPS>;
+
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator allocator((int*)&__shm[0]);
+    typename cfg::pipeline_inputs (&inputs)[cfg::PIPELINE_STAGES] =
+        allocator.allocate<typename cfg::pipeline_inputs, cfg::PIPELINE_STAGES>();
+
+    static constexpr int TASK_Q = 2;
+    __shared__ semaphore inputs_arrived[cfg::PIPELINE_STAGES];
+    __shared__ semaphore inputs_finished[cfg::PIPELINE_STAGES];
+    __shared__ semaphore task_ready[TASK_Q];   // producer -> consumers
+    __shared__ semaphore task_done[TASK_Q];    // consumers -> producer (slot free)
+    __shared__ int2 task_desc[TASK_Q];         // (row_idx, col_idx); row -1 = exit
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < cfg::PIPELINE_STAGES; ++i) {
+            init_semaphore(inputs_arrived[i], 0, 1);
+            init_semaphore(inputs_finished[i], 0, cfg::CONSUMER_WARPS);
+        }
+        for (int q = 0; q < TASK_Q; ++q) {
+            init_semaphore(task_ready[q], 0, 1);
+            init_semaphore(task_done[q], 0, cfg::CONSUMER_WARPS);
+        }
+    }
+    __syncthreads();
+
+    const int warp_id = kittens::warpid();
+    const int lane_id = kittens::laneid();
+    const int num_iters = static_cast<int>(G.activations.cols()) / cfg::RED_BLOCK;
+    const int col_blocks = static_cast<int>(G.weights.cols()) / cfg::COL_BLOCK;
+    int stage = 0;
+    uint32_t phasebits = 0xFFFF0000;   // stage pipeline (low: arrived, high: finished)
+    uint32_t qphase    = 0xFFFF0000;   // task ring (low: ready, high: done-free)
+
+    if (warp_id == cfg::CONSUMER_WARPS) {
+        // ------------------------------------------------------ producer warp
+        if (lane_id == 0) {
+            int q = 0;
+            while (true) {
+                const int t = atomicAdd(task_next, 1);
+                const int row_idx = (t < num_tasks) ? t / col_blocks : -1;
+                const int col_idx = (t < num_tasks) ? t - (t / col_blocks) * col_blocks : -1;
+                // slot q free? (consumers finished the task TASK_Q rounds ago)
+                wait(task_done[q], get_phasebit<1>(qphase, q));
+                update_phasebit<1>(qphase, q);
+                task_desc[q] = make_int2(row_idx, col_idx);
+                warp::arrive(task_ready[q]);   // publish (mbarrier orders the smem write)
+                if (row_idx < 0) break;
+                gate(row_idx); // <-- communication readiness fuses in here
+                const int e = blk_expert[row_idx];
+                for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    update_phasebit<1>(phasebits, stage);
+                    tma::expect_bytes(inputs_arrived[stage], sizeof(typename cfg::pipeline_inputs));
+                    tma::load_async(inputs[stage].A, G.activations, {row_idx, red_idx}, inputs_arrived[stage]);
+                    tma::load_async(inputs[stage].B, G.weights, {e, red_idx, col_idx}, inputs_arrived[stage]);
+                    stage = (stage + 1) % cfg::PIPELINE_STAGES;
+                }
+                q = (q + 1) % TASK_Q;
+            }
+        }
+    } else {
+        // ---------------------------------------------------- consumer warps
+        int q = 0;
+        while (true) {
+            wait(task_ready[q], get_phasebit<0>(qphase, q));
+            update_phasebit<0>(qphase, q);
+            const int row_idx = task_desc[q].x;
+            const int col_idx = task_desc[q].y;
+            if (row_idx < 0) break;
+
+            rt_fl<16, cfg::COL_BLOCK> acc;
+            warp::zero(acc);
+            constexpr int WG = cfg::CONSUMER_WARPS;
+            const int store_strip = (WG % 4 == 0) ? (warp_id / 4 + (warp_id % 4) * (WG / 4)) : warp_id;
+
+            for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                update_phasebit<0>(phasebits, stage);
+                #pragma unroll
+                for (int kk = 0; kk < cfg::RED_BLOCK / 16; kk++) {
+                    rt_bf<16, 16> a_reg;
+                    auto a_sub = inputs[stage].A.template subtile<16, 16>({store_strip, kk});
+                    warp::load(a_reg, a_sub);
+                    rt_bf<16, cfg::COL_BLOCK, ducks::rt_layout::col> b_reg;
+                    auto b_sub = inputs[stage].B.template subtile<16, cfg::COL_BLOCK>({kk, 0});
+                    warp::load(b_reg, b_sub);
+                    warp::mma_AB(acc, a_reg, b_reg, acc);
+                }
+                warp::arrive(inputs_finished[stage]);
+                stage = (stage + 1) % cfg::PIPELINE_STAGES;
+            }
+
+            store(acc, row_idx, col_idx);
+            consumers::sync(0); // full tile in global before the epilogue signal
+            epilogue(row_idx, col_idx);
+            warp::arrive(task_done[q]); // slot free for the producer
+            q = (q + 1) % TASK_Q;
         }
     }
 }
