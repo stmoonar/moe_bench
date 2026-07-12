@@ -497,13 +497,9 @@ class TKFusedTP(DistributedScheme):
         self._l0_seq += 1
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
         if self.fp8:
-            # 源端 1×128 group 量化(docs/39, 计入 timed 区): AG 字节减半
-            x = self.problem.hidden_states.view(self.num_tokens, self.H // 128, 128)
-            scale = (x.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-8)
-                     / 448.0)
-            self.pre_tokens.data_.copy_(
-                (x / scale).to(torch.float8_e4m3fn).view(self.num_tokens, self.H))
-            self.pre_scales.data_.copy_(scale.view(self.num_tokens, self.H // 128))
+            # 源端 1×128 group 量化(docs/41: 单 kernel 版, torch 链 ~80µs → ~15µs)
+            tk.rowgroup_quant_fp8(self.problem.hidden_states,
+                                  self.pre_tokens.data_, self.pre_scales.data_)
         else:
             self.pre_tokens.data_.copy_(self.problem.hidden_states)
         self._l0_seq += 1

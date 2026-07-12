@@ -257,6 +257,50 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     }
     CUDACHECK(cudaGetLastError());
 }
+// 1×128 row-group 量化(docs/41): bf16 (rows, groups*128) -> fp8 + scales
+// (rows, groups)。torch 的五连发小 kernel 链要 ~80us(docs/40 tok_copy 112),
+// 单 kernel 版 ~10-15us。token 量化(groups=32)与 act 量化(P3, groups=6)
+// 共用。block = 一行, 8 warps 按 group 跨步, warp 内 shfl 归约 amax。
+__global__ __launch_bounds__(256)
+void rowgroup_quant_kernel(const __nv_bfloat16 *__restrict__ in,
+                           __nv_fp8_e4m3 *__restrict__ out,
+                           float *__restrict__ scales,
+                           const int rows, const int groups) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    for (int g = warp; g < groups; g += 8) {
+        const __nv_bfloat16 *p = in + (size_t)row * groups * 128 + g * 128;
+        float m = 0.f;
+        #pragma unroll
+        for (int i = lane; i < 128; i += 32)
+            m = fmaxf(m, fabsf(__bfloat162float(p[i])));
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+        m = fmaxf(m, 1e-8f);
+        if (lane == 0) scales[(size_t)row * groups + g] = m / 448.f;
+        const float inv = 448.f / m;
+        __nv_fp8_e4m3 *q = out + (size_t)row * groups * 128 + g * 128;
+        #pragma unroll
+        for (int i = lane; i < 128; i += 32)
+            q[i] = __nv_fp8_e4m3(__bfloat162float(p[i]) * inv);
+    }
+}
+void rowgroup_quant_entry(const at::Tensor &in, at::Tensor &out, at::Tensor &scales) {
+    TORCH_CHECK(in.dtype() == at::ScalarType::BFloat16 && in.is_contiguous(), "in: contiguous bf16");
+    TORCH_CHECK(out.dtype() == at::ScalarType::Float8_e4m3fn, "out: fp8e4m3");
+    TORCH_CHECK(in.size(1) % 128 == 0, "cols % 128");
+    const int rows = static_cast<int>(in.size(0));
+    const int groups = static_cast<int>(in.size(1)) / 128;
+    TORCH_CHECK(scales.size(0) == rows && scales.size(1) == groups, "scales (rows, cols/128)");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    rowgroup_quant_kernel<<<rows, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16 *>(in.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3 *>(out.data_ptr()),
+        scales.data_ptr<float>(), rows, groups);
+    CUDACHECK(cudaGetLastError());
+}
 } // namespace gg8
 
 /* ===================================================================== *
@@ -2794,6 +2838,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_gemm_glu", &gg::entry_glu);
     m.def("grouped_gemm_cm", &gg::entry_cm);
     m.def("grouped_gemm_fp8", &gg8::entry);
+    m.def("rowgroup_quant_fp8", &gg8::rowgroup_quant_entry);
     m.def("moe_tp_dispatch_push_gemm", &tppdisp::entry);
     m.def("moe_tp_gemm_prered_push", &preredpush::gemm_push_entry_tp);
     m.def("moe_tp_gemm_prered_push_v2", &tppr2::entry);

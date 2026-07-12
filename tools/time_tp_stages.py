@@ -88,13 +88,9 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
         def st_copy():
             s._l0_seq += 1
             s.tk.pcie_device_barrier(s.barrier_l0, s._l0_seq)
-            if s.fp8:  # 源端 1×128 量化(docs/39, 与 scheme.run 相同)
-                x = s.problem.hidden_states.view(s.num_tokens, s.H // 128, 128)
-                scale = (x.abs().amax(dim=-1, keepdim=True).float()
-                         .clamp_min(1e-8) / 448.0)
-                s.pre_tokens.data_.copy_(
-                    (x / scale).to(torch.float8_e4m3fn).view(s.num_tokens, s.H))
-                s.pre_scales.data_.copy_(scale.view(s.num_tokens, s.H // 128))
+            if s.fp8:  # 源端 1×128 量化(docs/41: 单 kernel, 与 scheme.run 相同)
+                s.tk.rowgroup_quant_fp8(s.problem.hidden_states,
+                                        s.pre_tokens.data_, s.pre_scales.data_)
             else:
                 s.pre_tokens.data_.copy_(s.problem.hidden_states)
             s._l0_seq += 1
