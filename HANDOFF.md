@@ -9,7 +9,17 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第七轮 2026-07-11·当前状态】**35/35 全过。**T=1024 异常解除且创最佳比率
+**【TP 第八轮 2026-07-12·当前状态】**39/40(唯一 FAIL=09 调优本体)。
+**环境干扰假说裁决=确认(外因)**:两个历史波动档同 session 重复全部一致到 0.1%,
+双峰三轮游走+serial 中招+clocks 取证(GPU0 被别人占 59.9GB)收口;报数纪律改为
+"med 为准,出双峰当轮重跑取重复一致值"。全档复现第七轮:1.16×/1.20×/1.10×/
+1.07×(RB64)/1.01×,comm 拐点 24 三连庄。**TP-T3 v1 尸检:ray 在共享机上卡死
+RegisterClient 2.5h 被 SIGTERM,零 trial,serial_tuned≡serial;triton import
+报错是良性噪音**。已重写 v2:`tools/tune_moe_tp_noray.py`(无 ray、subprocess
+4 卡分片、monkeypatch 注入+自证、smem 预过滤 1920→648、E∈{64,128,256} 三档),
+step 09 升级(smoke 先行 + tuned serial 全网格复测 + 09v 自动裁决)。
+**下一步:重跑 `TUNE=1 bash tools/run_tp_all.sh` 拿 tuned serial 报终数**。docs/28。
+**【TP 第七轮(历史)】**35/35 全过。**T=1024 异常解除且创最佳比率
 (4199 vs 5021 = 1.20×)**;NE=64 2264(1.16×)、NE=128 1.11×。双峰漂移(上轮 t1024→本轮
 ne256_rb64,且 serial_t256 也离群)→ **环境干扰假说**(min 恰等稳定轮值);已加取证:每步
 clocks 快照 + 波动档同 session 重复跑,下轮裁决。**TP-T3 调优脚本就绪**(tools/
@@ -192,5 +202,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/25** | **TP 第五轮:首次超 serial(1.11~1.15×,docs/20 修复兑现-35%);push 冻结归因(GEMM-bound+scatter 粒度);NE=256 padding→RB64、comm_sms 拐点、预期账对数与微基准外推教训** |
 | **docs/26** | **TP 第六轮:comm 拐点=24 确认、RB64 翻盘 NE=256(1.07×)、首份分阶段归因(GEMM 1486µs/sched 277 最大可压项/理论地板 1900µs);T=1024 双峰异常待裁决** |
 | **docs/27** | **TP 第七轮:T=1024 解除(1.20× 最佳)、双峰漂移+serial 离群→环境干扰假说与取证(clocks_per_step/重复跑);TP-T3 调优脚本就绪(TUNE=1);报数纪律(波动档看 min+重复一致性)** |
+| **docs/28** | **TP 第八轮:环境假说裁决=确认(外因,重复跑全一致+clocks 取证);TP-T3 v1 尸检(ray 卡死 RegisterClient 2.5h 零 trial)与 v2 无 ray 重写(subprocess 分片/注入自证/smem 预过滤/E 三档);step 09 全网格+自动裁决** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |
