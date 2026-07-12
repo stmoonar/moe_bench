@@ -9,7 +9,17 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第十四轮 2026-07-12·测量轮待跑】**GRP=16 兑现大头(L1_fused 1294→786,
+**【TP 第十五轮 2026-07-12·当前状态】**测量轮裁决:**小预算假设证伪**
+(cs_l1 2/4/8/16/24 = 2223/2224/2216/2200/2171,单调反向;08c 显示尾部
+wire 全暴露)。**L1 N 维分解定案为负结果,TK_L1 默认回 v1**(e2e 2116)。
+根因是平台差异(docs/35):本机 L1 GEMM SM-bound,重叠是 SM 零和,v1 的
+"全速 GEMM+全员后排空"已把 wire 藏进高并行尾巴;Comet 的 N 维分解成立的
+前提是通信不占 SM(NVLink/copy engine),PCIe+SM 推送平台不成立——对
+sm120 移植是一手平台事实。v2 代码/门保留(TK_L1=v2,03l/04l/08l 已翻转为
+v2 对照)。stages 新增 L1_gemm_nb(86 块纯算)下轮裁决 L1 是否关账。
+**主攻切换:sched ~268(v1 含 job_order)、L0 暴露 ~200、tok_copy 并入
+L0**。下一步:FOCUS=1 跑默认回归 + nb 分解。docs/35。
+**【TP 第十四轮(历史·测量轮)】**GRP=16 兑现大头(L1_fused 1294→786,
 −508µs),cm 探针判换序无罪(+12µs);但 **v2 2174 仍比 v1 2116 差 +58**。
 关键洞察(docs/34):L1 GEMM 是 SM-bound → **通算重叠在 SM 维度是零和,真能
 藏的只有 PCIe 线上时间;v1 的"GEMM 全速+全员后排空"已接近该结构最优**。v2
@@ -282,5 +292,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/32** | **TP 第十二轮计划:L1 combine 按 N 维分解(Comet layer1-N;M 维九成 job 拖到 GEMM 尾的结构病);tppr2 = 列外层 dispenser + 列扫聚合信号 + (token,chunk) push;协议净简化(删 per-job wait/job_order);风险=1KB push 效率与 L2 复用** |
 | **docs/33** | **TP 第十三轮:L1 v2 首测回退归因(job=1token×1KB 的 wait 串行,延迟暴露 16384 次,L1_fused 691→1294;sched −35 兑现)与 GRP=16 组批修复(同目的卡连续行,16 TMA 一次 wait);grouped_gemm_cm 探针分离换序/协议代价** |
 | **docs/34** | **TP 第十四轮:GRP 兑现(786)、换序无罪(+12);L1 零和洞察(GEMM SM-bound → 重叠只藏得住 wire,v1 全员后排空近最优);v2 翻盘自由度=压小 TK_COMM_SMS_L1(列扫聚合无需守望者);测量轮 05b{2,4,8,16}+08c 与裁决树** |
+| **docs/35** | **TP 第十五轮:小预算证伪(单调反向)→ L1 N 维分解定案负结果,v1 回默认;平台差异沉淀(Comet-N 成立前提=通信不占 SM,PCIe+SM 推送平台零和);L1_gemm_nb 探针;主攻切 sched/L0/tok_copy** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |

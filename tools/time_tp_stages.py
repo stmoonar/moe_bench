@@ -54,8 +54,13 @@ def _worker(rank, world, init_method, ne, iters, tokens):
     ref_task_next = torch.zeros(1, dtype=torch.int32, device=device)
 
     stages = ["sched", "tok_copy", "L0_fused", "silu", "L1_fused", "final_red",
-              "L0_gemm_alone", "L1_gemm_alone", "L1_gemm_cm", "full_run"]
+              "L0_gemm_alone", "L1_gemm_alone", "L1_gemm_cm", "L1_gemm_nb",
+              "full_run"]
     acc = {k: 0.0 for k in stages}
+    # L1 GEMM 在 "让出 comm 块后的块数" 下的纯算参考(docs/35): 把 L1_fused
+    # 分解为 "GEMM@(sm-comm) + 真实排空尾", 裁决 L1 还有没有肉。
+    nb_blocks = torch.cuda.get_device_properties(device).multi_processor_count \
+        - s.num_comm_sms_l1
 
     def timed(key, fn):
         dist.barrier()
@@ -167,6 +172,8 @@ def _worker(rank, world, init_method, ne, iters, tokens):
             s.tk.grouped_gemm_cm(s.act, s.w2, ref_expout, s.padded,
                                  s.blk_expert, ref_task_next, 0)
         timed("L1_gemm_cm", st_l1_cm)
+        timed("L1_gemm_nb", lambda: s.tk.grouped_gemm_nb(
+            s.act, s.w2, ref_expout, s.padded, 0, nb_blocks))
 
         timed("full_run", s.run)
 
@@ -186,6 +193,8 @@ def _worker(rank, world, init_method, ne, iters, tokens):
         print(f"  -> L1 exposure {l0['L1_fused'] - l0['L1_gemm_alone']:10.1f}")
         print(f"  -> L1 exp(vs cm){l0['L1_fused'] - l0['L1_gemm_cm']:9.1f}"
               f"  (cm-rm delta {l0['L1_gemm_cm'] - l0['L1_gemm_alone']:+.1f})")
+        print(f"  -> L1 tail(vs nb@{nb_blocks}){l0['L1_fused'] - l0['L1_gemm_nb']:6.1f}"
+              f"  (SM-yield {l0['L1_gemm_nb'] - l0['L1_gemm_alone']:+.1f})")
         print(f"  -> stage sum   {sum(l0[k] for k in stages[:6]):10.1f} "
               f"(vs full_run {l0['full_run']:.1f})")
     dist.destroy_process_group()

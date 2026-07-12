@@ -169,7 +169,7 @@ else
     run_step 03_correct_ne64            600 python -m moe_bench.tools.run_tktp 64  --iters 10
     run_step 03g_correct_ne64_gluoff 600 env TK_L0_GLU=0 python -m moe_bench.tools.run_tktp 64 --iters 10
     run_step 03o_correct_ne64_l0v1   600 env TK_L0=v1 python -m moe_bench.tools.run_tktp 64 --iters 10
-    run_step 03l_correct_ne64_l1v1   600 env TK_L1=v1 python -m moe_bench.tools.run_tktp 64 --iters 10
+    run_step 03l_correct_ne64_l1v2   600 env TK_L1=v2 python -m moe_bench.tools.run_tktp 64 --iters 10
     run_step 03p_correct_ne64_push 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 --iters 10
     if [ "$QUICK" != "1" ]; then
         run_step 03_correct_ne128       600 python -m moe_bench.tools.run_tktp 128 --iters 10
@@ -189,8 +189,8 @@ else
         --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_gluoff_ne64_t512.json"
     run_step 04o_bench_l0v1_512 600 env TK_L0=v1 python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_l0v1_ne64_t512.json"
-    run_step 04l_bench_l1v1_512 600 env TK_L1=v1 python -m moe_bench.tools.run_tktp 64 \
-        --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_l1v1_ne64_t512.json"
+    run_step 04l_bench_l1v2_512 600 env TK_L1=v2 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_l1v2_ne64_t512.json"
     # push 路径已冻结(docs/25: TP 是 GEMM-bound, push 无收益且 scatter 粒度受限),
     # 保留单点 bench 作回归记录
     run_step 04p_bench_push_512 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 \
@@ -256,7 +256,7 @@ else
     run_step 08_time_stages 900 python -m moe_bench.tools.time_tp_stages 64 20
     run_step 08c_time_stages_l1sms4 900 env TK_COMM_SMS_L1=4 python -m moe_bench.tools.time_tp_stages 64 20
     run_step 08o_time_stages_l0v1 900 env TK_L0=v1 python -m moe_bench.tools.time_tp_stages 64 20
-    run_step 08l_time_stages_l1v1 900 env TK_L1=v1 python -m moe_bench.tools.time_tp_stages 64 20
+    run_step 08l_time_stages_l1v2 900 env TK_L1=v2 python -m moe_bench.tools.time_tp_stages 64 20
     run_step 08p_time_stages_push 900 env TK_TP_DISPATCH=push python -m moe_bench.tools.time_tp_stages 64 20
     if [ "$QUICK" != "1" ]; then
         run_step 08_time_stages_cs8 900 env TK_COMM_SMS=8 python -m moe_bench.tools.time_tp_stages 64 20

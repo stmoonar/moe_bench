@@ -281,11 +281,12 @@ class TKFusedTP(DistributedScheme):
                        and self.l0_mode == "v2")
         # layer0 dispenser task counter, zeroed each iter (same-stream)
         self.gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
-        # docs/32: layer1 v2 = N 维分解 combine(Comet layer1-N)。W2 GEMM 换
-        # 列外层 dispenser + 列扫聚合信号,push job = (token, chunk),从 GEMM
-        # ~1/8 进度起就流推送(v1 按 M 分解,topk=8 时九成 job 拖到 GEMM 尾)。
-        # TK_L1=v1 整体回滚。
-        self.l1_mode = os.environ.get("TK_L1", "v2")
+        # docs/32~35: layer1 v2 = N 维分解 combine(Comet layer1-N)。三轮实测
+        # 后**默认回 v1**(docs/35 负结果):GRP=16 修复粒度病后 v2 仍 786 vs
+        # v1 691,小预算 sweep 单调反向 —— 本机 L1 GEMM 是 SM-bound + 后排空
+        # 全员并行已近最优,N 维分解买不回调度成本(与 Comet 的 NVLink 结论
+        # 是平台差异)。TK_L1=v2 保留可复现。
+        self.l1_mode = os.environ.get("TK_L1", "v1")
         self.l1_gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
         # TP-T1 (docs/23): dispatch data plane. "pull" = tpdisp (weak path,
         # 23.5GB/s under 4-way concurrency, 16 comm SMs); "push" = tppdisp
