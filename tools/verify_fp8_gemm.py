@@ -33,13 +33,14 @@ def quant_a_group(x: torch.Tensor):
 
 
 def quant_w_block(w: torch.Tensor):
-    """128×128 block 量化,w (K, N) bf16 → (fp8, scales (K/128, N/128))。"""
-    K, N = w.shape
-    b = w.float().view(K // BLOCK, BLOCK, N // BLOCK, BLOCK)
+    """128×128 block 量化,w = B^T (N, K) bf16 → (fp8, scales (N/128, K/128))。
+    docs/38: kernel 用 mma_ABt,权重保持 (E, N, K) 原始布局。"""
+    N, K = w.shape
+    b = w.float().view(N // BLOCK, BLOCK, K // BLOCK, BLOCK)
     amax = b.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-8)
     scale = amax / torch.finfo(torch.float8_e4m3fn).max
     q = (b / scale).to(torch.float8_e4m3fn)
-    return q.view(K, N), scale.view(K // BLOCK, N // BLOCK).contiguous()
+    return q.view(N, K), scale.view(N // BLOCK, K // BLOCK).contiguous()
 
 
 def main():
@@ -62,7 +63,7 @@ def main():
 
     P = E * rows_e
     A_bf = torch.randn(P, K, device=device, dtype=torch.bfloat16) / 8
-    W_bf = torch.randn(E, K, N, device=device, dtype=torch.bfloat16) / 8
+    W_bf = torch.randn(E, N, K, device=device, dtype=torch.bfloat16) / 8  # B^T (E,N,K)
 
     A_q, A_s = quant_a_group(A_bf)
     Wq_list, Ws_list = zip(*[quant_w_block(W_bf[e]) for e in range(E)])
@@ -81,8 +82,8 @@ def main():
     ref = torch.empty(P, N, device=device, dtype=torch.float32)
     for e in range(E):
         w_deq = W_q[e].float() * W_s[e].repeat_interleave(BLOCK, dim=0) \
-                                      .repeat_interleave(BLOCK, dim=1)
-        ref[e * rows_e:(e + 1) * rows_e] = a_deq[e * rows_e:(e + 1) * rows_e] @ w_deq
+                                      .repeat_interleave(BLOCK, dim=1)  # (N, K)
+        ref[e * rows_e:(e + 1) * rows_e] = a_deq[e * rows_e:(e + 1) * rows_e] @ w_deq.T
 
     task_next.zero_()
     tk.grouped_gemm_fp8(A_q, A_s, W_q, W_s, out, padded, blk_expert, task_next, 0)
@@ -111,8 +112,9 @@ def main():
         task_next.zero_()
         tk.grouped_gemm_fp8(A_q, A_s, W_q, W_s, out, padded, blk_expert, task_next, 0)
 
+    W_bf_kn = W_bf.transpose(1, 2).contiguous()  # bf16 参考要 (E, K, N)
     t8 = bench(run_fp8)
-    t16 = bench(lambda: tk.grouped_gemm(A_bf, W_bf, out_bf, padded, 0))
+    t16 = bench(lambda: tk.grouped_gemm(A_bf, W_bf_kn, out_bf, padded, 0))
     fl = 2.0 * P * K * N
     print(f"[fp8 gemm] fp8 {t8:8.1f}us ({fl / t8 / 1e6:6.1f} TFLOP/s)   "
           f"bf16 {t16:8.1f}us ({fl / t16 / 1e6:6.1f} TFLOP/s)   "

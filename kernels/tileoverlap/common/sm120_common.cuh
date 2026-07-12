@@ -472,6 +472,10 @@ __device__ inline void grouped_gemm_sm120_dispenser(
  *    smem,不动 TMA expect 字节数);
  *  - 行内 scale 映射:rt 行布局 data[偶] → 行 lane/4,data[奇] → +8
  *    (global_to_register.cuh 实测确认);
+ *  - **B 用转置布局 (N, K) + mma_ABt**:TK 的 col-layout fp8 寄存器加载
+ *    路径没写完(shared_to_register.cuh 对 fp8x4 用 .x/.y,编译不过),
+ *    而 row-layout 走 ldmatrix 是通的;mma_ABt 的 fp8 特化在 SM120 齐全。
+ *    副作用是好事:权重保持 w1 的原始 (E, N, K) 布局,免转置;
  *  - 输出 fp32 累加器 → 现有 store policy(plain / glu)直接复用。
  * ======================================================================== */
 
@@ -488,7 +492,7 @@ struct gemm_config_fp8 {
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
     using A_tile = st_fp8e4m3<ROW_BLOCK, RED_BLOCK>; // 8KB (RB=128)
-    using B_tile = st_fp8e4m3<RED_BLOCK, COL_BLOCK>; // 8KB
+    using B_tile = st_fp8e4m3<COL_BLOCK, RED_BLOCK>; // 8KB, B^T (N-major)
 
     struct pipeline_inputs {
         A_tile A;
@@ -501,9 +505,9 @@ struct gemm_config_fp8 {
 /**
  * FP8 dispenser grouped GEMM。Globals 额外要求(duck-typed):
  *   G.activations : gl<fp8e4m3, 1, 1, -1(rows), -1(K), cfg8::A_tile>
- *   G.weights     : gl<fp8e4m3, 1, -1(E), -1(K), -1(N), cfg8::B_tile>
+ *   G.weights     : gl<fp8e4m3, 1, -1(E), -1(N), -1(K), cfg8::B_tile>  (B^T)
  *   G.a_scales    : gl<float, 1, 1, -1(rows), -1(K/128)>
- *   G.w_scales    : gl<float, 1, -1(E), -1(K/128), -1(N/128)>
+ *   G.w_scales    : gl<float, 1, -1(E), -1(N/128), -1(K/128)>
  * 其余(gate/epilogue/store/blk_expert/task_next)与 bf16 dispenser 相同。
  */
 template <bool COL_MAJOR = false, typename Globals, typename Gate, typename Epilogue, typename Store>
@@ -539,7 +543,8 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
     const int warp_id = kittens::warpid();
     const int lane_id = kittens::laneid();
     const int num_iters = static_cast<int>(G.activations.cols()) / cfg::RED_BLOCK;
-    const int col_blocks = static_cast<int>(G.weights.cols()) / cfg::COL_BLOCK;
+    // B^T 布局: weights (E, N, K) -> N 在 rows 维
+    const int col_blocks = static_cast<int>(G.weights.rows()) / cfg::COL_BLOCK;
     constexpr int STEPS_PER_SCALE = cfg::SCALE_K / cfg::RED_BLOCK;  // 2
     int stage = 0;
     uint32_t phasebits = 0xFFFF0000;
@@ -569,7 +574,8 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
                     update_phasebit<1>(phasebits, stage);
                     tma::expect_bytes(inputs_arrived[stage], sizeof(typename cfg::pipeline_inputs));
                     tma::load_async(inputs[stage].A, G.activations, {row_idx, red_idx}, inputs_arrived[stage]);
-                    tma::load_async(inputs[stage].B, G.weights, {e, red_idx, col_idx}, inputs_arrived[stage]);
+                    // B^T: (E, N, K) 布局, tile 坐标 {N 块, K 块}
+                    tma::load_async(inputs[stage].B, G.weights, {e, col_idx, red_idx}, inputs_arrived[stage]);
                     stage = (stage + 1) % cfg::PIPELINE_STAGES;
                 }
                 q = (q + 1) % TASK_Q;
@@ -603,10 +609,12 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
                     rt_fp8e4m3<16, cfg::MMA_K> a_reg;
                     auto a_sub = inputs[stage].A.template subtile<16, cfg::MMA_K>({store_strip, kk});
                     warp::load(a_reg, a_sub);
-                    rt_fp8e4m3<cfg::MMA_K, cfg::COL_BLOCK, ducks::rt_layout::col> b_reg;
-                    auto b_sub = inputs[stage].B.template subtile<cfg::MMA_K, cfg::COL_BLOCK>({kk, 0});
+                    // B^T 行布局加载(ldmatrix 路径; col-layout fp8 加载在 TK
+                    // 里没写完), mma_ABt 的 fp8 特化做 (M,K)x(N,K)^T
+                    rt_fp8e4m3<cfg::COL_BLOCK, cfg::MMA_K> b_reg;
+                    auto b_sub = inputs[stage].B.template subtile<cfg::COL_BLOCK, cfg::MMA_K>({0, kk});
                     warp::load(b_reg, b_sub);
-                    warp::mma_AB(sub, a_reg, b_reg, sub);
+                    warp::mma_ABt(sub, a_reg, b_reg, sub);
                 }
                 warp::arrive(inputs_finished[stage]);
                 stage = (stage + 1) % cfg::PIPELINE_STAGES;
@@ -614,7 +622,7 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
                 // 量化块(K=128)边界: fp32 重标定并入主累加器
                 if ((red_idx % STEPS_PER_SCALE) == STEPS_PER_SCALE - 1) {
                     const int kblk = red_idx / STEPS_PER_SCALE;
-                    const float bsc = G.w_scales[{e, kblk, col_idx}];
+                    const float bsc = G.w_scales[{e, col_idx, kblk}];  // (E, N/128, K/128)
                     const float s0 = G.a_scales[{r0, kblk}] * bsc;
                     const float s1 = G.a_scales[{r0 + 8, kblk}] * bsc;
                     #pragma unroll

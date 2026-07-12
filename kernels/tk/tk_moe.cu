@@ -208,15 +208,18 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
            const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
            at::Tensor &task_next, const int expert_offset) {
     using cfg = gemm_config_fp8;
+    // 布局(docs/38): weights = B^T (E, N, K)(w1 原始布局, 免转置),
+    // w_scales (E, N/128, K/128); mma_ABt + row-layout 加载。
     TORCH_CHECK(inputs.size(0) % cfg::ROW_BLOCK == 0, "tokens % ROW_BLOCK");
     TORCH_CHECK(inputs.size(1) % cfg::SCALE_K == 0, "K % 128 (scale blocks)");
-    TORCH_CHECK(weights.size(2) % cfg::COL_BLOCK == 0, "N % 128");
+    TORCH_CHECK(weights.size(2) == inputs.size(1), "weights must be (E, N, K), K match");
+    TORCH_CHECK(weights.size(1) % cfg::COL_BLOCK == 0, "N % 128");
     TORCH_CHECK(a_scales.size(0) == inputs.size(0) &&
                 a_scales.size(1) == inputs.size(1) / cfg::SCALE_K,
                 "a_scales must be (rows, K/128)");
-    TORCH_CHECK(w_scales.size(1) == weights.size(1) / cfg::SCALE_K &&
-                w_scales.size(2) == weights.size(2) / cfg::COL_BLOCK,
-                "w_scales must be (E, K/128, N/128)");
+    TORCH_CHECK(w_scales.size(1) == weights.size(1) / cfg::COL_BLOCK &&
+                w_scales.size(2) == weights.size(2) / cfg::SCALE_K,
+                "w_scales must be (E, N/128, K/128)");
     TORCH_CHECK(task_next.numel() == 1, "task_next must be a single int counter");
     globals G {
         .activations = kittens::py::tensor_to_gl<globals::activations_gl>(const_cast<at::Tensor&>(inputs)),
@@ -230,7 +233,7 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     };
     const int nblk = static_cast<int>(inputs.size(0)) / cfg::ROW_BLOCK;
     TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
-    const int num_tasks = nblk * (static_cast<int>(weights.size(2)) / cfg::COL_BLOCK);
+    const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;
