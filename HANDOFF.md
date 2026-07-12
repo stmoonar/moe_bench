@@ -9,7 +9,20 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第十五轮 2026-07-12·当前状态】**测量轮裁决:**小预算假设证伪**
+**【FP8 阶段启动 2026-07-12·分支 fp8_tp·当前状态】**bf16 阶段收官
+(1.21×/1.33×),15 轮经验整理进 **docs/36**(平台事实/调度结构/协议/
+方法论/负结果五类)。fp8 方案:token 1×128 group + weight 128×128 block
+(DeepSeek 式);harness 现成度高(Precision.FP8/per_block_cast/vllm w8a8
+serial/fp8-aware reference 全在位)。**收益分析(docs/37)**:我方 GEMM 2×
++ AG 字节减半(serial 的 AG 不减半)→ e2e 2116→~1500,预期比率 1.25-1.4×。
+关键设计:K-stage 从 64 提到 128(fp8 tile 16KB×2×3 stage=96KB 贴预算,
+每 stage 恰好一个 scale 块,per-stage fp32 重标定);GLU 列交织下权重量化
+在交织后布局上做(scale 块对齐 tile);push/combine 保持 bf16(协议零
+改动)。**P0 已落**:run_tktp --precision fp8 + 脚本 03f/04f serial fp8
+基线步。**下一步:FOCUS 跑 P0 定标 serial fp8**
+(`STEPS='^00_|^01_|^03f_|^04f_|^04_bench' bash tools/run_tp_all.sh`),
+然后 P1(grouped_gemm_sm120_fp8 单卡对拍)。docs/36/37。
+**【TP 第十五轮(历史·bf16 收官)】**测量轮裁决:**小预算假设证伪**
 (cs_l1 2/4/8/16/24 = 2223/2224/2216/2200/2171,单调反向;08c 显示尾部
 wire 全暴露)。**L1 N 维分解定案为负结果,TK_L1 默认回 v1**(e2e 2116)。
 根因是平台差异(docs/35):本机 L1 GEMM SM-bound,重叠是 SM 零和,v1 的
@@ -293,5 +306,7 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/33** | **TP 第十三轮:L1 v2 首测回退归因(job=1token×1KB 的 wait 串行,延迟暴露 16384 次,L1_fused 691→1294;sched −35 兑现)与 GRP=16 组批修复(同目的卡连续行,16 TMA 一次 wait);grouped_gemm_cm 探针分离换序/协议代价** |
 | **docs/34** | **TP 第十四轮:GRP 兑现(786)、换序无罪(+12);L1 零和洞察(GEMM SM-bound → 重叠只藏得住 wire,v1 全员后排空近最优);v2 翻盘自由度=压小 TK_COMM_SMS_L1(列扫聚合无需守望者);测量轮 05b{2,4,8,16}+08c 与裁决树** |
 | **docs/35** | **TP 第十五轮:小预算证伪(单调反向)→ L1 N 维分解定案负结果,v1 回默认;平台差异沉淀(Comet-N 成立前提=通信不占 SM,PCIe+SM 推送平台零和);L1_gemm_nb 探针;主攻切 sched/L0/tok_copy** |
+| **docs/36** | **bf16 阶段经验总结(15 轮):平台事实/调度结构(消费序对齐、转岗、GLU 融合、组批粒度)/PCIe 协议三件套/方法论(公平口径、归因探针、A/B 阶梯、FOCUS)/负结果(Comet-N、push、sched 合并)** |
+| **docs/37** | **FP8 路径收益分析与计划(分支 fp8_tp):token 1×128 + weight 128×128;e2e 预估 ~1500(1.25-1.4×);K-stage=128 对齐 scale 块、交织后量化、push/combine 保 bf16;P0 定标→P1 GEMM→P2 L0→P3 L1→P4 调优** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |

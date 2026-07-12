@@ -4,6 +4,7 @@ argparse (vllm FlexibleArgumentParser mangles argv here). Mirror of run_tkfused.
 
   python -m moe_bench.tools.run_tktp  <num_experts>  [--no-verify] [--iters N]
       [--dist balanced|uniform|skewed] [--tokens T] [--scheme tktp|serial]
+      [--precision bf16|fp8]   # fp8 = w8a8 block [128,128](docs/37, 分支 fp8_tp)
 
 Prints per-token latency + rel_err (harness verifies vs reference_moe through
 the full logical weight set automatically unless --no-verify).
@@ -29,9 +30,10 @@ def main():
     tokens = _arg("--tokens", 512, int)
     scheme = _arg("--scheme", "tktp")
     json_out = _arg("--json", None)
+    precision = Precision(_arg("--precision", "bf16"))
     cfg = MoEBenchConfig(
         hidden_size=4096, intermediate_size=3072, num_experts=ne, topk=8,
-        parallel_mode=ParallelMode.TP, world_size=4, precision=Precision.BF16,
+        parallel_mode=ParallelMode.TP, world_size=4, precision=precision,
         num_tokens=[tokens], routing=RoutingConfig(distribution=Distribution(dist)),
         distributed=True, warmup_iters=5, bench_iters=biter, use_cuda_graph=False,
         seed=0, verify=verify, device="cuda", output_json=json_out)

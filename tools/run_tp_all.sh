@@ -195,6 +195,15 @@ else
     # 保留单点 bench 作回归记录
     run_step 04p_bench_push_512 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_push_ne64_t512.json"
+    # ---------- 4f. FP8 serial 基线(docs/37 P0: 先定标, 再写 kernel) ----------
+    run_step 03f_correct_serial_fp8 600 python -m moe_bench.tools.run_tktp 64 \
+        --scheme serial --precision fp8 --iters 10
+    run_step 04f_bench_serial_fp8_512 600 python -m moe_bench.tools.run_tktp 64 \
+        --scheme serial --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/serial_fp8_ne64_t512.json"
+    run_step 04f_bench_serial_fp8_t1024 600 python -m moe_bench.tools.run_tktp 64 \
+        --scheme serial --precision fp8 --no-verify --iters 30 --tokens 1024 \
+        --json "$JSONS/serial_fp8_t1024.json"
 
     if [ "$QUICK" != "1" ]; then
         # ---------- 5. comm SM 预算 sweep（docs/30: v2 下 comm 块会转岗,
