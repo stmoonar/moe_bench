@@ -9,7 +9,17 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第十二轮 2026-07-12·待实测】**用户点破 + experience/02 §2 印证:L1
+**【TP 第十三轮 2026-07-12·待实测】**L1 v2 首测(083157)48/48 正确但**性能
+回退 +556µs(2675 vs v1 2119)**:协议对、粒度错——job=1 token×1KB,每 job
+一次 TMA+wait 串行化,PCIe 延迟暴露 16384 次,L1_fused 691→1294;sched 删
+job_order 兑现 −35(233)。**已修复:GRP=16 组批推送**(j 编号天然目的卡
+优先,连续 16 个 j 同卡且行连续 → 一个 job 归约 16×512 列段,背靠背 16 个
+TMA 一次 wait,延迟摊薄 16 倍,job 数 16384→1024);新增 `grouped_gemm_cm`
+探针(列外层纯算参考),stages 报 cm-rm delta 分离"换序代价 vs 协议代价"。
+预期 L1_fused→~600-700,e2e ~2000-2100。教训入 docs/33:**工作粒度 = 能触发
+一次高效通信的最小单位(docs/02 §3),1KB/次的 wait 串行是反模式**。
+下一步:bash tools/run_tp_all.sh。docs/33。
+**【TP 第十二轮(历史·粒度病已修)】**用户点破 + experience/02 §2 印证:L1
 combine 的可分解维度是 **N(输出列)**,v1 按 M 分解(job=token,等 max slot)
 在 topk=8 下九成 job 拖到 GEMM 尾 ~11% 才解锁——这才是 L1 暴露 186µs 的真身。
 已落地 **L1 v2(tppr2,TK_L1=v2 默认/v1 回滚)**:①W2 GEMM 列外层 dispenser
@@ -260,5 +270,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/30** | **TP 第十轮:通信拖慢计算定量账(L0 +254µs=纯 SM 让渡/L1 +190 中 48 是协议尾);L0 v2 dispenser+comm 转岗、SwiGLU 融合(列交织+fp32 epilogue)、sched 单 all_gather、L1 独立 comm 预算;回滚开关 TK_L0/TK_L0_GLU/TK_COMM_SMS_L1** |
 | **docs/31** | **TP 第十一轮:三刀兑现 1.24×/1.32×;A/B 阶梯定价(转岗 −68/GLU −83);comm 曲线右翼变平=转岗旁证;L1 减 SM 证伪;sched 合并反 +20µs(strided copy 账);剩余:sched 第二刀、L1 反向转岗** |
 | **docs/32** | **TP 第十二轮计划:L1 combine 按 N 维分解(Comet layer1-N;M 维九成 job 拖到 GEMM 尾的结构病);tppr2 = 列外层 dispenser + 列扫聚合信号 + (token,chunk) push;协议净简化(删 per-job wait/job_order);风险=1KB push 效率与 L2 复用** |
+| **docs/33** | **TP 第十三轮:L1 v2 首测回退归因(job=1token×1KB 的 wait 串行,延迟暴露 16384 次,L1_fused 691→1294;sched −35 兑现)与 GRP=16 组批修复(同目的卡连续行,16 TMA 一次 wait);grouped_gemm_cm 探针分离换序/协议代价** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |

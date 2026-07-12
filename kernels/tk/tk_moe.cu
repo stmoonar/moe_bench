@@ -108,6 +108,41 @@ void kernel_glu(const __grid_constant__ globals G, const int *__restrict__ blk_e
                                  glu_store_policy<globals::outputs_gl>{G.outputs},
                                  blk_expert, task_next, num_tasks);
 }
+// 列外层 dispenser GEMM 的纯算参考(docs/33): 隔离 "列外层换序对 GEMM 本身
+// 的代价"(L2 复用模式变化)与 "推送协议的代价" —— L1 v2 归因的对照组。
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void kernel_cm(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+               int *__restrict__ task_next, const int num_tasks) {
+    grouped_gemm_sm120_dispenser<true>(G, no_gate{}, noop_epilogue{},
+                                       plain_store_policy<globals::outputs_gl>{G.outputs},
+                                       blk_expert, task_next, num_tasks);
+}
+void entry_cm(const at::Tensor &inputs, const at::Tensor &weights, at::Tensor &outputs,
+              const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
+              at::Tensor &task_next, const int expert_offset) {
+    TORCH_CHECK(inputs.size(0) % gemm_config::ROW_BLOCK == 0, "tokens % 128");
+    TORCH_CHECK(inputs.size(1) % gemm_config::RED_BLOCK == 0, "K % 64");
+    TORCH_CHECK(weights.size(2) % gemm_config::COL_BLOCK == 0, "N % 128");
+    TORCH_CHECK(task_next.numel() == 1, "task_next must be a single int counter");
+    globals G {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(inputs),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = static_cast<int>(weights.size(0)),
+        .expert_offset = expert_offset
+    };
+    const int nblk = static_cast<int>(inputs.size(0)) / gemm_config::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
+    const int num_tasks = nblk * (static_cast<int>(weights.size(2)) / gemm_config::COL_BLOCK);
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel_cm, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel_cm<<<sm, gemm_config::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks);
+    CUDACHECK(cudaGetLastError());
+}
 void entry_glu(const at::Tensor &inputs, const at::Tensor &weights, at::Tensor &outputs,
                const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
                at::Tensor &task_next, const int expert_offset) {
@@ -2291,50 +2326,54 @@ struct colsweep_epilogue {
                          :: "l"(&G.barrier[G.dev_idx][{1, col_idx}]), "r"(G.seq) : "memory");
     }
 };
-// push job (token j, chunk c): 等该 chunk 的 CHUNK_CB 个列扫就绪, fp32
-// 加权归约 TOP_K 行的列段到 smem, TMA 推到源卡 staging 行内偏移 c, 选举
-// 与 v1 相同(expected × NCHUNKS)。
-__device__ inline void push_job_chunk(const globals &G, const int idx) {
-    if (idx >= G.num_jobs * globals::NCHUNKS) return;
-    const int c = idx / G.num_jobs;
-    const int j = idx - c * G.num_jobs;
+// push job = (chunk c, 16-token 组 g)(docs/33 修复: 第十二轮首测 job 粒度
+// 1 token×1KB, 每 job 一次 TMA+wait 串行化 -> 每块仅 1 个 1KB 写在飞,
+// PCIe 延迟被暴露 16384 次, L1_fused 691->1294)。关键: j = src_dev*T +
+// src_tok 天然目的卡优先, 连续 GRP 个 j 同目的卡且目的行连续 -> 一个 job
+// 归约 GRP 个 token 的列段(GRP KB smem), 背靠背发 GRP 个 TMA 再等一次,
+// 延迟摊薄 GRP 倍, job 数回到 (world*T/GRP)*NCHUNKS = 1024。
+// (docs/02 §3: 工作粒度 = 能触发一次高效通信的最小单位。)
+static constexpr int GRP = 16;   // tokens per push job; 需 T % GRP == 0
+__device__ inline void push_group(const globals &G, const int idx) {
+    const int ngroups = G.num_jobs / GRP;
+    if (idx >= ngroups * globals::NCHUNKS) return;
+    const int c = idx / ngroups;
+    const int g = idx - c * ngroups;
+    const int j0 = g * GRP;
     constexpr int VEC = 8, CVEC = globals::CHUNK_COLS / VEC;
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
-    typename globals::chunk_vec &row = al.allocate<typename globals::chunk_vec>();
-    __shared__ int s_slot[globals::TOP_K];
-    __shared__ float s_w[globals::TOP_K];
-    __shared__ int s_s, s_t, s_has;
+    typename globals::chunk_vec (&rows)[GRP] =
+        al.allocate<typename globals::chunk_vec, GRP>();
+    __shared__ int s_slot[GRP][globals::TOP_K];
+    __shared__ float s_w[GRP][globals::TOP_K];
+    __shared__ int s_dst, s_t0;
     if (threadIdx.x < globals::CHUNK_CB)   // 列扫聚合信号, 每列一个槽
         pcie_sync::wait_slot(G.barrier, G.dev_idx, 1,
                              c * globals::CHUNK_CB + threadIdx.x, G.seq);
-    if (threadIdx.x < globals::TOP_K) {
-        s_slot[threadIdx.x] = G.prered_slots[{j, threadIdx.x}];
-        s_w[threadIdx.x] = G.prered_w[{j, threadIdx.x}];
+    if (threadIdx.x < GRP * globals::TOP_K) {
+        const int r = threadIdx.x / globals::TOP_K;
+        const int k = threadIdx.x - r * globals::TOP_K;
+        s_slot[r][k] = G.prered_slots[{j0 + r, k}];
+        s_w[r][k] = G.prered_w[{j0 + r, k}];
     }
     if (threadIdx.x == 0) {
-        s_s = G.prered_dst[{j, 0}];
-        s_t = G.prered_dst[{j, 1}];
-        int has = 0;
-        #pragma unroll
-        for (int k = 0; k < globals::TOP_K; k++) has |= (G.prered_slots[{j, k}] >= 0);
-        s_has = has;
+        s_dst = G.prered_dst[{j0, 0}];   // 组内目的卡相同(T % GRP == 0)
+        s_t0 = G.prered_dst[{j0, 1}];
     }
     __syncthreads();
-    if (!s_has) return;  // 空 job 不推不计数(与 push_expected 口径一致)
 
-    bf16 *row_ptr = reinterpret_cast<bf16 *>(&row);
-    float4 *row_v = reinterpret_cast<float4 *>(row_ptr);
     const int col0 = c * globals::CHUNK_COLS;
-    for (int cc = threadIdx.x; cc < CVEC; cc += blockDim.x) {
+    for (int u = threadIdx.x; u < GRP * CVEC; u += blockDim.x) {
+        const int r = u / CVEC, cc = u - (u / CVEC) * CVEC;
         float acc[VEC];
         #pragma unroll
         for (int i = 0; i < VEC; i++) acc[i] = 0.0f;
         #pragma unroll
         for (int k = 0; k < globals::TOP_K; k++) {
-            const int slot = s_slot[k];
+            const int slot = s_slot[r][k];
             if (slot < 0) continue;
-            const float w = s_w[k];
+            const float w = s_w[r][k];
             const bf16 *e_row = &G.outputs[{slot, col0}];
             const float4 packed = reinterpret_cast<const float4 *>(e_row)[cc];
             const bf16_2 *pv = reinterpret_cast<const bf16_2 *>(&packed);
@@ -2347,19 +2386,30 @@ __device__ inline void push_job_chunk(const globals &G, const int idx) {
         bf16_2 res[VEC / 2];
         #pragma unroll
         for (int jj = 0; jj < VEC / 2; jj++) res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
-        row_v[cc] = *reinterpret_cast<const float4 *>(res);
+        reinterpret_cast<float4 *>(&rows[r])[cc] = *reinterpret_cast<const float4 *>(res);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        const int dst_row = G.dev_idx * G.num_source_tokens + s_t;
-        tma::store_async(G.staging[s_s], row, {dst_row, c});
-        tma::store_async_wait();
-        int old;
-        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
-                     : "=r"(old) : "l"(&G.local_cnt[{s_s}]) : "memory");
-        if (old + 1 == G.push_expected_l1[{s_s}] * globals::NCHUNKS) {
-            __threadfence_system();
-            pcie_sync::signal_slot(G.barrier, s_s, 2 + G.dev_idx, 0, G.seq);
+        int nreal = 0;
+        #pragma unroll 1
+        for (int r = 0; r < GRP; r++) {
+            int has = 0;
+            #pragma unroll
+            for (int k = 0; k < globals::TOP_K; k++) has |= (s_slot[r][k] >= 0);
+            if (!has) continue;   // 空 token 不推不计数(与 push_expected 口径一致)
+            nreal++;
+            const int dst_row = G.dev_idx * G.num_source_tokens + s_t0 + r;
+            tma::store_async(G.staging[s_dst], rows[r], {dst_row, c});
+        }
+        tma::store_async_wait();   // GRP 个 1KB 写一次性排空(延迟摊薄)
+        if (nreal) {
+            int old;
+            asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;}"
+                         : "=r"(old) : "l"(&G.local_cnt[{s_dst}]), "r"(nreal) : "memory");
+            if (old + nreal == G.push_expected_l1[{s_dst}] * globals::NCHUNKS) {
+                __threadfence_system();
+                pcie_sync::signal_slot(G.barrier, s_dst, 2 + G.dev_idx, 0, G.seq);
+            }
         }
     }
 }
@@ -2376,12 +2426,13 @@ void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_exper
         asm volatile("bar.sync 2, %0;" :: "n"(gemm_config::NUM_THREADS));  // docs/24
     }
     __shared__ int s_j;
+    const int njobs = (G.num_jobs / GRP) * globals::NCHUNKS;
     while (true) {
         if (threadIdx.x == 0) s_j = atomicAdd(job_next, 1);
         __syncthreads();
         const int idx = s_j;
-        if (idx >= G.num_jobs * globals::NCHUNKS) break;
-        push_job_chunk(G, idx);
+        if (idx >= njobs) break;
+        push_group(G, idx);
         __syncthreads();
     }
 }
@@ -2411,6 +2462,8 @@ void entry(at::Tensor &activations, at::Tensor &weights,
     TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
     TORCH_CHECK(static_cast<int>(weights.size(2)) == globals::H,
                 "L1 weights cols must be H (down projection)");
+    TORCH_CHECK(num_source_tokens % GRP == 0,
+                "T must be divisible by the push group size (GRP)");
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
     TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
     const int num_comp_sms = sm - num_comm_sms;
@@ -2464,6 +2517,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tp_dispatch_gemm", &tpdisp::entry);
     m.def("moe_tp_dispatch_gemm_v2", &tpdisp2::entry);
     m.def("grouped_gemm_glu", &gg::entry_glu);
+    m.def("grouped_gemm_cm", &gg::entry_cm);
     m.def("moe_tp_dispatch_push_gemm", &tppdisp::entry);
     m.def("moe_tp_gemm_prered_push", &preredpush::gemm_push_entry_tp);
     m.def("moe_tp_gemm_prered_push_v2", &tppr2::entry);

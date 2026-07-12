@@ -54,7 +54,7 @@ def _worker(rank, world, init_method, ne, iters, tokens):
     ref_task_next = torch.zeros(1, dtype=torch.int32, device=device)
 
     stages = ["sched", "tok_copy", "L0_fused", "silu", "L1_fused", "final_red",
-              "L0_gemm_alone", "L1_gemm_alone", "full_run"]
+              "L0_gemm_alone", "L1_gemm_alone", "L1_gemm_cm", "full_run"]
     acc = {k: 0.0 for k in stages}
 
     def timed(key, fn):
@@ -160,6 +160,14 @@ def _worker(rank, world, init_method, ne, iters, tokens):
         timed("L1_gemm_alone", lambda: s.tk.grouped_gemm(
             s.act, s.w2, ref_expout, s.padded, 0))
 
+        # 列外层换序的纯算对照(docs/33): L1 v2 的 GEMM 走 COL_MAJOR dispenser,
+        # 这里单独计时同款纯算版, 把"换序代价"与"推送协议代价"分开归因。
+        def st_l1_cm():
+            ref_task_next.zero_()
+            s.tk.grouped_gemm_cm(s.act, s.w2, ref_expout, s.padded,
+                                 s.blk_expert, ref_task_next, 0)
+        timed("L1_gemm_cm", st_l1_cm)
+
         timed("full_run", s.run)
 
     t = torch.tensor([acc[k] / iters for k in stages], device=device)
@@ -176,6 +184,8 @@ def _worker(rank, world, init_method, ne, iters, tokens):
         l0 = dict(zip(stages, t.tolist()))
         print(f"  -> L0 exposure {l0['L0_fused'] - l0['L0_gemm_alone']:10.1f}")
         print(f"  -> L1 exposure {l0['L1_fused'] - l0['L1_gemm_alone']:10.1f}")
+        print(f"  -> L1 exp(vs cm){l0['L1_fused'] - l0['L1_gemm_cm']:9.1f}"
+              f"  (cm-rm delta {l0['L1_gemm_cm'] - l0['L1_gemm_alone']:+.1f})")
         print(f"  -> stage sum   {sum(l0[k] for k in stages[:6]):10.1f} "
               f"(vs full_run {l0['full_run']:.1f})")
     dist.destroy_process_group()
