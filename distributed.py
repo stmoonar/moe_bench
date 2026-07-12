@@ -81,6 +81,10 @@ def _verify_rank(
     reference = reference_moe(golden_problem)
     output = scheme.run()  # untimed forward for the actual output
     check = verify_output(golden_problem, output, reference)
+    if not check.passed:
+        # fp8 远程排障(docs/38): 表格只有 rel_err, 失败时把 max_abs/atol/rtol
+        # 全打出来, 一次 zip 回流就能定位是量化口径差异还是真 bug。
+        print(f"  [verify rank {rank}] {check}", flush=True)
     return check.rel_err, check.passed
 
 

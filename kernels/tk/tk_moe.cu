@@ -173,6 +173,75 @@ void entry_glu(const at::Tensor &inputs, const at::Tensor &weights, at::Tensor &
 } // namespace gg
 
 /* ===================================================================== *
+ * 1b. FP8 grouped GEMM 单卡入口(docs/37 P1): A 1×128 group 量化 +
+ *     W 128×128 block 量化, dispenser 结构, 输出 bf16。
+ *     tools/verify_fp8_gemm.py 用它对拍 fp32 反量化参考并计时。
+ * ===================================================================== */
+namespace gg8 {
+struct globals {
+    using cfg = gemm_config_fp8;
+    using activations_gl = gl<fp8e4m3, 1, 1, -1, -1, cfg::A_tile>;
+    using weights_gl     = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;
+    using a_scales_gl    = gl<float, 1, 1, -1, -1>;
+    using w_scales_gl    = gl<float, 1, -1, -1, -1>;
+    using outputs_gl     = gl<bf16, 1, 1, -1, -1>;
+    using counts_gl      = gl<int, 1, 1, 1, -1>;
+    activations_gl activations;
+    weights_gl weights;
+    a_scales_gl a_scales;
+    w_scales_gl w_scales;
+    outputs_gl outputs;
+    counts_gl padded_tokens_per_expert;
+    const int num_local_experts;
+    const int expert_offset;
+};
+struct no_gate { __device__ inline void operator()(int) const {} };
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+            int *__restrict__ task_next, const int num_tasks) {
+    grouped_gemm_sm120_fp8_dispenser(G, no_gate{}, noop_epilogue{},
+                                     plain_store_policy<globals::outputs_gl>{G.outputs},
+                                     blk_expert, task_next, num_tasks);
+}
+void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
+           const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
+           const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
+           at::Tensor &task_next, const int expert_offset) {
+    using cfg = gemm_config_fp8;
+    TORCH_CHECK(inputs.size(0) % cfg::ROW_BLOCK == 0, "tokens % ROW_BLOCK");
+    TORCH_CHECK(inputs.size(1) % cfg::SCALE_K == 0, "K % 128 (scale blocks)");
+    TORCH_CHECK(weights.size(2) % cfg::COL_BLOCK == 0, "N % 128");
+    TORCH_CHECK(a_scales.size(0) == inputs.size(0) &&
+                a_scales.size(1) == inputs.size(1) / cfg::SCALE_K,
+                "a_scales must be (rows, K/128)");
+    TORCH_CHECK(w_scales.size(1) == weights.size(1) / cfg::SCALE_K &&
+                w_scales.size(2) == weights.size(2) / cfg::COL_BLOCK,
+                "w_scales must be (E, K/128, N/128)");
+    TORCH_CHECK(task_next.numel() == 1, "task_next must be a single int counter");
+    globals G {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(const_cast<at::Tensor&>(inputs)),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(const_cast<at::Tensor&>(weights)),
+        .a_scales = kittens::py::tensor_to_gl<globals::a_scales_gl>(const_cast<at::Tensor&>(a_scales)),
+        .w_scales = kittens::py::tensor_to_gl<globals::w_scales_gl>(const_cast<at::Tensor&>(w_scales)),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(const_cast<at::Tensor&>(padded_tokens_per_expert)),
+        .num_local_experts = static_cast<int>(weights.size(0)),
+        .expert_offset = expert_offset
+    };
+    const int nblk = static_cast<int>(inputs.size(0)) / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
+    const int num_tasks = nblk * (static_cast<int>(weights.size(2)) / cfg::COL_BLOCK);
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace gg8
+
+/* ===================================================================== *
  * 2. Dispatch ⊕ grouped GEMM (layer0): pull tokens from peers to local,
  *    fuse the gate (or up) GEMM. Port of tileoverlap/02.
  * ===================================================================== */
@@ -2518,6 +2587,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tp_dispatch_gemm_v2", &tpdisp2::entry);
     m.def("grouped_gemm_glu", &gg::entry_glu);
     m.def("grouped_gemm_cm", &gg::entry_cm);
+    m.def("grouped_gemm_fp8", &gg8::entry);
     m.def("moe_tp_dispatch_push_gemm", &tppdisp::entry);
     m.def("moe_tp_gemm_prered_push", &preredpush::gemm_push_entry_tp);
     m.def("moe_tp_gemm_prered_push_v2", &tppr2::entry);

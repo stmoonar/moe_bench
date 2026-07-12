@@ -9,7 +9,21 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【FP8 阶段启动 2026-07-12·分支 fp8_tp·当前状态】**bf16 阶段收官
+**【FP8 P0 定标+P1 落码 2026-07-12·分支 fp8_tp·当前状态】**P0 定标完成:
+**serial fp8 = 2074(T=512)/4030(T=1024)**,vllm triton fp8 仅 1.27× 自家
+bf16;**serial fp8 已快过我们 bf16 融合(2115)——fp8 是保住领先的必需品**。
+我方 fp8 靶:~1500(比率 ~1.38×)。⚠️ serial fp8 verify FAIL(rel_err
+1.67e-2 > tol,步骤未失败=会埋 bug):已加失败时打印完整 check(max_abs/
+atol/rtol),下轮定位是量化口径差还是真 bug。**P1 已落码待编译验证**:
+`gemm_config_fp8`(RED=64 不变,量化块 K=128=2 step,子累加器每 2 step
+fp32 重标定;scale 直读 global 不进 smem/不动 TMA expect;行映射 data偶→
+lane/4、奇→+8 已从 TK 源码确认)+ `grouped_gemm_sm120_fp8_dispenser` +
+`gg8::entry`(binding grouped_gemm_fp8)+ **tools/verify_fp8_gemm.py**
+(单卡对拍 fp32 反量化参考 rel<5e-3 + vs bf16 计时,目标 ≥1.8×)。脚本
+02f 两档(L0/L1 形状)。**下一步:
+`STEPS='^00_|^01_|^02f_' bash tools/run_tp_all.sh` 裁决 P1**;过了进 P2
+(源端 token 量化+fp8 AG+L0 集成)。docs/37。
+**【FP8 阶段启动(历史)】**bf16 阶段收官
 (1.21×/1.33×),15 轮经验整理进 **docs/36**(平台事实/调度结构/协议/
 方法论/负结果五类)。fp8 方案:token 1×128 group + weight 128×128 block
 (DeepSeek 式);harness 现成度高(Precision.FP8/per_block_cast/vllm w8a8

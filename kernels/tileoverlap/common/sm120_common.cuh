@@ -458,4 +458,185 @@ __device__ inline void grouped_gemm_sm120_dispenser(
     }
 }
 
+/* ==========================================================================
+ * 3. SM120 FP8 grouped GEMM(docs/37 P1,分支 fp8_tp)
+ *
+ * 量化方案(DeepSeek 式):A 按 1×128 group(每行每 128 个 K 一个 fp32
+ * scale),W 按 128×128 block。mma.sync m16n8k32 e4m3(experience/12)。
+ *
+ * 结构 = grouped_gemm_sm120_dispenser 的 fp8 变体:
+ *  - RED_BLOCK 仍 64(A tile 128×64 fp8 = 8KB,B 64×128 = 8KB,3 stage
+ *    48KB,smem 富余),量化块 K=128 = 2 个 red step:子累加器每 2 step
+ *    做一次 fp32 重标定 acc += sub × (a_scale[row] × w_scale[kblk,cblk]);
+ *  - scale 直接从 global 读(L2 广播,每 K 块每线程 3 个 float,不进
+ *    smem,不动 TMA expect 字节数);
+ *  - 行内 scale 映射:rt 行布局 data[偶] → 行 lane/4,data[奇] → +8
+ *    (global_to_register.cuh 实测确认);
+ *  - 输出 fp32 累加器 → 现有 store policy(plain / glu)直接复用。
+ * ======================================================================== */
+
+struct gemm_config_fp8 {
+    static constexpr int ROW_BLOCK = TK_ROW_BLOCK;
+    static constexpr int COL_BLOCK = 128;
+    static constexpr int RED_BLOCK = 64;
+    static constexpr int SCALE_K = 128;              // 量化块 K 宽 = 2 个 red step
+    static constexpr int PIPELINE_STAGES = 3;        // 3 × 16KB = 48KB
+    static constexpr int MMA_K = 32;                 // m16n8k32
+
+    static constexpr int CONSUMER_WARPS = ROW_BLOCK / 16;
+    static constexpr int NUM_WARPS = CONSUMER_WARPS + 1;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    using A_tile = st_fp8e4m3<ROW_BLOCK, RED_BLOCK>; // 8KB (RB=128)
+    using B_tile = st_fp8e4m3<RED_BLOCK, COL_BLOCK>; // 8KB
+
+    struct pipeline_inputs {
+        A_tile A;
+        B_tile B;
+    };
+
+    static constexpr int DYNAMIC_SHARED_MEMORY = PIPELINE_STAGES * sizeof(pipeline_inputs);
+};
+
+/**
+ * FP8 dispenser grouped GEMM。Globals 额外要求(duck-typed):
+ *   G.activations : gl<fp8e4m3, 1, 1, -1(rows), -1(K), cfg8::A_tile>
+ *   G.weights     : gl<fp8e4m3, 1, -1(E), -1(K), -1(N), cfg8::B_tile>
+ *   G.a_scales    : gl<float, 1, 1, -1(rows), -1(K/128)>
+ *   G.w_scales    : gl<float, 1, -1(E), -1(K/128), -1(N/128)>
+ * 其余(gate/epilogue/store/blk_expert/task_next)与 bf16 dispenser 相同。
+ */
+template <bool COL_MAJOR = false, typename Globals, typename Gate, typename Epilogue, typename Store>
+__device__ inline void grouped_gemm_sm120_fp8_dispenser(
+        const Globals &G, const Gate &gate, const Epilogue &epilogue, const Store &store,
+        const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks) {
+    using cfg = gemm_config_fp8;
+    using consumers = kittens::group<cfg::CONSUMER_WARPS>;
+
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator allocator((int*)&__shm[0]);
+    typename cfg::pipeline_inputs (&inputs)[cfg::PIPELINE_STAGES] =
+        allocator.allocate<typename cfg::pipeline_inputs, cfg::PIPELINE_STAGES>();
+
+    static constexpr int TASK_Q = 2;
+    __shared__ semaphore inputs_arrived[cfg::PIPELINE_STAGES];
+    __shared__ semaphore inputs_finished[cfg::PIPELINE_STAGES];
+    __shared__ semaphore task_ready[TASK_Q];
+    __shared__ semaphore task_done[TASK_Q];
+    __shared__ int2 task_desc[TASK_Q];
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < cfg::PIPELINE_STAGES; ++i) {
+            init_semaphore(inputs_arrived[i], 0, 1);
+            init_semaphore(inputs_finished[i], 0, cfg::CONSUMER_WARPS);
+        }
+        for (int q = 0; q < TASK_Q; ++q) {
+            init_semaphore(task_ready[q], 0, 1);
+            init_semaphore(task_done[q], 0, cfg::CONSUMER_WARPS);
+        }
+    }
+    __syncthreads();
+
+    const int warp_id = kittens::warpid();
+    const int lane_id = kittens::laneid();
+    const int num_iters = static_cast<int>(G.activations.cols()) / cfg::RED_BLOCK;
+    const int col_blocks = static_cast<int>(G.weights.cols()) / cfg::COL_BLOCK;
+    constexpr int STEPS_PER_SCALE = cfg::SCALE_K / cfg::RED_BLOCK;  // 2
+    int stage = 0;
+    uint32_t phasebits = 0xFFFF0000;
+    uint32_t qphase    = 0xFFFF0000;
+
+    if (warp_id == cfg::CONSUMER_WARPS) {
+        // ------------------------------------------------------ producer warp
+        if (lane_id == 0) {
+            const int nblk = num_tasks / col_blocks;
+            int q = 0;
+            while (true) {
+                const int t = atomicAdd(task_next, 1);
+                int row_idx = -1, col_idx = -1;
+                if (t < num_tasks) {
+                    if constexpr (COL_MAJOR) { row_idx = t % nblk; col_idx = t / nblk; }
+                    else { row_idx = t / col_blocks; col_idx = t - (t / col_blocks) * col_blocks; }
+                }
+                wait(task_done[q], get_phasebit<1>(qphase, q));
+                update_phasebit<1>(qphase, q);
+                task_desc[q] = make_int2(row_idx, col_idx);
+                warp::arrive(task_ready[q]);
+                if (row_idx < 0) break;
+                gate(row_idx);
+                const int e = blk_expert[row_idx];
+                for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    update_phasebit<1>(phasebits, stage);
+                    tma::expect_bytes(inputs_arrived[stage], sizeof(typename cfg::pipeline_inputs));
+                    tma::load_async(inputs[stage].A, G.activations, {row_idx, red_idx}, inputs_arrived[stage]);
+                    tma::load_async(inputs[stage].B, G.weights, {e, red_idx, col_idx}, inputs_arrived[stage]);
+                    stage = (stage + 1) % cfg::PIPELINE_STAGES;
+                }
+                q = (q + 1) % TASK_Q;
+            }
+        }
+    } else {
+        // ---------------------------------------------------- consumer warps
+        int q = 0;
+        while (true) {
+            wait(task_ready[q], get_phasebit<0>(qphase, q));
+            update_phasebit<0>(qphase, q);
+            const int row_idx = task_desc[q].x;
+            const int col_idx = task_desc[q].y;
+            if (row_idx < 0) break;
+            const int e = blk_expert[row_idx];
+
+            rt_fl<16, cfg::COL_BLOCK> acc;    // 重标定后的主累加器
+            rt_fl<16, cfg::COL_BLOCK> sub;    // 单个量化块(K=128)的子累加器
+            warp::zero(acc);
+            warp::zero(sub);
+            constexpr int WG = cfg::CONSUMER_WARPS;
+            const int store_strip = (WG % 4 == 0) ? (warp_id / 4 + (warp_id % 4) * (WG / 4)) : warp_id;
+            // rt 行布局: data[偶] → 行 r0, data[奇] → r0+8(global_to_register)
+            const int r0 = row_idx * cfg::ROW_BLOCK + store_strip * 16 + (lane_id >> 2);
+
+            for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                update_phasebit<0>(phasebits, stage);
+                #pragma unroll
+                for (int kk = 0; kk < cfg::RED_BLOCK / cfg::MMA_K; kk++) {
+                    rt_fp8e4m3<16, cfg::MMA_K> a_reg;
+                    auto a_sub = inputs[stage].A.template subtile<16, cfg::MMA_K>({store_strip, kk});
+                    warp::load(a_reg, a_sub);
+                    rt_fp8e4m3<cfg::MMA_K, cfg::COL_BLOCK, ducks::rt_layout::col> b_reg;
+                    auto b_sub = inputs[stage].B.template subtile<cfg::MMA_K, cfg::COL_BLOCK>({kk, 0});
+                    warp::load(b_reg, b_sub);
+                    warp::mma_AB(sub, a_reg, b_reg, sub);
+                }
+                warp::arrive(inputs_finished[stage]);
+                stage = (stage + 1) % cfg::PIPELINE_STAGES;
+
+                // 量化块(K=128)边界: fp32 重标定并入主累加器
+                if ((red_idx % STEPS_PER_SCALE) == STEPS_PER_SCALE - 1) {
+                    const int kblk = red_idx / STEPS_PER_SCALE;
+                    const float bsc = G.w_scales[{e, kblk, col_idx}];
+                    const float s0 = G.a_scales[{r0, kblk}] * bsc;
+                    const float s1 = G.a_scales[{r0 + 8, kblk}] * bsc;
+                    #pragma unroll
+                    for (int j = 0; j < acc.width; j++) {
+                        #pragma unroll
+                        for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
+                            const float s = (k & 1) ? s1 : s0;
+                            acc.tiles[0][j].data[k].x += sub.tiles[0][j].data[k].x * s;
+                            acc.tiles[0][j].data[k].y += sub.tiles[0][j].data[k].y * s;
+                        }
+                    }
+                    warp::zero(sub);
+                }
+            }
+
+            store(acc, row_idx, col_idx);
+            consumers::sync(0);
+            epilogue(row_idx, col_idx);
+            warp::arrive(task_done[q]);
+            q = (q + 1) % TASK_Q;
+        }
+    }
+}
+
 } // namespace tileoverlap

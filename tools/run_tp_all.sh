@@ -162,6 +162,9 @@ if [ "${SKIP_ALL:-0}" = "1" ] || [ ! -f "$MOE_DIR/kernels/tk/build/"tk_moe_w4_h4
 else
     # ---------- 2. 调度裁决：GPU builder vs host golden + TP 不变量 ----------
     run_step 02_verify_tp_schedule 900 python -m moe_bench.tools.verify_tp_schedule
+    # ---------- 2f. FP8 grouped GEMM 单卡裁决(docs/37 P1: 对拍 + TFLOP/s) ----------
+    run_step 02f_verify_fp8_gemm 900 python -m moe_bench.tools.verify_fp8_gemm
+    run_step 02f_verify_fp8_gemm_l1 900 python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096
 
     # ---------- 3. 正确性对拍（harness 自动 verify vs reference_moe） ----------
     # 默认路径现在是 L0 v2 + GLU(docs/30);再单独门控 v2 无 GLU 与 v1 回归,
