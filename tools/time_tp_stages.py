@@ -124,12 +124,21 @@ def _worker(rank, world, init_method, ne, iters, tokens):
             s._l1_seq += 1
             s.combine_local_cnt.zero_()
             s.job_next.zero_()
-            s.tk.moe_tp_gemm_prered_push(
-                s.act, s.w2, s.expert_out, s.padded, s.combine_staging,
-                s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
-                s.push_expected_l1, s.job_order, s.job_next, s.barrier_l1,
-                s.num_comm_sms, s.num_padded_total, s.num_tokens, s.num_jobs,
-                s._l1_seq)
+            if s.l1_mode == "v2":
+                s.l1_gemm_next.zero_()
+                s.tk.moe_tp_gemm_prered_push_v2(
+                    s.act, s.w2, s.expert_out, s.padded, s.combine_staging,
+                    s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
+                    s.push_expected_l1, s.blk_expert, s.l1_gemm_next, s.job_next,
+                    s.barrier_l1, s.num_comm_sms_l1, s.num_padded_total,
+                    s.num_tokens, s.num_jobs, s._l1_seq)
+            else:
+                s.tk.moe_tp_gemm_prered_push(
+                    s.act, s.w2, s.expert_out, s.padded, s.combine_staging,
+                    s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
+                    s.push_expected_l1, s.job_order, s.job_next, s.barrier_l1,
+                    s.num_comm_sms_l1, s.num_padded_total, s.num_tokens, s.num_jobs,
+                    s._l1_seq)
         timed("L1_fused", st_l1)
 
         timed("final_red", lambda: s.tk.moe_final_reduce_push(
@@ -158,7 +167,8 @@ def _worker(rank, world, init_method, ne, iters, tokens):
     if rank == 0:
         print(f"\n== tktp stage attribution (NE={ne}, T={tokens}, iters={iters}, "
               f"dispatch={s.dispatch_mode}, l0={s.l0_mode}"
-              f"{'+glu' if s.l0_glu else ''}, comm_sms={s.num_comm_sms}, "
+              f"{'+glu' if s.l0_glu else ''}, l1={s.l1_mode}, "
+              f"comm_sms={s.num_comm_sms}, "
               f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.num_push_sms}, "
               f"max over ranks, us) ==")
         for k, v in zip(stages, t.tolist()):

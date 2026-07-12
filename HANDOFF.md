@@ -9,7 +9,18 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第十一轮 2026-07-12·当前状态】**45/45 全过,docs/30 三刀兑现:
+**【TP 第十二轮 2026-07-12·待实测】**用户点破 + experience/02 §2 印证:L1
+combine 的可分解维度是 **N(输出列)**,v1 按 M 分解(job=token,等 max slot)
+在 topk=8 下九成 job 拖到 GEMM 尾 ~11% 才解锁——这才是 L1 暴露 186µs 的真身。
+已落地 **L1 v2(tppr2,TK_L1=v2 默认/v1 回滚)**:①W2 GEMM 列外层 dispenser
+(模板加 COL_MAJOR);②信号按列扫聚合(cb 计数满 nblk → 单信号放行整列全部
+token 的 combine,per-job wait 与 job_order 全删,job_order 移出 sched 计时);
+③push job=(token,chunk=512列/1KB),chunk-major 从 GEMM ~1/8 进度起流推;
+watermark expected×NCHUNKS,final_red 零改动。脚本加 03l/04l/08l(v1 门/A B/
+归因对照)。风险:1KB push 的 PCIe 效率(不够就 TK_L1_CHUNK_CB=8)、列外层的
+L2 复用变化。**预期 L1 暴露 186→~50-80,e2e 2125→~2000-2050;下一步:
+bash tools/run_tp_all.sh**。docs/32。
+**【TP 第十一轮(历史)】**45/45 全过,docs/30 三刀兑现:
 **主形状 NE=64/T=512 = 2125µs(1.24×),T=1024 = 3781(1.32×),NE=128 1.15×,
 NE=256(RB64) 1.10×,T=256 1.04×**。A/B 阶梯:v1 2276 → v2(dispenser+转岗)
 2208(−68)→ +GLU 2125(−83);归因:silu 109→6、L0 暴露 255→201(T=1024
@@ -248,5 +259,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/29** | **TP 第九轮:TP-T3 v2 跑通(kernel 级 3~7%)但 e2e 收益错位(仅 T=1024 兑现,主嫌查表键 M×topk 错位/次嫌赢家诅咒);v2.1 finalize 终审(键探针自校准+复审+钉死默认+端到端自证);00_reset_tuned_cfg 保口径可比** |
 | **docs/30** | **TP 第十轮:通信拖慢计算定量账(L0 +254µs=纯 SM 让渡/L1 +190 中 48 是协议尾);L0 v2 dispenser+comm 转岗、SwiGLU 融合(列交织+fp32 epilogue)、sched 单 all_gather、L1 独立 comm 预算;回滚开关 TK_L0/TK_L0_GLU/TK_COMM_SMS_L1** |
 | **docs/31** | **TP 第十一轮:三刀兑现 1.24×/1.32×;A/B 阶梯定价(转岗 −68/GLU −83);comm 曲线右翼变平=转岗旁证;L1 减 SM 证伪;sched 合并反 +20µs(strided copy 账);剩余:sched 第二刀、L1 反向转岗** |
+| **docs/32** | **TP 第十二轮计划:L1 combine 按 N 维分解(Comet layer1-N;M 维九成 job 拖到 GEMM 尾的结构病);tppr2 = 列外层 dispenser + 列扫聚合信号 + (token,chunk) push;协议净简化(删 per-job wait/job_order);风险=1KB push 效率与 L2 复用** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |

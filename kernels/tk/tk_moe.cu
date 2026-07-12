@@ -2205,6 +2205,243 @@ void final_reduce_push_entry(kittens::py::TKParallelTensor &staging, at::Tensor 
 }
 } // namespace preredpush
 
+/* ===================================================================== *
+ * 4c. TP layer1 v2: N 维分解的 combine(docs/32, Comet layer1-N 教训)。
+ *
+ * v1(gemm_push_kernel_tp)按 M 维分解 combine:job = 一个 token,就绪 =
+ * 它 TOP_K 个 slot 的行块全部算完。topk=8 时 max slot 期望在表的 ~8/9 处
+ * -> 约九成 job 拖到 GEMM 尾部才解锁,push 挤在尾巴,comm 块大部分时间
+ * 在 spin(experience/02 §2 表里 "M 维不可" 的原因: combine 对同一 token
+ * 的 topk 行归约,行与行强耦合)。
+ *
+ * v2 沿 N(输出列)分解,配套两件事:
+ *   1. W2 GEMM 换 COL_MAJOR dispenser(列外层扫描): 第 c 个列扫在
+ *      ~(c+1)/col_blocks 的 GEMM 进度处完成 —— 完整列切片提前成型;
+ *   2. 信号按列扫聚合(docs/02 §3 计数聚合): 每个 (rb,cb) tile 完成给
+ *      cb 计数器 +1,凑满 nblk 个行块 = 该列全表就绪,ONE 信号放行该列
+ *      全部 token 的 combine —— per-job 的 max-slot wait 和 job_order
+ *      排序整个删掉,协议反而更简单。
+ *   push job = (token, chunk): 归约该 token TOP_K 行的 CHUNK_COLS 列段,
+ *   TMA 推 1KB 段到源卡 staging 的行内偏移。job 序 chunk-major,
+ *   comm 块从 chunk 0 起顺次消化 —— push 从 GEMM 的 ~CHUNK_CB/32 进度
+ *   就开始流,而不是尾部倾泻。角色结构与 v1 相同(comp 块 GEMM 完
+ *   bar.sync 2 转岗入池)。watermark 选举不变,expected × NCHUNKS。
+ * ===================================================================== */
+namespace tppr2 {
+#ifndef TK_L1_CHUNK_CB
+#define TK_L1_CHUNK_CB 4
+#endif
+struct globals {
+    using cfg = gemm_config;
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    static constexpr int TOP_K = 8;
+    static constexpr int CHUNK_CB = TK_L1_CHUNK_CB;              // col blocks per push chunk
+    static constexpr int CHUNK_COLS = CHUNK_CB * cfg::COL_BLOCK; // 512 cols = 1KB bf16
+    static constexpr int NCHUNKS = H / CHUNK_COLS;
+    static_assert(H % CHUNK_COLS == 0, "H % (CHUNK_CB*COL_BLOCK) != 0");
+    using chunk_vec       = sv_bf<CHUNK_COLS>;
+    using activations_gl = gl<bf16, 1, 1, -1, -1, cfg::A_tile>;
+    using weights_gl     = gl<bf16, 1, -1, -1, -1, cfg::B_tile>;
+    using outputs_gl     = gl<bf16, 1, 1, -1, H>;
+    using counts_gl      = gl<int, 1, 1, 1, -1>;
+    using staging_pgl    = pgl<gl<bf16, 1, 1, -1, H, chunk_vec>, NUM_DEVICES, false>;
+    using dst_gl         = gl<int, 1, 1, -1, 2>;
+    using slots_gl       = gl<int, 1, 1, -1, TOP_K>;
+    using w_gl           = gl<float, 1, 1, -1, TOP_K>;
+    using cnt1d_gl       = gl<int, 1, 1, 1, -1>;
+    using barrier_pgl    = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    activations_gl activations;
+    weights_gl weights;
+    outputs_gl outputs;
+    counts_gl padded_tokens_per_expert;
+    const int num_local_experts;
+    const int expert_offset;
+    staging_pgl staging;
+    dst_gl prered_dst;
+    slots_gl prered_slots;
+    w_gl prered_w;
+    cnt1d_gl local_cnt;
+    cnt1d_gl push_expected_l1;
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int num_padded_local_tokens;
+    const int num_source_tokens;
+    const int num_jobs;        // world*T tokens; push jobs = num_jobs * NCHUNKS
+    const int num_comp_sms;
+    const int seq;
+};
+struct no_gate { __device__ inline void operator()(int) const {} };
+// 列扫聚合信号: 每个 (rb, cb) tile 完成 -> cb 计数器 +1; 满 nblk = 该列
+// 全表就绪, 单写者把 seq 盖进 barrier 行 1 列 cb(本地 gpu 序即可,
+// 跨卡的一步在 push 的 watermark 上)。barrier 行 0 = cb 计数器(每迭代
+// 清零), 行 1 = cb 就绪信号(seq 单调, 无需清)。
+struct colsweep_epilogue {
+    const globals &G;
+    const int nblk;
+    __device__ inline void operator()(int, int col_idx) const {
+        __threadfence();
+        kittens::group<gemm_config::CONSUMER_WARPS>::sync(1);
+        if (kittens::laneid() != 0 || kittens::warpid() != 0) return;
+        int done;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(done) : "l"(&G.barrier[G.dev_idx][{0, col_idx}]) : "memory");
+        if (done + 1 == nblk)
+            asm volatile("st.release.gpu.global.s32 [%0], %1;"
+                         :: "l"(&G.barrier[G.dev_idx][{1, col_idx}]), "r"(G.seq) : "memory");
+    }
+};
+// push job (token j, chunk c): 等该 chunk 的 CHUNK_CB 个列扫就绪, fp32
+// 加权归约 TOP_K 行的列段到 smem, TMA 推到源卡 staging 行内偏移 c, 选举
+// 与 v1 相同(expected × NCHUNKS)。
+__device__ inline void push_job_chunk(const globals &G, const int idx) {
+    if (idx >= G.num_jobs * globals::NCHUNKS) return;
+    const int c = idx / G.num_jobs;
+    const int j = idx - c * G.num_jobs;
+    constexpr int VEC = 8, CVEC = globals::CHUNK_COLS / VEC;
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::chunk_vec &row = al.allocate<typename globals::chunk_vec>();
+    __shared__ int s_slot[globals::TOP_K];
+    __shared__ float s_w[globals::TOP_K];
+    __shared__ int s_s, s_t, s_has;
+    if (threadIdx.x < globals::CHUNK_CB)   // 列扫聚合信号, 每列一个槽
+        pcie_sync::wait_slot(G.barrier, G.dev_idx, 1,
+                             c * globals::CHUNK_CB + threadIdx.x, G.seq);
+    if (threadIdx.x < globals::TOP_K) {
+        s_slot[threadIdx.x] = G.prered_slots[{j, threadIdx.x}];
+        s_w[threadIdx.x] = G.prered_w[{j, threadIdx.x}];
+    }
+    if (threadIdx.x == 0) {
+        s_s = G.prered_dst[{j, 0}];
+        s_t = G.prered_dst[{j, 1}];
+        int has = 0;
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) has |= (G.prered_slots[{j, k}] >= 0);
+        s_has = has;
+    }
+    __syncthreads();
+    if (!s_has) return;  // 空 job 不推不计数(与 push_expected 口径一致)
+
+    bf16 *row_ptr = reinterpret_cast<bf16 *>(&row);
+    float4 *row_v = reinterpret_cast<float4 *>(row_ptr);
+    const int col0 = c * globals::CHUNK_COLS;
+    for (int cc = threadIdx.x; cc < CVEC; cc += blockDim.x) {
+        float acc[VEC];
+        #pragma unroll
+        for (int i = 0; i < VEC; i++) acc[i] = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) {
+            const int slot = s_slot[k];
+            if (slot < 0) continue;
+            const float w = s_w[k];
+            const bf16 *e_row = &G.outputs[{slot, col0}];
+            const float4 packed = reinterpret_cast<const float4 *>(e_row)[cc];
+            const bf16_2 *pv = reinterpret_cast<const bf16_2 *>(&packed);
+            #pragma unroll
+            for (int jj = 0; jj < VEC / 2; jj++) {
+                float2 f = __bfloat1622float2(pv[jj]);
+                acc[2*jj] += w * f.x; acc[2*jj+1] += w * f.y;
+            }
+        }
+        bf16_2 res[VEC / 2];
+        #pragma unroll
+        for (int jj = 0; jj < VEC / 2; jj++) res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
+        row_v[cc] = *reinterpret_cast<const float4 *>(res);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int dst_row = G.dev_idx * G.num_source_tokens + s_t;
+        tma::store_async(G.staging[s_s], row, {dst_row, c});
+        tma::store_async_wait();
+        int old;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(old) : "l"(&G.local_cnt[{s_s}]) : "memory");
+        if (old + 1 == G.push_expected_l1[{s_s}] * globals::NCHUNKS) {
+            __threadfence_system();
+            pcie_sync::signal_slot(G.barrier, s_s, 2 + G.dev_idx, 0, G.seq);
+        }
+    }
+}
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+            int *__restrict__ gemm_next, int *__restrict__ job_next) {
+    if (blockIdx.x < G.num_comp_sms) {
+        const int col_blocks = static_cast<int>(G.weights.cols()) / gemm_config::COL_BLOCK;
+        const int nblk = G.num_padded_local_tokens / gemm_config::ROW_BLOCK;
+        grouped_gemm_sm120_dispenser<true>(
+            G, no_gate{}, colsweep_epilogue{G, nblk},
+            plain_store_policy<globals::outputs_gl>{G.outputs},
+            blk_expert, gemm_next, nblk * col_blocks);
+        asm volatile("bar.sync 2, %0;" :: "n"(gemm_config::NUM_THREADS));  // docs/24
+    }
+    __shared__ int s_j;
+    while (true) {
+        if (threadIdx.x == 0) s_j = atomicAdd(job_next, 1);
+        __syncthreads();
+        const int idx = s_j;
+        if (idx >= G.num_jobs * globals::NCHUNKS) break;
+        push_job_chunk(G, idx);
+        __syncthreads();
+    }
+}
+__global__ __launch_bounds__(256)
+void reset_kernel(const __grid_constant__ globals G) {
+    const int cb = globals::H / gemm_config::COL_BLOCK;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < cb; i += gridDim.x * blockDim.x)
+        G.barrier[G.dev_idx][{0, i}] = 0;
+}
+void entry(at::Tensor &activations, at::Tensor &weights,
+           at::Tensor &expert_outputs, at::Tensor &padded_tokens_per_expert,
+           kittens::py::TKParallelTensor &staging, at::Tensor &prered_dst,
+           at::Tensor &prered_slots, at::Tensor &prered_w, at::Tensor &local_cnt,
+           at::Tensor &push_expected_l1, at::Tensor &blk_expert,
+           at::Tensor &gemm_next, at::Tensor &job_next,
+           kittens::py::TKParallelTensor &barrier,
+           const int num_comm_sms, const int num_padded_local_tokens,
+           const int num_source_tokens, const int num_jobs, const int seq) {
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
+    TORCH_CHECK(weights.size(0) == num_local_experts,
+                "TP weights first dim must equal the FULL expert count");
+    TORCH_CHECK(num_local_experts <= gemm_config::MAX_LOCAL_EXPERTS, "too many experts");
+    TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms >= 1");
+    TORCH_CHECK(gemm_next.numel() == 1 && job_next.numel() == 1, "counters must be single ints");
+    const int nblk = num_padded_local_tokens / gemm_config::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
+    TORCH_CHECK(static_cast<int>(weights.size(2)) == globals::H,
+                "L1 weights cols must be H (down projection)");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
+    const int num_comp_sms = sm - num_comm_sms;
+    globals G {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(activations),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(expert_outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = num_local_experts, .expert_offset = 0,
+        .staging = kittens::py::parallel_tensor_to_pgl<globals::staging_pgl>(staging),
+        .prered_dst = kittens::py::tensor_to_gl<globals::dst_gl>(prered_dst),
+        .prered_slots = kittens::py::tensor_to_gl<globals::slots_gl>(prered_slots),
+        .prered_w = kittens::py::tensor_to_gl<globals::w_gl>(prered_w),
+        .local_cnt = kittens::py::tensor_to_gl<globals::cnt1d_gl>(local_cnt),
+        .push_expected_l1 = kittens::py::tensor_to_gl<globals::cnt1d_gl>(push_expected_l1),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_padded_local_tokens = num_padded_local_tokens,
+        .num_source_tokens = num_source_tokens, .num_jobs = num_jobs,
+        .num_comp_sms = num_comp_sms, .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel<<<sm, gemm_config::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), job_next.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+    reset_kernel<<<1, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace tppr2
+
 #include <torch/csrc/utils/pybind.h>
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_TK_PARALLEL_TENSOR(m);
@@ -2229,4 +2466,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_gemm_glu", &gg::entry_glu);
     m.def("moe_tp_dispatch_push_gemm", &tppdisp::entry);
     m.def("moe_tp_gemm_prered_push", &preredpush::gemm_push_entry_tp);
+    m.def("moe_tp_gemm_prered_push_v2", &tppr2::entry);
 }

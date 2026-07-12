@@ -343,7 +343,12 @@ __device__ inline void grouped_gemm_sm120(const Globals &G, const Gate &gate, co
  */
 struct noop_epilogue { __device__ inline void operator()(int, int) const {} };
 
-template <typename Globals, typename Gate, typename Epilogue, typename Store>
+/* COL_MAJOR (docs/32, the Comet layer1-N lesson): task t sweeps COLUMN-outer
+ * (all row blocks at col 0, then col 1, ...) so complete OUTPUT COLUMN SLICES
+ * materialize early — the N-decomposed combine can start after ~1/col_blocks
+ * of the GEMM instead of waiting for row blocks that finish last. Claim order
+ * == completion order either way; only the t -> (row, col) map changes. */
+template <bool COL_MAJOR = false, typename Globals, typename Gate, typename Epilogue, typename Store>
 __device__ inline void grouped_gemm_sm120_dispenser(
         const Globals &G, const Gate &gate, const Epilogue &epilogue, const Store &store,
         const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks) {
@@ -384,11 +389,15 @@ __device__ inline void grouped_gemm_sm120_dispenser(
     if (warp_id == cfg::CONSUMER_WARPS) {
         // ------------------------------------------------------ producer warp
         if (lane_id == 0) {
+            const int nblk = num_tasks / col_blocks;
             int q = 0;
             while (true) {
                 const int t = atomicAdd(task_next, 1);
-                const int row_idx = (t < num_tasks) ? t / col_blocks : -1;
-                const int col_idx = (t < num_tasks) ? t - (t / col_blocks) * col_blocks : -1;
+                int row_idx = -1, col_idx = -1;
+                if (t < num_tasks) {
+                    if constexpr (COL_MAJOR) { row_idx = t % nblk; col_idx = t / nblk; }
+                    else { row_idx = t / col_blocks; col_idx = t - (t / col_blocks) * col_blocks; }
+                }
                 // slot q free? (consumers finished the task TASK_Q rounds ago)
                 wait(task_done[q], get_phasebit<1>(qphase, q));
                 update_phasebit<1>(qphase, q);

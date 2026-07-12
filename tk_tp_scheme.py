@@ -206,9 +206,12 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     mins = tpl.min(dim=1).values
     out["pull_order"].copy_(
         torch.argsort(mins * S + torch.arange(S, device=device)).to(torch.int32))
-    out["job_order"].copy_(
-        torch.argsort(tpl.max(dim=1).values * S + torch.arange(S, device=device))
-        .to(torch.int32))
+    # L1 v2(docs/32)不再消费 job_order(列扫聚合信号取代 max-slot 就绪序),
+    # 只有 v1 路径要求重建 —— 与 push_order 同款的按需策略(docs/26)。
+    if "job_order" in out:
+        out["job_order"].copy_(
+            torch.argsort(tpl.max(dim=1).values * S + torch.arange(S, device=device))
+            .to(torch.int32))
     if "push_order" in out:
         out["push_order"].copy_(
             torch.argsort(mins.view(world_size, T), dim=1).to(torch.int32))
@@ -278,6 +281,12 @@ class TKFusedTP(DistributedScheme):
                        and self.l0_mode == "v2")
         # layer0 dispenser task counter, zeroed each iter (same-stream)
         self.gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
+        # docs/32: layer1 v2 = N 维分解 combine(Comet layer1-N)。W2 GEMM 换
+        # 列外层 dispenser + 列扫聚合信号,push job = (token, chunk),从 GEMM
+        # ~1/8 进度起就流推送(v1 按 M 分解,topk=8 时九成 job 拖到 GEMM 尾)。
+        # TK_L1=v1 整体回滚。
+        self.l1_mode = os.environ.get("TK_L1", "v2")
+        self.l1_gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
         # TP-T1 (docs/23): dispatch data plane. "pull" = tpdisp (weak path,
         # 23.5GB/s under 4-way concurrency, 16 comm SMs); "push" = tppdisp
         # (strong path 50.9GB/s, 4 SMs saturate, chunk watermarks). Default
@@ -326,9 +335,13 @@ class TKFusedTP(DistributedScheme):
                 "kpos_grid": ar % self.top_k,
                 "padded": self.padded, "tp_slots": self.tp_slots,
                 "prered_w": self.prered_w, "slack": self.slack,
-                "pull_order": self.pull_order, "job_order": self.job_order,
+                "pull_order": self.pull_order,
                 "blk_expert": self.blk_expert,
             }
+            # job_order 只有 L1 v1 消费(v2 的列扫信号取代就绪序, docs/32),
+            # 不进 v2 的计时重建 —— 同 push_order 的按需策略。
+            if self.l1_mode != "v2":
+                self._sched_out["job_order"] = self.job_order
             # push_order is only consumed by the (frozen) push dispatch — keep
             # it out of the timed per-iter rebuild on the pull path (docs/26:
             # sched is the largest single compressible slice, 277µs @ 12%).
@@ -487,14 +500,24 @@ class TKFusedTP(DistributedScheme):
         self._l1_seq += 1
         self.combine_local_cnt.zero_()
         self.job_next.zero_()
-        tk.moe_tp_gemm_prered_push(self.act, self.w2, self.expert_out, self.padded,
-                                   self.combine_staging, self.prered_dst,
-                                   self.tp_slots, self.prered_w,
-                                   self.combine_local_cnt, self.push_expected_l1,
-                                   self.job_order, self.job_next,
-                                   self.barrier_l1, self.num_comm_sms_l1,
-                                   self.num_padded_total, self.num_tokens,
-                                   self.num_jobs, self._l1_seq)
+        if self.l1_mode == "v2":
+            self.l1_gemm_next.zero_()
+            tk.moe_tp_gemm_prered_push_v2(
+                self.act, self.w2, self.expert_out, self.padded,
+                self.combine_staging, self.prered_dst, self.tp_slots,
+                self.prered_w, self.combine_local_cnt, self.push_expected_l1,
+                self.blk_expert, self.l1_gemm_next, self.job_next,
+                self.barrier_l1, self.num_comm_sms_l1, self.num_padded_total,
+                self.num_tokens, self.num_jobs, self._l1_seq)
+        else:
+            tk.moe_tp_gemm_prered_push(self.act, self.w2, self.expert_out, self.padded,
+                                       self.combine_staging, self.prered_dst,
+                                       self.tp_slots, self.prered_w,
+                                       self.combine_local_cnt, self.push_expected_l1,
+                                       self.job_order, self.job_next,
+                                       self.barrier_l1, self.num_comm_sms_l1,
+                                       self.num_padded_total, self.num_tokens,
+                                       self.num_jobs, self._l1_seq)
         tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
                                  self.recv_from, self.combine_out, self.barrier_l1,
                                  self.num_tokens, self._l1_seq)
