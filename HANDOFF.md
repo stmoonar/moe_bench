@@ -9,7 +9,17 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第十轮 2026-07-12·当前状态·待实测】**用户裁定弃 vLLM 调优线,回归自研
+**【TP 第十一轮 2026-07-12·当前状态】**45/45 全过,docs/30 三刀兑现:
+**主形状 NE=64/T=512 = 2125µs(1.24×),T=1024 = 3781(1.32×),NE=128 1.15×,
+NE=256(RB64) 1.10×,T=256 1.04×**。A/B 阶梯:v1 2276 → v2(dispenser+转岗)
+2208(−68)→ +GLU 2125(−83);归因:silu 109→6、L0 暴露 255→201(T=1024
+477→306,batch 越大回收越多)、GLU store GEMM 级零开销(969 vs 978)。
+comm 拐点仍 24 但右翼大幅变平(32: 2412→2186,转岗旁证);**TK_COMM_SMS_L1
+减 SM 假设证伪**(8/16 反慢 ~90µs,L1 comm 块是有效推流工,保持 24);
+**sched 合并 all_gather 未兑现反 +20µs**(strided copy 倒贴,packed 布局
+(2,T,K) 待微修)。剩余账:sched 267 重回最大单项、L1 暴露 186(comm 块
+spin 期帮 GEMM 的反向转岗待设计)、L0 暴露 201 刚性。docs/31。
+**【TP 第十轮(历史·已兑现)】**用户裁定弃 vLLM 调优线,回归自研
 算子。**通信拖慢计算的定量账(docs/30)**:L0 +254µs≈100% 是 SM 让渡(110/86
 模型吻合,数据等待≈0)、L1 +190µs 中 142 让渡+48 排空尾;comm_sms U 型 = 静态
 折衷,结构解法是转岗。**本轮四项落地(全带回滚开关,42 步脚本已更新)**:
@@ -237,5 +247,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/28** | **TP 第八轮:环境假说裁决=确认(外因,重复跑全一致+clocks 取证);TP-T3 v1 尸检(ray 卡死 RegisterClient 2.5h 零 trial)与 v2 无 ray 重写(subprocess 分片/注入自证/smem 预过滤/E 三档);step 09 全网格+自动裁决** |
 | **docs/29** | **TP 第九轮:TP-T3 v2 跑通(kernel 级 3~7%)但 e2e 收益错位(仅 T=1024 兑现,主嫌查表键 M×topk 错位/次嫌赢家诅咒);v2.1 finalize 终审(键探针自校准+复审+钉死默认+端到端自证);00_reset_tuned_cfg 保口径可比** |
 | **docs/30** | **TP 第十轮:通信拖慢计算定量账(L0 +254µs=纯 SM 让渡/L1 +190 中 48 是协议尾);L0 v2 dispenser+comm 转岗、SwiGLU 融合(列交织+fp32 epilogue)、sched 单 all_gather、L1 独立 comm 预算;回滚开关 TK_L0/TK_L0_GLU/TK_COMM_SMS_L1** |
+| **docs/31** | **TP 第十一轮:三刀兑现 1.24×/1.32×;A/B 阶梯定价(转岗 −68/GLU −83);comm 曲线右翼变平=转岗旁证;L1 减 SM 证伪;sched 合并反 +20µs(strided copy 账);剩余:sched 第二刀、L1 反向转岗** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |
