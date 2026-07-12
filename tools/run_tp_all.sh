@@ -205,7 +205,10 @@ else
                 --scheme tktp --no-verify --iters 30 \
                 --json "$JSONS/tktp_commsms${CS}.json"
         done
-        for CS1 in 8 16; do
+        # docs/34: L1 GEMM 是 SM-bound, v2 的列扫聚合不需要 comm 块守就绪序
+        # (v1 需要) -> v2 独有自由度是把 L1 预算压到极小, GEMM 拿满 SM,
+        # 排空靠全员转岗。扫小值找 v2 拐点。
+        for CS1 in 2 4 8 16; do
             run_step "05b_sweep_l1sms_${CS1}" 600 \
                 env TK_COMM_SMS_L1=$CS1 python -m moe_bench.tools.run_tktp 64 \
                 --scheme tktp --no-verify --iters 30 \
@@ -251,6 +254,7 @@ else
 
     # ---------- 8. 分阶段归因(docs/09 三件套: 各阶段 + GEMM-alone 对照) ----------
     run_step 08_time_stages 900 python -m moe_bench.tools.time_tp_stages 64 20
+    run_step 08c_time_stages_l1sms4 900 env TK_COMM_SMS_L1=4 python -m moe_bench.tools.time_tp_stages 64 20
     run_step 08o_time_stages_l0v1 900 env TK_L0=v1 python -m moe_bench.tools.time_tp_stages 64 20
     run_step 08l_time_stages_l1v1 900 env TK_L1=v1 python -m moe_bench.tools.time_tp_stages 64 20
     run_step 08p_time_stages_push 900 env TK_TP_DISPATCH=push python -m moe_bench.tools.time_tp_stages 64 20

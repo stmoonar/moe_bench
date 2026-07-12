@@ -9,7 +9,17 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第十三轮 2026-07-12·待实测】**L1 v2 首测(083157)48/48 正确但**性能
+**【TP 第十四轮 2026-07-12·测量轮待跑】**GRP=16 兑现大头(L1_fused 1294→786,
+−508µs),cm 探针判换序无罪(+12µs);但 **v2 2174 仍比 v1 2116 差 +58**。
+关键洞察(docs/34):L1 GEMM 是 SM-bound → **通算重叠在 SM 维度是零和,真能
+藏的只有 PCIe 线上时间;v1 的"GEMM 全速+全员后排空"已接近该结构最优**。v2
+的独有翻盘自由度 = 列扫聚合不需要常驻守望者,可把 TK_COMM_SMS_L1 压到 2~8
+(v1 砍不得,十一轮已证伪)。本轮零 kernel 改动:05b 扩扫 {2,4,8,16} + 08c
+(cs_l1=4 归因)。**下一步(~4 分钟)**:
+`STEPS='^00_|^01_|^03_correct_ne64$|^04_bench_tktp_512$|^05b_|^06_tktp_t1024$|^08_time_stages$|^08c_' bash tools/run_tp_all.sh`
+裁决树:小预算赢 → v2 定档;wire 喂不满 → 延迟选举/GRP=32;都追不平 → v1
+回默认,负结果沉淀,主攻转 sched(233)/L0 暴露(202)。docs/34。
+**【TP 第十三轮(历史·GRP 已兑现)】**L1 v2 首测(083157)48/48 正确但**性能
 回退 +556µs(2675 vs v1 2119)**:协议对、粒度错——job=1 token×1KB,每 job
 一次 TMA+wait 串行化,PCIe 延迟暴露 16384 次,L1_fused 691→1294;sched 删
 job_order 兑现 −35(233)。**已修复:GRP=16 组批推送**(j 编号天然目的卡
@@ -271,5 +281,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/31** | **TP 第十一轮:三刀兑现 1.24×/1.32×;A/B 阶梯定价(转岗 −68/GLU −83);comm 曲线右翼变平=转岗旁证;L1 减 SM 证伪;sched 合并反 +20µs(strided copy 账);剩余:sched 第二刀、L1 反向转岗** |
 | **docs/32** | **TP 第十二轮计划:L1 combine 按 N 维分解(Comet layer1-N;M 维九成 job 拖到 GEMM 尾的结构病);tppr2 = 列外层 dispenser + 列扫聚合信号 + (token,chunk) push;协议净简化(删 per-job wait/job_order);风险=1KB push 效率与 L2 复用** |
 | **docs/33** | **TP 第十三轮:L1 v2 首测回退归因(job=1token×1KB 的 wait 串行,延迟暴露 16384 次,L1_fused 691→1294;sched −35 兑现)与 GRP=16 组批修复(同目的卡连续行,16 TMA 一次 wait);grouped_gemm_cm 探针分离换序/协议代价** |
+| **docs/34** | **TP 第十四轮:GRP 兑现(786)、换序无罪(+12);L1 零和洞察(GEMM SM-bound → 重叠只藏得住 wire,v1 全员后排空近最优);v2 翻盘自由度=压小 TK_COMM_SMS_L1(列扫聚合无需守望者);测量轮 05b{2,4,8,16}+08c 与裁决树** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |
