@@ -214,6 +214,30 @@ else
     run_step 04l8_bench_l1fp8_off_512 600 env TK_L1_FP8=0 python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --precision fp8 --no-verify --iters 50 \
         --json "$JSONS/tktp_fp8_l1off_ne64_t512.json"
+    # ---------- 4c8. Copy-engine A/B(docs/43: 线上字节 0 SM, 打破零和) ----------
+    run_step 03c8_correct_tktp_fp8_ce 600 env TK_L0_CE=1 TK_L1_CE=1 \
+        python -m moe_bench.tools.run_tktp 64 --precision fp8 --iters 10
+    run_step 04c8_bench_l0ce_512 600 env TK_L0_CE=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_l0ce_ne64_t512.json"
+    run_step 04c8_bench_l1ce_512 600 env TK_L1_CE=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_l1ce_ne64_t512.json"
+    run_step 04c8_bench_bothce_512 600 env TK_L0_CE=1 TK_L1_CE=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_bothce_ne64_t512.json"
+    run_step 04c8_bench_bothce_t1024 600 env TK_L0_CE=1 TK_L1_CE=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 30 --tokens 1024 \
+        --json "$JSONS/tktp_fp8_bothce_t1024.json"
+    # CE 下 comm 块只做本地 scatter, 拐点应大幅左移 —— 重扫小值
+    for CS in 4 8 12 16; do
+        run_step "05c8_ce_commsms_${CS}" 600 \
+            env TK_L0_CE=1 TK_L1_CE=1 TK_COMM_SMS=$CS python -m moe_bench.tools.run_tktp 64 \
+            --scheme tktp --precision fp8 --no-verify --iters 30 \
+            --json "$JSONS/tktp_fp8_ce_commsms${CS}.json"
+    done
+    run_step 08c8_time_stages_fp8_ce 900 env TK_L0_CE=1 TK_L1_CE=1 \
+        python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     # ---------- 5f. fp8 comm_sms 重扫(docs/40: AG 字节减半, 拐点应左移) ----------
     for CS in 8 12 16 24; do
         run_step "05f_fp8_commsms_${CS}" 600 \

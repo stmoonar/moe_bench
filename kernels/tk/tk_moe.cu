@@ -853,7 +853,7 @@ void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_exper
         dispatch_persistent(G, blockIdx.x - G.num_comp_sms, gridDim.x - G.num_comp_sms);
         // join the GEMM pool on the DEDICATED named barrier (docs/24: barrier 0
         // is cycled with a 256-count inside the GEMM consumer group).
-        asm volatile("bar.sync 2, %0;" :: "n"(gemm_config::NUM_THREADS));
+        kittens::group<gemm_config::NUM_WARPS>::sync(2);  // TK 原语(docs/43 审计)
     }
     if constexpr (GLU) {
         grouped_gemm_sm120_dispenser(G, tpdisp::dispatch_gate{G}, noop_epilogue{},
@@ -949,6 +949,8 @@ struct globals {
     static constexpr int TOKENS_PER_BLOCK = 20;         // 20×(4096+128+pad) ≤ 96KB
     using pre_tokens_pgl  = pgl<gl<fp8e4m3, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
     using pre_scales_pgl  = pgl<gl<float, 1, 1, -1, NSC, scale_vec>, NUM_DEVICES, false>;
+    using ag_tokens_gl    = gl<fp8e4m3, 1, 1, -1, H, token_vec>;   // CE 版本地 AG 缓冲
+    using ag_scales_gl    = gl<float, 1, 1, -1, NSC, scale_vec>;
     using gathered_gl     = gl<fp8e4m3, 1, 1, -1, H, token_vec, cfg::A_tile>;
     using gscales_gl      = gl<float, 1, 1, -1, NSC, scale_vec>;
     using weights_gl      = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;   // (E, N, K)
@@ -961,6 +963,8 @@ struct globals {
     using barrier_pgl     = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
     pre_tokens_pgl pre_tokens;
     pre_scales_pgl pre_scales;
+    ag_tokens_gl ag_tokens;       // CE 版: 行 d = src_dev*T + src_tok
+    ag_scales_gl ag_scales;
     gathered_gl activations;      // gathered fp8 (LOCAL)
     gscales_gl a_scales;          // gathered scales (LOCAL, GEMM 直读)
     weights_gl weights;
@@ -992,7 +996,11 @@ struct dispatch_gate {
 };
 // 常驻 comm 块: 分波拉取 fp8 行 + scale 行(一个 mbarrier 两个 TMA),
 // 各自 scatter 到 TOP_K 个 slot; 协议与 tpdisp2 相同。
-__device__ inline void dispatch_persistent(const globals &G, const int cb_idx, const int num_cb) {
+// CE=true(docs/43): 线上字节由 copy engine 搬进本地 ag 缓冲(0 SM),
+// 这里只做本地 scatter —— 每 token 按分片 flag 放行(本地轮询)。
+template <bool CE>
+__device__ inline void dispatch_persistent(const globals &G, const int *__restrict__ flags,
+                                           const int cb_idx, const int num_cb) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
     typename globals::token_vec (&token)[globals::TOKENS_PER_BLOCK] =
@@ -1012,10 +1020,18 @@ __device__ inline void dispatch_persistent(const globals &G, const int cb_idx, c
             const int d = G.pull_order[{i}];
             const int src_dev = d / G.num_tokens;
             const int src_tok = d % G.num_tokens;
+            if constexpr (CE) {  // 分片 flag 放行(CE 完成信号, 本地轮询)
+                while (((volatile const int *)flags)[src_dev] == 0) __nanosleep(64);
+            }
             tma::expect_bytes(token_arrived[lane_id],
                               sizeof(globals::token_vec) + sizeof(globals::scale_vec));
-            tma::load_async(token[lane_id], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[lane_id]);
-            tma::load_async(scales[lane_id], G.pre_scales[src_dev], {src_tok, 0}, token_arrived[lane_id]);
+            if constexpr (CE) {
+                tma::load_async(token[lane_id], G.ag_tokens, {d, 0}, token_arrived[lane_id]);
+                tma::load_async(scales[lane_id], G.ag_scales, {d, 0}, token_arrived[lane_id]);
+            } else {
+                tma::load_async(token[lane_id], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[lane_id]);
+                tma::load_async(scales[lane_id], G.pre_scales[src_dev], {src_tok, 0}, token_arrived[lane_id]);
+            }
             wait(token_arrived[lane_id], phase);
             #pragma unroll
             for (int k = 0; k < globals::TOP_K; k++) {
@@ -1038,12 +1054,14 @@ __device__ inline void dispatch_persistent(const globals &G, const int cb_idx, c
         __syncthreads();
     }
 }
+template <bool CE>
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
-            int *__restrict__ task_next, const int num_tasks) {
+            int *__restrict__ task_next, const int num_tasks,
+            const int *__restrict__ flags) {
     if (blockIdx.x >= G.num_comp_sms) {
-        dispatch_persistent(G, blockIdx.x - G.num_comp_sms, gridDim.x - G.num_comp_sms);
-        asm volatile("bar.sync 2, %0;" :: "n"(gemm_config_fp8::NUM_THREADS));  // docs/24
+        dispatch_persistent<CE>(G, flags, blockIdx.x - G.num_comp_sms, gridDim.x - G.num_comp_sms);
+        kittens::group<gemm_config_fp8::NUM_WARPS>::sync(2);  // TK 原语(docs/43 审计)  // docs/24
     }
     grouped_gemm_sm120_fp8_dispenser(G, dispatch_gate{G}, noop_epilogue{},
                                      glu_store_policy<globals::outputs_gl>{G.outputs},
@@ -1056,12 +1074,14 @@ void reset_kernel(const __grid_constant__ globals G) {
         G.barrier[G.dev_idx][{i}] = G.slack[{i}];
 }
 void entry(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTensor &pre_scales,
+           at::Tensor &ag_tokens, at::Tensor &ag_scales, at::Tensor &flags,
            at::Tensor &gathered, at::Tensor &gathered_scales,
            at::Tensor &weights, at::Tensor &w_scales, at::Tensor &act,
            at::Tensor &padded_tokens_per_expert, at::Tensor &tp_slots,
            at::Tensor &slack, at::Tensor &pull_order, at::Tensor &blk_expert,
            at::Tensor &gemm_next, kittens::py::TKParallelTensor &barrier,
-           const int num_comm_sms, const int num_padded_local_tokens, const int num_tokens) {
+           const int num_comm_sms, const int num_padded_local_tokens, const int num_tokens,
+           const bool use_ce) {
     using cfg = gemm_config_fp8;
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
@@ -1082,6 +1102,8 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTen
     globals G {
         .pre_tokens = kittens::py::parallel_tensor_to_pgl<globals::pre_tokens_pgl>(pre_tokens),
         .pre_scales = kittens::py::parallel_tensor_to_pgl<globals::pre_scales_pgl>(pre_scales),
+        .ag_tokens = kittens::py::tensor_to_gl<globals::ag_tokens_gl>(ag_tokens),
+        .ag_scales = kittens::py::tensor_to_gl<globals::ag_scales_gl>(ag_scales),
         .activations = kittens::py::tensor_to_gl<globals::gathered_gl>(gathered),
         .a_scales = kittens::py::tensor_to_gl<globals::gscales_gl>(gathered_scales),
         .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
@@ -1104,9 +1126,17 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTen
         cfg::DYNAMIC_SHARED_MEMORY + 1024
         ? globals::TOKENS_PER_BLOCK * (sizeof(globals::token_vec) + sizeof(globals::scale_vec)) + 2048
         : cfg::DYNAMIC_SHARED_MEMORY + 1024;
-    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
-        G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks);
+    if (use_ce) {
+        CUDACHECK(cudaFuncSetAttribute(kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel<true><<<sm, cfg::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+            flags.data_ptr<int>());
+    } else {
+        CUDACHECK(cudaFuncSetAttribute(kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel<false><<<sm, cfg::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+            flags.data_ptr<int>());
+    }
     CUDACHECK(cudaGetLastError());
     const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
     reset_kernel<<<rb, 256, 0, stream>>>(G);
@@ -2373,7 +2403,7 @@ void gemm_push_kernel_tp(const __grid_constant__ globals G,
         // with a 256-thread count (producer lanes 1..31 exit the GEMM
         // immediately) — concurrent mixed-count arrivals on one barrier are
         // UB (observed as cudaErrorIllegalInstruction, round 4 / docs/24).
-        asm volatile("bar.sync 2, %0;" :: "n"(gemm_config::NUM_THREADS));
+        kittens::group<gemm_config::NUM_WARPS>::sync(2);  // TK 原语(docs/43 审计)
     }
     // Post-join (or comm block): barrier 0 is free again, __syncthreads is safe.
     __shared__ int s_j;
@@ -2741,7 +2771,7 @@ void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_exper
             G, no_gate{}, colsweep_epilogue{G, nblk},
             plain_store_policy<globals::outputs_gl>{G.outputs},
             blk_expert, gemm_next, nblk * col_blocks);
-        asm volatile("bar.sync 2, %0;" :: "n"(gemm_config::NUM_THREADS));  // docs/24
+        kittens::group<gemm_config::NUM_WARPS>::sync(2);  // TK 原语(docs/43 审计)  // docs/24
     }
     __shared__ int s_j;
     const int njobs = (G.num_jobs / GRP) * globals::NCHUNKS;
@@ -2834,6 +2864,7 @@ struct globals {
     using weights_gl     = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;  // w2 (E, H, inter) = B^T
     using w_scales_gl    = gl<float, 1, -1, -1, -1>;                 // (E, H/128, inter/128)
     using outputs_gl     = gl<bf16, 1, 1, -1, H>;                    // expert_out (bf16)
+    using planes_gl      = gl<bf16, 1, 1, -1, H>;                    // CE 版本地 out_planes
     using counts_gl      = gl<int, 1, 1, 1, -1>;
     using staging_pgl    = pgl<gl<bf16, 1, 1, -1, H, row_vec>, NUM_DEVICES, false>;
     using dst_gl         = gl<int, 1, 1, -1, 2>;
@@ -2846,6 +2877,7 @@ struct globals {
     weights_gl weights;
     w_scales_gl w_scales;
     outputs_gl outputs;
+    planes_gl out_planes;   // CE 版: plane s = 行 [s*T, (s+1)*T), 由 ce::rs_push 搬运
     counts_gl padded_tokens_per_expert;
     const int num_local_experts;
     const int expert_offset;
@@ -2880,7 +2912,10 @@ struct signal_epilogue {
                          :: "l"(&G.barrier[G.dev_idx][{1, row_idx}]), "r"(G.seq) : "memory");
     }
 };
-// push_job: 与 preredpush::push_job 逐行同构(读 bf16 expert_out, 推 8KB 行)
+// push_job: 与 preredpush::push_job 逐行同构(读 bf16 expert_out, 推 8KB 行)。
+// CE=true(docs/43): 归约结果直写本地 out_planes(免 smem/TMA/选举),
+// 线上搬运与 watermark 由 ce::rs_push(copy engine, 0 SM)负责。
+template <bool CE>
 __device__ inline void push_job(const globals &G, const int j) {
     if (j >= G.num_jobs) return;
     constexpr int H = globals::H, VEC = 8, HVEC = H / VEC;
@@ -2909,8 +2944,14 @@ __device__ inline void push_job(const globals &G, const int j) {
     __syncthreads();
     if (!s_has) return;
 
-    bf16 *row_ptr = reinterpret_cast<bf16 *>(&row);
-    float4 *row_v = reinterpret_cast<float4 *>(row_ptr);
+    // CE 版直写本地 out_planes 行; SM 版写 smem 行再 TMA 推远端
+    float4 *row_v;
+    if constexpr (CE) {
+        row_v = reinterpret_cast<float4 *>(
+            &G.out_planes[{s_s * G.num_source_tokens + s_t, 0}]);
+    } else {
+        row_v = reinterpret_cast<float4 *>(reinterpret_cast<bf16 *>(&row));
+    }
     for (int c = threadIdx.x; c < HVEC; c += blockDim.x) {
         float acc[VEC];
         #pragma unroll
@@ -2934,6 +2975,7 @@ __device__ inline void push_job(const globals &G, const int j) {
         for (int jj = 0; jj < VEC / 2; jj++) res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
         row_v[c] = *reinterpret_cast<const float4 *>(res);
     }
+    if constexpr (CE) return;   // 搬运与 watermark 交给 ce::rs_push
     __syncthreads();
     if (threadIdx.x == 0) {
         const int dst_row = G.dev_idx * G.num_source_tokens + s_t;
@@ -2948,6 +2990,7 @@ __device__ inline void push_job(const globals &G, const int j) {
         }
     }
 }
+template <bool CE>
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
             int *__restrict__ gemm_next,
@@ -2959,7 +3002,7 @@ void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_exper
             G, no_gate{}, signal_epilogue{G, col_blocks},
             plain_store_policy<globals::outputs_gl>{G.outputs},
             blk_expert, gemm_next, nblk * col_blocks);
-        asm volatile("bar.sync 2, %0;" :: "n"(gemm_config_fp8::NUM_THREADS));  // docs/24
+        kittens::group<gemm_config_fp8::NUM_WARPS>::sync(2);  // TK 原语(docs/43 审计)  // docs/24
     }
     __shared__ int s_j;
     while (true) {
@@ -2967,7 +3010,7 @@ void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_exper
         __syncthreads();
         const int idx = s_j;
         if (idx >= G.num_jobs) break;
-        push_job(G, job_order[idx]);
+        push_job<CE>(G, job_order[idx]);
         __syncthreads();
     }
 }
@@ -2979,14 +3022,16 @@ void reset_kernel(const __grid_constant__ globals G) {
 }
 void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
            at::Tensor &weights, at::Tensor &w_scales,
-           at::Tensor &expert_outputs, at::Tensor &padded_tokens_per_expert,
+           at::Tensor &expert_outputs, at::Tensor &out_planes,
+           at::Tensor &padded_tokens_per_expert,
            kittens::py::TKParallelTensor &staging, at::Tensor &prered_dst,
            at::Tensor &prered_slots, at::Tensor &prered_w, at::Tensor &local_cnt,
            at::Tensor &push_expected_l1, at::Tensor &blk_expert,
            at::Tensor &gemm_next, at::Tensor &job_order, at::Tensor &job_next,
            kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_padded_local_tokens,
-           const int num_source_tokens, const int num_jobs, const int seq) {
+           const int num_source_tokens, const int num_jobs, const int seq,
+           const bool use_ce) {
     using cfg = gemm_config_fp8;
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
@@ -3012,6 +3057,7 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
         .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
         .w_scales = kittens::py::tensor_to_gl<globals::w_scales_gl>(w_scales),
         .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(expert_outputs),
+        .out_planes = kittens::py::tensor_to_gl<globals::planes_gl>(out_planes),
         .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
         .num_local_experts = num_local_experts, .expert_offset = 0,
         .staging = kittens::py::parallel_tensor_to_pgl<globals::staging_pgl>(staging),
@@ -3027,16 +3073,106 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
     };
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;   // 48KB GEMM > 8KB push row
-    CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
-        G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(),
-        job_order.data_ptr<int>(), job_next.data_ptr<int>());
+    if (use_ce) {
+        CUDACHECK(cudaFuncSetAttribute(kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel<true><<<sm, cfg::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(),
+            job_order.data_ptr<int>(), job_next.data_ptr<int>());
+    } else {
+        CUDACHECK(cudaFuncSetAttribute(kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel<false><<<sm, cfg::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(),
+            job_order.data_ptr<int>(), job_next.data_ptr<int>());
+    }
     CUDACHECK(cudaGetLastError());
     const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
     reset_kernel<<<rb, 256, 0, stream>>>(G);
     CUDACHECK(cudaGetLastError());
 }
 } // namespace tppr8
+
+/* ===================================================================== *
+ * 5. Copy-engine 通信编排(docs/43): 用 CE(0 SM)搬线上字节, 打破
+ *    docs/35 的 "通信占 SM = 零和" 约束。TK 的对应抽象:
+ *    TKParallelTensor.raw_ptrs_(IPC 指针簿, 公开成员)+ 流上
+ *    cudaMemcpyAsync(D2D peer, UVA 自动走 CE)。KittensClub 是单进程
+ *    多卡的编排原语, 我们每 rank 一进程, 等价物即本进程的 side streams。
+ *    完成信号 = 同流追加的 4B/flag 写(设备侧本地轮询, PCIe-safe)。
+ * ===================================================================== */
+namespace ce {
+static cudaStream_t s_streams[TK_NUM_DEVICES] = {};
+static cudaEvent_t s_event = nullptr;
+static cudaEvent_t s_done[TK_NUM_DEVICES] = {};
+static void _lazy_init() {
+    if (s_event == nullptr) {
+        for (int i = 0; i < TK_NUM_DEVICES; i++) {
+            CUDACHECK(cudaStreamCreateWithFlags(&s_streams[i], cudaStreamNonBlocking));
+            CUDACHECK(cudaEventCreateWithFlags(&s_done[i], cudaEventDisableTiming));
+        }
+        CUDACHECK(cudaEventCreateWithFlags(&s_event, cudaEventDisableTiming));
+    }
+}
+// 跨迭代护栏: 下一迭代的 L1 kernel(写 out_planes)必须等上一迭代的 CE
+// 读完 —— 主流 wait 上次 rs_push 的完成 event(首迭代 event 未记录 = 直通)。
+void rs_fence_entry() {
+    _lazy_init();
+    for (int i = 0; i < TK_NUM_DEVICES; i++)
+        CUDACHECK(cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream(), s_done[i], 0));
+}
+// L0: 各卡 pre_tokens/pre_scales 分片 CE 拉到本地 ag 缓冲, 每片完成置 flag。
+// 调用点位于 pcie_device_barrier 之后(各 rank 量化已全局可见), event 捕获
+// 主流序; kernel 侧按 flag 逐分片放行 scatter。
+void ag_pull_entry(kittens::py::TKParallelTensor &pre_tokens,
+                   kittens::py::TKParallelTensor &pre_scales,
+                   at::Tensor &ag_tokens, at::Tensor &ag_scales, at::Tensor &flags) {
+    _lazy_init();
+    const int world = pre_tokens.local_world_size_;
+    const size_t tok_bytes = pre_tokens.data_.nbytes();
+    const size_t sc_bytes = pre_scales.data_.nbytes();
+    TORCH_CHECK(ag_tokens.nbytes() == tok_bytes * world, "ag_tokens size");
+    TORCH_CHECK(ag_scales.nbytes() == sc_bytes * world, "ag_scales size");
+    TORCH_CHECK(flags.numel() >= world, "flags size");
+    CUDACHECK(cudaEventRecord(s_event, at::cuda::getCurrentCUDAStream()));
+    for (int s = 0; s < world; s++) {
+        CUDACHECK(cudaStreamWaitEvent(s_streams[s], s_event, 0));
+        CUDACHECK(cudaMemcpyAsync(
+            (char *)ag_tokens.data_ptr() + (size_t)s * tok_bytes,
+            pre_tokens.raw_ptrs_[s], tok_bytes, cudaMemcpyDeviceToDevice, s_streams[s]));
+        CUDACHECK(cudaMemcpyAsync(
+            (char *)ag_scales.data_ptr() + (size_t)s * sc_bytes,
+            pre_scales.raw_ptrs_[s], sc_bytes, cudaMemcpyDeviceToDevice, s_streams[s]));
+        CUDACHECK(cudaMemsetAsync((char *)flags.data_ptr() + (size_t)s * 4, 1, 4, s_streams[s]));
+    }
+}
+// L1: 本地 out_planes 的 plane s 经 CE 推到卡 s 的 staging 行 [me*T, me*T+T),
+// 同流追加 4B seq 写进卡 s 的 barrier (2+me, 0) —— 与 SM 版 watermark 槽位
+// 完全一致, final_reduce_push 零改动。event 捕获 L1 kernel 完成。
+void rs_push_entry(at::Tensor &out_planes,
+                   kittens::py::TKParallelTensor &staging,
+                   kittens::py::TKParallelTensor &barrier,
+                   at::Tensor &seq_buf, const int num_tokens) {
+    _lazy_init();
+    const int world = staging.local_world_size_;
+    const int me = staging.local_rank_;
+    const size_t row_bytes = (size_t)staging.data_.size(1) * 2;   // bf16
+    const size_t plane_bytes = (size_t)num_tokens * row_bytes;
+    const int bar_cols = static_cast<int>(barrier.data_.size(1));
+    TORCH_CHECK(out_planes.nbytes() == plane_bytes * world, "out_planes size");
+    TORCH_CHECK(seq_buf.numel() == 1 && seq_buf.dtype() == at::ScalarType::Int, "seq_buf");
+    CUDACHECK(cudaEventRecord(s_event, at::cuda::getCurrentCUDAStream()));
+    for (int s = 0; s < world; s++) {
+        CUDACHECK(cudaStreamWaitEvent(s_streams[s], s_event, 0));
+        CUDACHECK(cudaMemcpyAsync(
+            (char *)staging.raw_ptrs_[s] + (size_t)me * num_tokens * row_bytes,
+            (char *)out_planes.data_ptr() + (size_t)s * plane_bytes,
+            plane_bytes, cudaMemcpyDeviceToDevice, s_streams[s]));
+        CUDACHECK(cudaMemcpyAsync(
+            (char *)barrier.raw_ptrs_[s] + ((size_t)(2 + me) * bar_cols) * 4,
+            seq_buf.data_ptr(), 4, cudaMemcpyDeviceToDevice, s_streams[s]));
+        CUDACHECK(cudaEventRecord(s_done[s], s_streams[s]));
+    }
+}
+} // namespace ce
 
 #include <torch/csrc/utils/pybind.h>
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -3068,4 +3204,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tp_gemm_prered_push", &preredpush::gemm_push_entry_tp);
     m.def("moe_tp_gemm_prered_push_v2", &tppr2::entry);
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
+    m.def("ce_ag_pull", &ce::ag_pull_entry);
+    m.def("ce_rs_push", &ce::rs_push_entry);
+    m.def("ce_rs_fence", &ce::rs_fence_entry);
 }

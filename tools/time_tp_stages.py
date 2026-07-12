@@ -99,13 +99,18 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
 
         def st_l0():
             if s.fp8:
+                if s.l0_ce:
+                    s.ce_flags.zero_()
+                    s.tk.ce_ag_pull(s.pre_tokens, s.pre_scales,
+                                    s.ag_tokens, s.ag_scales, s.ce_flags)
                 s.gemm_next.zero_()
                 s.tk.moe_tp_dispatch_gemm_fp8(
-                    s.pre_tokens, s.pre_scales, s.gathered, s.gathered_scales,
+                    s.pre_tokens, s.pre_scales, s.ag_tokens, s.ag_scales,
+                    s.ce_flags, s.gathered, s.gathered_scales,
                     s.w_gateup_fp8, s.w1_il_scales, s.act, s.padded,
                     s.tp_slots, s.slack, s.pull_order, s.blk_expert,
                     s.gemm_next, s.barrier_l0, s.num_comm_sms,
-                    s.num_padded_total, s.num_tokens)
+                    s.num_padded_total, s.num_tokens, s.l0_ce)
             elif s.dispatch_mode == "push":
                 s._l0_seq += 1
                 s.l0_push_cnt.zero_()
@@ -144,14 +149,21 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
             s.job_next.zero_()
             if s.fp8 and s.l1_fp8:
                 s.tk.rowgroup_quant_fp8(s.act, s.act_fp8, s.act_scales)
+                if s.l1_ce:
+                    s.tk.ce_rs_fence()
                 s.l1_gemm_next.zero_()
                 s.tk.moe_tp_gemm_prered_push_fp8(
                     s.act_fp8, s.act_scales, s.w2_fp8, s.w2_scales,
-                    s.expert_out, s.padded, s.combine_staging, s.prered_dst,
-                    s.tp_slots, s.prered_w, s.combine_local_cnt,
+                    s.expert_out, s.out_planes, s.padded, s.combine_staging,
+                    s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
                     s.push_expected_l1, s.blk_expert, s.l1_gemm_next,
                     s.job_order, s.job_next, s.barrier_l1, s.num_comm_sms_l1,
-                    s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq)
+                    s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq,
+                    s.l1_ce)
+                if s.l1_ce:
+                    s.seq_buf.fill_(s._l1_seq)
+                    s.tk.ce_rs_push(s.out_planes, s.combine_staging,
+                                    s.barrier_l1, s.seq_buf, s.num_tokens)
             elif s.l1_mode == "v2":
                 s.l1_gemm_next.zero_()
                 s.tk.moe_tp_gemm_prered_push_v2(

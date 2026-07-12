@@ -9,7 +9,18 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【FP8 P3 落码待实测 2026-07-12·分支 fp8_tp·当前状态】**量化 kernel 兑现
+**【FP8 CE 通信+TK 审计待实测 2026-07-12·分支 fp8_tp·当前状态】**用户指示:
+通信改 copy engine(0 SM,打破 docs/35 零和)+ TK 原语审计。**审计(docs/43
+§1)**:5 处 bar.sync asm → group<N>::sync(2) ✅;host CE = raw_ptrs_+side
+streams(club 的多进程等价);pcie_sync/量化/policy 保留有据。**CE 已落码**:
+ce_ag_pull(L0:CE 拉分片进本地 ag 缓冲+flag,kernel 只本地 scatter)、
+ce_rs_push(L1:out_planes CE 推对端+4B watermark,final_red 零改动)、
+ce_rs_fence(跨迭代护栏);TK_L0_CE/TK_L1_CE 默认 0,04c8 三档 A/B +
+05c8 CE 拐点重扫 {4,8,12,16} + 08c8 归因。P3(L1 fp8)同待实测。预期:
+L0 CE 回收让渡大头(935→~800),L1 CE 账面平衡由数据裁决;e2e 目标 ~1650-1700。
+**下一步:`STEPS='^00_|^01_|^03f8_|^03c8_|^04f8_|^04l8_|^04c8_|^05c8_|^08f_|^08c8_'
+bash tools/run_tp_all.sh`**。docs/42/43。
+**【FP8 P3 落码(历史)】**量化 kernel 兑现
 (tok_copy 112→24,e2e **1879/3180**)。**未隐藏通信定量账(docs/42 §1)**:
 L0 AG≈0(全藏)、L1 尾 108、final_red 20、sched gather ~40、屏障 ~20 =
 **~190µs(10%)**;另让渡税 264(平台结构性)。合理上限 ~1560-1600

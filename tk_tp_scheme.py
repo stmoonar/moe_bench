@@ -364,6 +364,10 @@ class TKFusedTP(DistributedScheme):
             # docs/42 P3: L1 fp8(默认)—— w2 (E,H,inter) 就是 B^T 布局,
             # qc.w2_scale (E,H/128,inter/128) 原样可用, 零转置零重量化。
             self.l1_fp8 = os.environ.get("TK_L1_FP8", "1") == "1"
+            # docs/43: 线上字节改走 copy engine(0 SM, 打破 SM 零和);
+            # TK 抽象 = TKParallelTensor.raw_ptrs_ + side streams(ce:: 编排)。
+            self.l0_ce = os.environ.get("TK_L0_CE", "0") == "1"
+            self.l1_ce = os.environ.get("TK_L1_CE", "0") == "1"
             s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
             w1_bf = (problem.w1.float() * s1.repeat_interleave(128, 1)
                                             .repeat_interleave(128, 2))
@@ -445,6 +449,15 @@ class TKFusedTP(DistributedScheme):
                                            dtype=torch.float8_e4m3fn)
                 self.act_scales = torch.zeros(P, inter // 128, device=device,
                                               dtype=torch.float32)
+            # docs/43 CE 缓冲(kernel 入口需要实参, 常驻分配; CE 关闭时不访问)
+            S = world * num_tokens
+            self.ag_tokens = torch.zeros(S, H, device=device,
+                                         dtype=torch.float8_e4m3fn)
+            self.ag_scales = torch.zeros(S, H // 128, device=device,
+                                         dtype=torch.float32)
+            self.ce_flags = torch.zeros(world, dtype=torch.int32, device=device)
+            self.out_planes = torch.zeros(S, H, device=device, dtype=torch.bfloat16)
+            self.seq_buf = torch.zeros(1, dtype=torch.int32, device=device)
         else:
             self.gathered = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
         self.gateup_out = torch.zeros(P, 2 * inter, device=device, dtype=torch.bfloat16)
@@ -523,14 +536,21 @@ class TKFusedTP(DistributedScheme):
         if self.fp8:
             # docs/39 P2: fp8 AG(token 4KB + scales 128B)⊕ fp8 dispenser GEMM
             # ⊕ GLU epilogue(fp32 上 silu*up 直存 bf16 act); L1 保持 bf16。
+            # docs/43: TK_L0_CE=1 时线上字节由 copy engine 拉进本地 ag 缓冲
+            # (0 SM), comm 块只做本地 scatter(按分片 flag 放行)。
+            if self.l0_ce:
+                self.ce_flags.zero_()
+                tk.ce_ag_pull(self.pre_tokens, self.pre_scales,
+                              self.ag_tokens, self.ag_scales, self.ce_flags)
             self.gemm_next.zero_()
             tk.moe_tp_dispatch_gemm_fp8(
-                self.pre_tokens, self.pre_scales, self.gathered,
+                self.pre_tokens, self.pre_scales, self.ag_tokens,
+                self.ag_scales, self.ce_flags, self.gathered,
                 self.gathered_scales, self.w_gateup_fp8, self.w1_il_scales,
                 self.act, self.padded, self.tp_slots, self.slack,
                 self.pull_order, self.blk_expert, self.gemm_next,
                 self.barrier_l0, self.num_comm_sms, self.num_padded_total,
-                self.num_tokens)
+                self.num_tokens, self.l0_ce)
         elif self.dispatch_mode == "push":
             # TP-T1 (docs/23): strong-path push + chunk watermarks + resident
             # scatter. seq gates the watermark slots (monotonic, no reset).
@@ -575,18 +595,26 @@ class TKFusedTP(DistributedScheme):
         self.combine_local_cnt.zero_()
         self.job_next.zero_()
         if self.fp8 and self.l1_fp8:
-            # docs/42 P3: act 量化(单 kernel)+ fp8 W2 GEMM ⊕ v1 push/排空
+            # docs/42 P3: act 量化(单 kernel)+ fp8 W2 GEMM ⊕ v1 push/排空。
+            # docs/43: TK_L1_CE=1 时归约直写本地 out_planes, 线上搬运与
+            # watermark 由 ce::rs_push(copy engine)完成, final_red 零改动。
             tk.rowgroup_quant_fp8(self.act, self.act_fp8, self.act_scales)
+            if self.l1_ce:
+                tk.ce_rs_fence()  # 等上一迭代 CE 读完 out_planes(docs/43)
             self.l1_gemm_next.zero_()
             tk.moe_tp_gemm_prered_push_fp8(
                 self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
-                self.expert_out, self.padded, self.combine_staging,
-                self.prered_dst, self.tp_slots, self.prered_w,
-                self.combine_local_cnt, self.push_expected_l1,
+                self.expert_out, self.out_planes, self.padded,
+                self.combine_staging, self.prered_dst, self.tp_slots,
+                self.prered_w, self.combine_local_cnt, self.push_expected_l1,
                 self.blk_expert, self.l1_gemm_next, self.job_order,
                 self.job_next, self.barrier_l1, self.num_comm_sms_l1,
                 self.num_padded_total, self.num_tokens, self.num_jobs,
-                self._l1_seq)
+                self._l1_seq, self.l1_ce)
+            if self.l1_ce:
+                self.seq_buf.fill_(self._l1_seq)
+                tk.ce_rs_push(self.out_planes, self.combine_staging,
+                              self.barrier_l1, self.seq_buf, self.num_tokens)
         elif self.l1_mode == "v2":
             self.l1_gemm_next.zero_()
             tk.moe_tp_gemm_prered_push_v2(
