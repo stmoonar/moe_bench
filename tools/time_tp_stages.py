@@ -142,7 +142,17 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
             s._l1_seq += 1
             s.combine_local_cnt.zero_()
             s.job_next.zero_()
-            if s.l1_mode == "v2":
+            if s.fp8 and s.l1_fp8:
+                s.tk.rowgroup_quant_fp8(s.act, s.act_fp8, s.act_scales)
+                s.l1_gemm_next.zero_()
+                s.tk.moe_tp_gemm_prered_push_fp8(
+                    s.act_fp8, s.act_scales, s.w2_fp8, s.w2_scales,
+                    s.expert_out, s.padded, s.combine_staging, s.prered_dst,
+                    s.tp_slots, s.prered_w, s.combine_local_cnt,
+                    s.push_expected_l1, s.blk_expert, s.l1_gemm_next,
+                    s.job_order, s.job_next, s.barrier_l1, s.num_comm_sms_l1,
+                    s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq)
+            elif s.l1_mode == "v2":
                 s.l1_gemm_next.zero_()
                 s.tk.moe_tp_gemm_prered_push_v2(
                     s.act, s.w2, s.expert_out, s.padded, s.combine_staging,
@@ -184,18 +194,30 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
         else:
             timed("L0_gemm_alone", lambda: s.tk.grouped_gemm(
                 s.gathered, s.w_gateup, ref_gateup, s.padded, 0))
-        timed("L1_gemm_alone", lambda: s.tk.grouped_gemm(
-            s.act, s.w2, ref_expout, s.padded, 0))
+        if s.fp8 and s.l1_fp8:
+            def st_l1_alone_fp8():
+                ref_task_next.zero_()
+                s.tk.grouped_gemm_fp8(s.act_fp8, s.act_scales, s.w2_fp8,
+                                      s.w2_scales, ref_expout, s.padded,
+                                      s.blk_expert, ref_task_next, 0, False)
+            timed("L1_gemm_alone", st_l1_alone_fp8)
+        else:
+            timed("L1_gemm_alone", lambda: s.tk.grouped_gemm(
+                s.act, s.w2, ref_expout, s.padded, 0))
 
-        # 列外层换序的纯算对照(docs/33): L1 v2 的 GEMM 走 COL_MAJOR dispenser,
-        # 这里单独计时同款纯算版, 把"换序代价"与"推送协议代价"分开归因。
-        def st_l1_cm():
-            ref_task_next.zero_()
-            s.tk.grouped_gemm_cm(s.act, s.w2, ref_expout, s.padded,
-                                 s.blk_expert, ref_task_next, 0)
-        timed("L1_gemm_cm", st_l1_cm)
-        timed("L1_gemm_nb", lambda: s.tk.grouped_gemm_nb(
-            s.act, s.w2, ref_expout, s.padded, 0, nb_blocks))
+        # 列外层换序的纯算对照(docs/33)与 nb 让渡对照(docs/35)——
+        # bf16 专用参考(L1 fp8 模式下 bf16 w2 不存在, 置 0 跳过)。
+        if s.fp8 and s.l1_fp8:
+            timed("L1_gemm_cm", lambda: None)
+            timed("L1_gemm_nb", lambda: None)
+        else:
+            def st_l1_cm():
+                ref_task_next.zero_()
+                s.tk.grouped_gemm_cm(s.act, s.w2, ref_expout, s.padded,
+                                     s.blk_expert, ref_task_next, 0)
+            timed("L1_gemm_cm", st_l1_cm)
+            timed("L1_gemm_nb", lambda: s.tk.grouped_gemm_nb(
+                s.act, s.w2, ref_expout, s.padded, 0, nb_blocks))
 
         timed("full_run", s.run)
 

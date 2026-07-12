@@ -210,6 +210,10 @@ else
     run_step 04f8_bench_tktp_fp8_t1024 600 python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --precision fp8 --no-verify --iters 30 --tokens 1024 \
         --json "$JSONS/tktp_fp8_t1024.json"
+    # docs/42 P3 A/B: L1 fp8 关闭档(w2 反量化 bf16 + v1)
+    run_step 04l8_bench_l1fp8_off_512 600 env TK_L1_FP8=0 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_l1off_ne64_t512.json"
     # ---------- 5f. fp8 comm_sms 重扫(docs/40: AG 字节减半, 拐点应左移) ----------
     for CS in 8 12 16 24; do
         run_step "05f_fp8_commsms_${CS}" 600 \

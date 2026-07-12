@@ -235,6 +235,7 @@ class TKFusedTP(DistributedScheme):
         # docs/39 P2: fp8 = L0 走 fp8 AG + fp8 GEMM(GLU 融合), L1 保持 bf16
         # (act/push/combine 精度不变, 阶段边界干净)。
         self.fp8 = problem.quant_config is not None
+        self.l1_fp8 = False  # fp8 分支里按 TK_L1_FP8 重置(docs/42)
         if self.fp8:
             assert cfg.block_shape == [128, 128], "fp8 kernels assume [128,128] blocks"
         self.ctx = ctx
@@ -360,13 +361,21 @@ class TKFusedTP(DistributedScheme):
             # 列交织后的布局上重量化(scale 块与 GEMM tile 对齐, docs/37 §2)。
             qc = problem.quant_config
             FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+            # docs/42 P3: L1 fp8(默认)—— w2 (E,H,inter) 就是 B^T 布局,
+            # qc.w2_scale (E,H/128,inter/128) 原样可用, 零转置零重量化。
+            self.l1_fp8 = os.environ.get("TK_L1_FP8", "1") == "1"
             s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
             w1_bf = (problem.w1.float() * s1.repeat_interleave(128, 1)
                                             .repeat_interleave(128, 2))
-            s2 = qc.w2_scale.float()                         # (E, H/128, I/128)
-            w2_bf = (problem.w2.float() * s2.repeat_interleave(128, 1)
-                                            .repeat_interleave(128, 2))
-            self.w2 = w2_bf.to(torch.bfloat16).transpose(1, 2).contiguous()  # (E, inter, H)
+            if self.l1_fp8:
+                self.w2_fp8 = problem.w2.contiguous()        # (E, H, inter) fp8
+                self.w2_scales = qc.w2_scale.float().contiguous()
+            else:
+                s2 = qc.w2_scale.float()                     # (E, H/128, I/128)
+                w2_bf = (problem.w2.float() * s2.repeat_interleave(128, 1)
+                                                .repeat_interleave(128, 2))
+                self.w2 = w2_bf.to(torch.bfloat16).transpose(1, 2).contiguous()
+                del w2_bf
             # GLU 列交织(按 N 行, 单位 64): [gate64 | up64] per 128-N block
             E = w1_bf.shape[0]
             gate = w1_bf[:, :inter].view(E, inter // 64, 64, H)
@@ -379,7 +388,7 @@ class TKFusedTP(DistributedScheme):
                 E, 2 * inter // 128, H // 128).contiguous()
             self.w_gateup_fp8 = (v / (amax / FP8_MAX)).to(torch.float8_e4m3fn) \
                                                       .view(E, 2 * inter, H).contiguous()
-            del w1_bf, w1_il, v, w2_bf
+            del w1_bf, w1_il, v
         else:
             w1 = problem.w1                                     # (E, 2*inter, H), [gate; up]
             self.w_gateup = w1.transpose(1, 2).contiguous()     # (E, H, 2*inter), [gate | up]
@@ -431,6 +440,11 @@ class TKFusedTP(DistributedScheme):
             # padding 行 scale=0 -> 反量化恒 0, GEMM 对 padding 行为与 bf16 一致
             self.gathered_scales = torch.zeros(P, H // 128, device=device,
                                                dtype=torch.float32)
+            if self.l1_fp8:  # docs/42 P3: act 量化缓冲(复用 rowgroup kernel)
+                self.act_fp8 = torch.zeros(P, inter, device=device,
+                                           dtype=torch.float8_e4m3fn)
+                self.act_scales = torch.zeros(P, inter // 128, device=device,
+                                              dtype=torch.float32)
         else:
             self.gathered = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
         self.gateup_out = torch.zeros(P, 2 * inter, device=device, dtype=torch.bfloat16)
@@ -560,7 +574,20 @@ class TKFusedTP(DistributedScheme):
         self._l1_seq += 1
         self.combine_local_cnt.zero_()
         self.job_next.zero_()
-        if self.l1_mode == "v2":
+        if self.fp8 and self.l1_fp8:
+            # docs/42 P3: act 量化(单 kernel)+ fp8 W2 GEMM ⊕ v1 push/排空
+            tk.rowgroup_quant_fp8(self.act, self.act_fp8, self.act_scales)
+            self.l1_gemm_next.zero_()
+            tk.moe_tp_gemm_prered_push_fp8(
+                self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
+                self.expert_out, self.padded, self.combine_staging,
+                self.prered_dst, self.tp_slots, self.prered_w,
+                self.combine_local_cnt, self.push_expected_l1,
+                self.blk_expert, self.l1_gemm_next, self.job_order,
+                self.job_next, self.barrier_l1, self.num_comm_sms_l1,
+                self.num_padded_total, self.num_tokens, self.num_jobs,
+                self._l1_seq)
+        elif self.l1_mode == "v2":
             self.l1_gemm_next.zero_()
             tk.moe_tp_gemm_prered_push_v2(
                 self.act, self.w2, self.expert_out, self.padded,

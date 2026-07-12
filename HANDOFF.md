@@ -9,7 +9,17 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【FP8 重叠上限·A 证伪+量化 kernel 化 2026-07-12·分支 fp8_tp·当前状态】**
+**【FP8 P3 落码待实测 2026-07-12·分支 fp8_tp·当前状态】**量化 kernel 兑现
+(tok_copy 112→24,e2e **1879/3180**)。**未隐藏通信定量账(docs/42 §1)**:
+L0 AG≈0(全藏)、L1 尾 108、final_red 20、sched gather ~40、屏障 ~20 =
+**~190µs(10%)**;另让渡税 264(平台结构性)。合理上限 ~1560-1600
+(1.30-1.33×),余 ~300。**P3 已落码**:tppr8(fp8 dispenser W2 GEMM +
+v1 push 逐行同构;**w2/w2_scale 原样可用零转置零重量化**)+ act 量化复用
+rowgroup kernel;TK_L1_FP8 开关 + 04l8 A/B;stages L1 fp8 感知(cm/nb 置 0)。
+预期 L1_fused 696→~560,e2e ~1770-1800(1.15-1.17×),T=1024 ~3000(1.34×)。
+**下一步:`STEPS='^00_|^01_|^03f8_|^04f8_|^04l8_|^08f_' bash
+tools/run_tp_all.sh`**;过了做 C(sched 双流)+ 全量回归 + 双口径终数。docs/42。
+**【FP8 A 证伪+量化 kernel(历史)】**
 05f 裁决:**fp8 拐点不左移(24 仍单调最优)**——pull 是延迟/并发受限,减字节
 不减 RTT,A 刀归档负结果。08f 首份 fp8 归因:full 1931 = sched 275 +
 **tok_copy 112(torch 量化链 ~80µs,新头号便宜肉)** + L0_fused 935 + L1 695
