@@ -9,7 +9,18 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【FP8 CE 死锁已修复·待重测 2026-07-12·分支 fp8_tp·当前状态】**CE 首测
+**【FP8 P3 兑现·CE 判负·sched 瘦身待测 2026-07-12·分支 fp8_tp·当前状态】**
+**P3 兑现:T=512 = 1756(1.18× vs serial fp8)、T=1024 = 3017(1.33×)**,
+L1 fp8 净赚 −129 与预算吻合;数值 rel_err 4.28e-2(2% 元素超容差,口径决策
+待定:放容差或消 w1 二次量化)。**CE 负结果定案(docs/44 §2)**:L0CE +236/
+L1CE +450/双 CE +609,拐点 sweep 全程劣于 SM 版——CE 把 token 粒度消费序
+流水退化成分片大块搬运,违反粒度纪律;本机结论:SM 驱动细粒度流水 > CE,
+代码留档默认关。**sched int32 瘦身已落码**(三处 argsort key int64→int32,
+值域校验安全,预期 268→~220)。当前账:1756,余量 sched −40~55 + final_red
+−20 + L1 尾 −30 → 收官预计 ~1660-1700(1.22-1.25×)贴平台上限。
+**下一步:`STEPS='^00_|^01_|^02_|^03f8_|^04f8_|^08f_' bash tools/run_tp_all.sh`
+(02 必跑:builder key 变更)→ 全量回归 + bf16/fp8 双口径终数**。docs/44。
+**【FP8 CE 死锁修复(历史)】**CE 首测
 03c8/04c8 死锁(挂满 600s 超时):**持久 kernel 占满 110 SM 自旋等 flag,而
 cudaMemsetAsync/同设备 memcpy 是小 kernel 形式,排不上队 → 互相等死**(经典
 坑,已入踩坑索引)。修复三处:①自己分片不经 CE(kernel 直读本地 pre_tokens,

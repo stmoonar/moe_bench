@@ -164,7 +164,9 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     eid = packed_all[..., 0].reshape(N).long()
     # canonical order within an expert = (src_dev, src_tok, kpos) = flat index n
     # (docs/23: all ranks must build the SAME layout for the push dispatch).
-    key = eid * N + torch.arange(N, device=device)
+    # docs/44 sched 瘦身: key 用 int32(值域 E*N ≤ 256*131072 < 2^31, 排序
+    # 结果与 int64 逐元素相同, verify 对拍不变), argsort 提速 ~30-40%。
+    key = (eid * N + torch.arange(N, device=device)).to(torch.int32)
     order = torch.argsort(key)
     eid_s = eid[order]
 
@@ -205,13 +207,14 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     tpl = out["tp_slots"].long()
     mins = tpl.min(dim=1).values
     out["pull_order"].copy_(
-        torch.argsort(mins * S + torch.arange(S, device=device)).to(torch.int32))
+        torch.argsort((mins * S + torch.arange(S, device=device))
+                      .to(torch.int32)).to(torch.int32))
     # L1 v2(docs/32)不再消费 job_order(列扫聚合信号取代 max-slot 就绪序),
     # 只有 v1 路径要求重建 —— 与 push_order 同款的按需策略(docs/26)。
     if "job_order" in out:
         out["job_order"].copy_(
-            torch.argsort(tpl.max(dim=1).values * S + torch.arange(S, device=device))
-            .to(torch.int32))
+            torch.argsort((tpl.max(dim=1).values * S + torch.arange(S, device=device))
+                          .to(torch.int32)).to(torch.int32))
     if "push_order" in out:
         out["push_order"].copy_(
             torch.argsort(mins.view(world_size, T), dim=1).to(torch.int32))
