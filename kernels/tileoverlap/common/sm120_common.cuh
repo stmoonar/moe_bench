@@ -601,6 +601,13 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
             // rt 行布局: data[偶] → 行 r0, data[奇] → r0+8(global_to_register)
             const int r0 = row_idx * cfg::ROW_BLOCK + store_strip * 16 + (lane_id >> 2);
 
+            // scale 预取(docs/38: 首测 1.27×, 边界处的 3 个 global scale 读
+            // 在关键路径上, 32 个边界 × L2 延迟 ≈ 40% 气泡)。边界只消费
+            // 已在寄存器的值, 同时发起下一块的加载(2 个 red step 的着陆窗)。
+            float bsc_n = G.w_scales[{e, col_idx, 0}];
+            float s0_n = G.a_scales[{r0, 0}];
+            float s1_n = G.a_scales[{r0 + 8, 0}];
+
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                 wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
                 update_phasebit<0>(phasebits, stage);
@@ -619,12 +626,16 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
                 warp::arrive(inputs_finished[stage]);
                 stage = (stage + 1) % cfg::PIPELINE_STAGES;
 
-                // 量化块(K=128)边界: fp32 重标定并入主累加器
+                // 量化块(K=128)边界: fp32 重标定并入主累加器(scale 用预取值)
                 if ((red_idx % STEPS_PER_SCALE) == STEPS_PER_SCALE - 1) {
-                    const int kblk = red_idx / STEPS_PER_SCALE;
-                    const float bsc = G.w_scales[{e, col_idx, kblk}];  // (E, N/128, K/128)
-                    const float s0 = G.a_scales[{r0, kblk}] * bsc;
-                    const float s1 = G.a_scales[{r0 + 8, kblk}] * bsc;
+                    const float s0 = s0_n * bsc_n;
+                    const float s1 = s1_n * bsc_n;
+                    const int kblk1 = red_idx / STEPS_PER_SCALE + 1;
+                    if (kblk1 * STEPS_PER_SCALE < num_iters) {  // 预取下一块
+                        bsc_n = G.w_scales[{e, col_idx, kblk1}];
+                        s0_n = G.a_scales[{r0, kblk1}];
+                        s1_n = G.a_scales[{r0 + 8, kblk1}];
+                    }
                     #pragma unroll
                     for (int j = 0; j < acc.width; j++) {
                         #pragma unroll
