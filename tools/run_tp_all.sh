@@ -10,6 +10,12 @@
 #          设为 "none" 表示当前环境已就绪，跳过 source）
 #   CARDS  使用的 4 卡组（如 "9,11,13,15"）；不设则按 AGENTS.md 优先级自动挑空闲组
 #   QUICK  =1 只跑核心步骤（编译+裁决+NE64 对拍+512token bench），跳过 sweep
+#   FOCUS  =1 本轮迭代验证集（~4 分钟）：编译 + 默认路径对拍 + 主形状 bench
+#          + 本轮 A/B + t1024 + 归因。serial 基线/comm sweep/NE sweep/push 回归
+#          等六轮稳定项全部跳过（serial 稳定在 ±0.3%，比率用历史 serial 即可）；
+#          动了调度表用 STEPS 把 02_verify 加回来。全量回归留给里程碑/报数轮。
+#   STEPS  步骤名过滤正则（grep -E），只跑匹配的步骤，其余记 SKIP。
+#          例：STEPS='01_|03_correct_ne64$|08_' 只编译+默认对拍+归因。
 #
 # 产物：moe_bench/tp_test_results/tp_run_<时间戳>.zip（logs/ + json/ + summary.txt）
 # 每一步单独 timeout，单步失败不中断后续步骤（失败记录在 summary.txt）。
@@ -93,11 +99,22 @@ fi
 export CUDA_VISIBLE_DEVICES="$CARDS"
 note "使用 GPU 组: $CARDS (CUDA_VISIBLE_DEVICES)"
 
+# ---------- 步骤过滤（FOCUS 预设 / STEPS 正则） ----------
+# FOCUS=1: 本轮迭代验证集。必跑 00/01(复位+预检+编译), 默认路径对拍,
+# 主形状 bench + 本轮 A/B(04l), t1024, 归因(08)。其余稳定项 SKIP。
+if [ "${FOCUS:-0}" = "1" ] && [ -z "${STEPS:-}" ]; then
+    STEPS='^00_|^01_|^03_correct_ne64$|^04_bench_tktp_512$|^04l_|^06_tktp_t1024$|^08_time_stages$'
+fi
+
 # ---------- 通用步骤执行器 ----------
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 run_step() {  # run_step <名字> <超时秒> <命令...>
     local name="$1" tmo="$2"; shift 2
     local log="$LOGS/${name}.log"
+    if [ -n "${STEPS:-}" ] && ! echo "$name" | grep -qE "$STEPS"; then
+        SKIP=$((SKIP+1))
+        return 0
+    fi
     note "STEP $name: $*"
     if timeout --kill-after=30 "$tmo" "$@" > "$log" 2>&1; then
         note "  -> OK"
@@ -262,7 +279,7 @@ if [ "${TUNE:-0}" = "1" ] && [ "${SKIP_ALL:-0}" != "1" ]; then
 fi
 
 # ---------- 收尾：汇总 + 打包 ----------
-note "完成: PASS=$PASS FAIL=$FAIL"
+note "完成: PASS=$PASS FAIL=$FAIL SKIP=$SKIP${STEPS:+ (过滤: $STEPS)}"
 {
     echo; echo "== 关键结果速览 =="
     for f in "$LOGS"/03_*.log "$LOGS"/04_*.log "$LOGS"/05_*.log "$LOGS"/06_*.log "$LOGS"/07_*.log "$LOGS"/09_serial_tuned_*.log; do
