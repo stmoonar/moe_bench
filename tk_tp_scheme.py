@@ -231,8 +231,12 @@ class TKFusedTP(DistributedScheme):
     def setup(self, problem: MoEProblem, ctx: DistContext) -> None:
         cfg = problem.config
         assert cfg.parallel_mode == ParallelMode.TP, "TKFusedTP is TP-only"
-        assert problem.quant_config is None, "TKFusedTP is bf16-only (no fp8 yet)"
         assert cfg.topk == 8, "kernels compile TOP_K=8"
+        # docs/39 P2: fp8 = L0 走 fp8 AG + fp8 GEMM(GLU 融合), L1 保持 bf16
+        # (act/push/combine 精度不变, 阶段边界干净)。
+        self.fp8 = problem.quant_config is not None
+        if self.fp8:
+            assert cfg.block_shape == [128, 128], "fp8 kernels assume [128,128] blocks"
         self.ctx = ctx
         self.problem = problem
         H = cfg.hidden_size
@@ -278,7 +282,7 @@ class TKFusedTP(DistributedScheme):
         # TK_L0_GLU=0 keeps the dispenser but stores gateup_out + torch silu.
         self.l0_mode = os.environ.get("TK_L0", "v2")
         self.l0_glu = (os.environ.get("TK_L0_GLU", "1") == "1"
-                       and self.l0_mode == "v2")
+                       and self.l0_mode == "v2") or self.fp8  # fp8 kernel 自带 GLU
         # layer0 dispenser task counter, zeroed each iter (same-stream)
         self.gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
         # docs/32~35: layer1 v2 = N 维分解 combine(Comet layer1-N)。三轮实测
@@ -350,11 +354,37 @@ class TKFusedTP(DistributedScheme):
                 self._sched_out["push_order"] = self.push_order
             self._sched_graph = None  # captured lazily on first run()
 
-        # ---- weights (x @ W layout, W = (K, N)) ----
-        w1 = problem.w1                                     # (E, 2*inter, H), [gate; up]
-        self.w_gateup = w1.transpose(1, 2).contiguous()     # (E, H, 2*inter), [gate | up]
-        self.w2 = problem.w2.transpose(1, 2).contiguous()   # (E, inter, H)
-        if self.l0_glu:
+        # ---- weights ----
+        if self.fp8:
+            # docs/39: fp8 权重先反量化(setup 一次), L1 用 bf16; L0 在 GLU
+            # 列交织后的布局上重量化(scale 块与 GEMM tile 对齐, docs/37 §2)。
+            qc = problem.quant_config
+            FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+            s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
+            w1_bf = (problem.w1.float() * s1.repeat_interleave(128, 1)
+                                            .repeat_interleave(128, 2))
+            s2 = qc.w2_scale.float()                         # (E, H/128, I/128)
+            w2_bf = (problem.w2.float() * s2.repeat_interleave(128, 1)
+                                            .repeat_interleave(128, 2))
+            self.w2 = w2_bf.to(torch.bfloat16).transpose(1, 2).contiguous()  # (E, inter, H)
+            # GLU 列交织(按 N 行, 单位 64): [gate64 | up64] per 128-N block
+            E = w1_bf.shape[0]
+            gate = w1_bf[:, :inter].view(E, inter // 64, 64, H)
+            up = w1_bf[:, inter:].view(E, inter // 64, 64, H)
+            w1_il = torch.stack([gate, up], dim=2).view(E, 2 * inter, H)
+            # 交织后 128(N)×128(K) 重量化 -> scale 块与 B tile 天然对齐
+            v = w1_il.view(E, 2 * inter // 128, 128, H // 128, 128)
+            amax = v.abs().amax(dim=(2, 4), keepdim=True).clamp_min(1e-8)
+            self.w1_il_scales = (amax / FP8_MAX).view(
+                E, 2 * inter // 128, H // 128).contiguous()
+            self.w_gateup_fp8 = (v / (amax / FP8_MAX)).to(torch.float8_e4m3fn) \
+                                                      .view(E, 2 * inter, H).contiguous()
+            del w1_bf, w1_il, v, w2_bf
+        else:
+            w1 = problem.w1                                     # (E, 2*inter, H), [gate; up]
+            self.w_gateup = w1.transpose(1, 2).contiguous()     # (E, H, 2*inter), [gate | up]
+            self.w2 = problem.w2.transpose(1, 2).contiguous()   # (E, inter, H)
+        if self.l0_glu and not self.fp8:
             # docs/30: column-interleave so every 128-col GEMM tile is
             # [gate64 | up64] of the SAME intermediate columns — the SwiGLU
             # epilogue pairs the halves inside the accumulator. Setup-time
@@ -370,8 +400,15 @@ class TKFusedTP(DistributedScheme):
         lr, lws = ctx.local_rank, world
         P = num_padded_total
         # peer-readable token shard (dispatch pull source)
-        self.pre_tokens = TK((num_tokens, H), dtype=torch.bfloat16, local_rank=lr,
-                             local_world_size=lws, multicast=False)
+        if self.fp8:
+            # fp8 AG(docs/39): 源端量化后 4KB/token + 128B scales, AG 字节减半
+            self.pre_tokens = TK((num_tokens, H), dtype=torch.float8_e4m3fn,
+                                 local_rank=lr, local_world_size=lws, multicast=False)
+            self.pre_scales = TK((num_tokens, H // 128), dtype=torch.float32,
+                                 local_rank=lr, local_world_size=lws, multicast=False)
+        else:
+            self.pre_tokens = TK((num_tokens, H), dtype=torch.bfloat16, local_rank=lr,
+                                 local_world_size=lws, multicast=False)
         bar_cols = max(P // ROW_BLOCK + 1, 32)
         # barrier_l0: row 0 = dispatch row-block counters (slack-seeded), row 1 =
         # pcie_barrier_all slots. barrier_l1: row 0 = W2 col-block counters,
@@ -389,7 +426,13 @@ class TKFusedTP(DistributedScheme):
 
         # LOCAL workspaces (TP: peers never touch gathered / expert_out).
         # zeros so never-written padding rows stay clean bf16.
-        self.gathered = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
+        if self.fp8:
+            self.gathered = torch.zeros(P, H, device=device, dtype=torch.float8_e4m3fn)
+            # padding 行 scale=0 -> 反量化恒 0, GEMM 对 padding 行为与 bf16 一致
+            self.gathered_scales = torch.zeros(P, H // 128, device=device,
+                                               dtype=torch.float32)
+        else:
+            self.gathered = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
         self.gateup_out = torch.zeros(P, 2 * inter, device=device, dtype=torch.bfloat16)
         self.act = torch.zeros(P, inter, device=device, dtype=torch.bfloat16)
         self.expert_out = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
@@ -453,12 +496,32 @@ class TKFusedTP(DistributedScheme):
         # iter's tokens) and AFTER (my tokens visible before peers pull).
         self._l0_seq += 1
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
-        self.pre_tokens.data_.copy_(self.problem.hidden_states)
+        if self.fp8:
+            # 源端 1×128 group 量化(docs/39, 计入 timed 区): AG 字节减半
+            x = self.problem.hidden_states.view(self.num_tokens, self.H // 128, 128)
+            scale = (x.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-8)
+                     / 448.0)
+            self.pre_tokens.data_.copy_(
+                (x / scale).to(torch.float8_e4m3fn).view(self.num_tokens, self.H))
+            self.pre_scales.data_.copy_(scale.view(self.num_tokens, self.H // 128))
+        else:
+            self.pre_tokens.data_.copy_(self.problem.hidden_states)
         self._l0_seq += 1
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
 
         # layer0: AllGather-dedup dispatch ⊕ gate+up GEMM (one launch)
-        if self.dispatch_mode == "push":
+        if self.fp8:
+            # docs/39 P2: fp8 AG(token 4KB + scales 128B)⊕ fp8 dispenser GEMM
+            # ⊕ GLU epilogue(fp32 上 silu*up 直存 bf16 act); L1 保持 bf16。
+            self.gemm_next.zero_()
+            tk.moe_tp_dispatch_gemm_fp8(
+                self.pre_tokens, self.pre_scales, self.gathered,
+                self.gathered_scales, self.w_gateup_fp8, self.w1_il_scales,
+                self.act, self.padded, self.tp_slots, self.slack,
+                self.pull_order, self.blk_expert, self.gemm_next,
+                self.barrier_l0, self.num_comm_sms, self.num_padded_total,
+                self.num_tokens)
+        elif self.dispatch_mode == "push":
             # TP-T1 (docs/23): strong-path push + chunk watermarks + resident
             # scatter. seq gates the watermark slots (monotonic, no reset).
             self._l0_seq += 1

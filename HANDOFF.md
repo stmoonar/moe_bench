@@ -9,7 +9,20 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【FP8 P1 裁决中 2026-07-12·分支 fp8_tp·当前状态】**P1 两轮:**正确性一次
+**【FP8 P2 落码待实测 2026-07-12·分支 fp8_tp·当前状态】****税坐实**:raw
+探针 304/311 TFLOP/s(仅高 7-12%)→ fp8+fp32acc 峰值≈bf16 峰值,消费级硅
+blockwise fp8 收益≈1.3×(纯字节红利),f16 累加有 128-K 溢出风险不做——
+sm120 一手平台事实归档(docs/39 §1)。**P2 已落码**:tpdisp8 = 源端 1×128
+量化(torch, 计时区)+ fp8 AG(行+scale 行两 TMA 一 mbarrier,线上 8KB→
+4.125KB,TOKENS_PER_BLOCK 20)+ fp8 dispenser GEMM(a_scales 直读
+gathered_scales;权重 dequant→GLU 交织→128×128 重量化,scale 块对齐 tile,
+B^T 免转置)+ GLU epilogue 直存 bf16 act;L1/push/combine 全 bf16。scheme
+fp8 分支 + 脚本 03f8/04f8。预期 e2e ~1900-1950 vs serial fp8 2074(P3 后
+~1.15-1.18×)。⚠️ verify 预期 FAIL 在 fp8 容差(serial fp8 同病,rel_err
+1.67e-2;我们多一层重量化差),诊断行已加,同量级即过,容差校准待数据。
+**下一步:`STEPS='^00_|^01_|^03f8_|^04f8_|^04f_' bash tools/run_tp_all.sh`**。
+docs/39。
+**【FP8 P1(历史·税坐实)】**P1 两轮:**正确性一次
 全对**(两档形状 rel_err 1.68e-3,scale 行映射/B^T+mma_ABt/重标定全对);TK
 平台坑沉淀(col-layout fp8 加载没写完 → B 转置 (E,N,K)+row ldmatrix+mma_ABt,
 副产品 w1 免转置)。性能 283 TFLOP/s = 1.29×(预取假说证伪,仅 +1.5%)。
