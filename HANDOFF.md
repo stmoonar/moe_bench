@@ -9,7 +9,14 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【FP8 CE 通信+TK 审计待实测 2026-07-12·分支 fp8_tp·当前状态】**用户指示:
+**【FP8 CE 死锁已修复·待重测 2026-07-12·分支 fp8_tp·当前状态】**CE 首测
+03c8/04c8 死锁(挂满 600s 超时):**持久 kernel 占满 110 SM 自旋等 flag,而
+cudaMemsetAsync/同设备 memcpy 是小 kernel 形式,排不上队 → 互相等死**(经典
+坑,已入踩坑索引)。修复三处:①自己分片不经 CE(kernel 直读本地 pre_tokens,
+省一次搬运);②CE 模式 grid = sm−1(留 1 SM 给辅助 kernel);③final_reduce
+改 grid-stride + 栅格限 sm−2(防同类饿死)。其余计划不变(docs/43)。
+**下一步:杀掉挂着的脚本,git pull 后重跑同一 STEPS 命令**。
+**【FP8 CE 通信+TK 审计(历史·死锁已修)】**用户指示:
 通信改 copy engine(0 SM,打破 docs/35 零和)+ TK 原语审计。**审计(docs/43
 §1)**:5 处 bar.sync asm → group<N>::sync(2) ✅;host CE = raw_ptrs_+side
 streams(club 的多进程等价);pcie_sync/量化/policy 保留有据。**CE 已落码**:
@@ -307,6 +314,11 @@ TP 路线:**dispatch push 化为必选项**,见 docs/23(TP 第三轮计划)。)
 
 ## 4. 踩坑索引(改代码前必读)
 
+- **持久 kernel 满铺 SM + 依赖 host 侧辅助操作 = 死锁**(docs/44):
+  cudaMemsetAsync 与**同设备** cudaMemcpyAsync 在部分实现里是小 kernel,
+  被占满 SM 的持久 kernel 饿死 → flag 永不落地互相等(CE 首测 03c8/04c8
+  hang 10min 超时)。解法:CE 模式 grid 留 1 SM、自旋型 kernel(final_red)
+  用 grid-stride 限栅格、自己设备的数据直读不经 memcpy。
 - **`kernels/tk/sm120_common.cuh` 是构建产物,不是源文件**(build.py 每次编译
   前从正本 `kernels/tileoverlap/common/sm120_common.cuh` 覆盖拷贝,且被
   .gitignore)。改 GEMM 模板必须改正本;改了副本 = 不进 git + 下次编译被覆盖

@@ -1020,12 +1020,13 @@ __device__ inline void dispatch_persistent(const globals &G, const int *__restri
             const int d = G.pull_order[{i}];
             const int src_dev = d / G.num_tokens;
             const int src_tok = d % G.num_tokens;
-            if constexpr (CE) {  // 分片 flag 放行(CE 完成信号, 本地轮询)
-                while (((volatile const int *)flags)[src_dev] == 0) __nanosleep(64);
+            if constexpr (CE) {  // 远端分片按 flag 放行; 自己的分片直读本地
+                if (src_dev != G.dev_idx)
+                    while (((volatile const int *)flags)[src_dev] == 0) __nanosleep(64);
             }
             tma::expect_bytes(token_arrived[lane_id],
                               sizeof(globals::token_vec) + sizeof(globals::scale_vec));
-            if constexpr (CE) {
+            if (CE && src_dev != G.dev_idx) {
                 tma::load_async(token[lane_id], G.ag_tokens, {d, 0}, token_arrived[lane_id]);
                 tma::load_async(scales[lane_id], G.ag_scales, {d, 0}, token_arrived[lane_id]);
             } else {
@@ -1127,8 +1128,11 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTen
         ? globals::TOKENS_PER_BLOCK * (sizeof(globals::token_vec) + sizeof(globals::scale_vec)) + 2048
         : cfg::DYNAMIC_SHARED_MEMORY + 1024;
     if (use_ce) {
+        // 留 1 个 SM 给 CE 流的辅助 kernel(cudaMemsetAsync/同设备 memcpy 在
+        // 部分实现里是小 kernel): 持久 kernel 占满 SM 时 flag 永不落地 ->
+        // 死锁(docs/44, 03c8/04c8 hang 的根因)。
         CUDACHECK(cudaFuncSetAttribute(kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-        kernel<true><<<sm, cfg::NUM_THREADS, smem, stream>>>(
+        kernel<true><<<sm - 1, cfg::NUM_THREADS, smem, stream>>>(
             G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
             flags.data_ptr<int>());
     } else {
@@ -2423,9 +2427,11 @@ void reset_kernel(const __grid_constant__ globals G) {
         G.barrier[G.dev_idx][{0, i}] = 0;
 }
 // source-card final reduce: wait per-card watermark, then sum contributing rows.
+// grid-stride(docs/44): 满铺 block-per-token 会占满 SM 并自旋等 watermark,
+// 饿死 CE 流的辅助 kernel(同设备 plane copy)-> 死锁; 改条带循环 + 入口
+// 限栅格, 永远给辅助操作留 SM。
 __global__ void final_reduce_push_kernel(const __grid_constant__ final_globals G) {
-    const int t = blockIdx.x;
-    if (t >= G.num_source_tokens) return;
+    for (int t = blockIdx.x; t < G.num_source_tokens; t += gridDim.x) {
     constexpr int H = final_globals::H, VEC = 8, HVEC = H / VEC;
     __shared__ int s_contrib[final_globals::NUM_DEVICES];
     // per-card watermark wait: only the cards that send me anything (recv_from)
@@ -2459,6 +2465,8 @@ __global__ void final_reduce_push_kernel(const __grid_constant__ final_globals G
         #pragma unroll
         for (int jj = 0; jj < VEC / 2; jj++) res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
         out_v[c] = *reinterpret_cast<const float4 *>(res);
+    }
+    __syncthreads();  // 下一条带复用 s_contrib 前, 本条带读完
     }
 }
 static void _launch_gemm_push(globals &G, at::Tensor &padded_tokens_per_expert,
@@ -2583,7 +2591,10 @@ void final_reduce_push_entry(kittens::py::TKParallelTensor &staging, at::Tensor 
         .dev_idx = dev_idx, .num_source_tokens = num_source_tokens, .seq = seq
     };
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    final_reduce_push_kernel<<<num_source_tokens, 256, 0, stream>>>(G);
+    // grid 限到 sm-2(docs/44): 满铺自旋会饿死 CE 流的辅助 kernel
+    int sm_frp; CUDACHECK(cudaDeviceGetAttribute(&sm_frp, cudaDevAttrMultiProcessorCount, dev_idx));
+    const int frp_blocks = std::min(num_source_tokens, sm_frp - 2);
+    final_reduce_push_kernel<<<frp_blocks, 256, 0, stream>>>(G);
     CUDACHECK(cudaGetLastError());
 }
 } // namespace preredpush
@@ -3133,7 +3144,11 @@ void ag_pull_entry(kittens::py::TKParallelTensor &pre_tokens,
     TORCH_CHECK(ag_scales.nbytes() == sc_bytes * world, "ag_scales size");
     TORCH_CHECK(flags.numel() >= world, "flags size");
     CUDACHECK(cudaEventRecord(s_event, at::cuda::getCurrentCUDAStream()));
+    const int me = pre_tokens.local_rank_;
     for (int s = 0; s < world; s++) {
+        if (s == me) continue;   // 自己的分片 kernel 直读本地 pre_tokens(docs/44:
+                                 // 同设备 memcpy 可能以 kernel 实现, 会被持久
+                                 // kernel 饿死 -> 死锁; 且本无搬运必要)
         CUDACHECK(cudaStreamWaitEvent(s_streams[s], s_event, 0));
         CUDACHECK(cudaMemcpyAsync(
             (char *)ag_tokens.data_ptr() + (size_t)s * tok_bytes,
