@@ -9,14 +9,18 @@
 #
 # TP 与 EP 的 config 键不同(EP 产物救不了 TP):
 #   - TP 下 fused_experts 见到全部 E 个 expert, intermediate 是分片 768
-#     -> 查表键 E=<NE>,N=768; NE sweep 档位各需一份 -> E ∈ {64,128,256}
+#     -> 查表键 E=<NE>,N=768
 #   - topk=8 全命中本地, batch(M) = world*T ∈ {1024,2048,4096}, 外加余量
 #
-# 用法(约 1.5~2 小时, 4 卡并行; 产物 json 装机后 serial 基线自动变快):
+# 默认只调主报数形状 E=64(NE=64/topk=8/hidden=4096/gate_up=6144);
+# NE sweep 档位需要时用 TUNE_E="64 128 256" 打开。
+#
+# 用法(单档 E 约 15~20 分钟, 4 卡并行; 产物 json 装机后 serial 基线自动变快):
 #   bash moe_bench/tools/tune_vllm_moe_tp.sh
 set -euo pipefail
 
 GPUS="${MB_GPUS:-${CUDA_VISIBLE_DEVICES:-9,11,13,15}}"
+TUNE_E="${TUNE_E:-64}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
@@ -27,7 +31,7 @@ fi
 echo "[tune-tp] smoke 自检(单卡, <2min): 验证注入机制在本机 vllm 上生效"
 python "$SCRIPT_DIR/tune_moe_tp_noray.py" --smoke --gpus "$GPUS" --num-experts 64
 
-for E in 64 128 256; do
+for E in $TUNE_E; do
   echo "[tune-tp] ===== E=$E, N=768 ====="
   python "$SCRIPT_DIR/tune_moe_tp_noray.py" --gpus "$GPUS" --num-experts "$E"
 done

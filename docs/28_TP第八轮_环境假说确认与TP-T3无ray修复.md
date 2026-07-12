@@ -69,19 +69,21 @@ step 09(`tune_vllm_moe_tp.sh` v1 → vllm `benchmark_moe.py --tune`)rc=134:
 - **搜索空间**:与 `benchmark_moe.py` 相同的 1920 组,加 smem 预过滤
   ((BM·BK+BK·BN)·2·stages > 99KB 直接跳过)后剩 **648 组**,省掉必败编译;
   config 外层循环、M 内层循环摊薄 triton 编译;
-- **三档 E 全调**:NE sweep 的 serial 查表键是 `E=<NE>,N=768`,E∈{64,128,256}
-  各产一份 config(单档 4 卡 ~15min,三档 <1h);
+- **默认只调主报数形状 E=64**(NE=64/topk=8/hidden=4096/gate_up=6144,
+  查表键 `E=64,N=768`,单档 4 卡 ~15min);NE sweep 的 serial 查表键是
+  `E=<NE>,N=768`,需要时 `TUNE_E="64 128 256"` 打开三档;
 - **产物落两处**:vllm configs 目录(生效)+ `tools/build_tune/`(留档)。
 
-一键脚本 step 09 同步升级:调优后复测 serial **全网格**(t256/t512/t1024/
-ne128/ne256),并加裁决步 `09v_tuned_applied`(任一 tuned 日志仍报
-`Using default MoE config` 即 FAIL,不再靠肉眼)。
+一键脚本 step 09 同步升级:调优后复测 E=64 的三个 token 档(t256/t512/
+t1024;ne128/256 查表键不同、默认没调,不复测),并加裁决步
+`09v_tuned_applied`(任一 tuned 日志仍报 `Using default MoE config` 即
+FAIL,不再靠肉眼)。
 
 ## 5. 下一步
 
-1. **重跑 `TUNE=1 bash tools/run_tp_all.sh`**(预计比上轮多 ~1h,不再有
-   3h 的 ray 黑洞)。看点:09_tune 的增益表 + 09v 裁决 + tuned serial 全网格;
-2. 拿到 tuned serial 后**报终数**(当前 1.16×/1.20× 是对未调优 triton 的,
-   预期比率会回落,幅度取决于默认 config 离最优多远);
+1. **重跑 `TUNE=1 bash tools/run_tp_all.sh`**(step 09 预计 ~30min,不再有
+   3h 的 ray 黑洞)。看点:09_tune 的增益表 + 09v 裁决 + tuned serial 三档;
+2. 拿到 tuned serial 后对主形状**报终数**(当前 1.16×/1.20× 是对未调优
+   triton 的,预期比率会回落,幅度取决于默认 config 离最优多远);
 3. 若比率回落过多需要找补:sched 第二刀(合并 all_gather/TK 侧路由 gather,
    预估 −40~60µs,docs/27 §3)是下一个可压项。

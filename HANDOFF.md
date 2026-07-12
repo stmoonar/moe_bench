@@ -16,8 +16,10 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 1.07×(RB64)/1.01×,comm 拐点 24 三连庄。**TP-T3 v1 尸检:ray 在共享机上卡死
 RegisterClient 2.5h 被 SIGTERM,零 trial,serial_tuned≡serial;triton import
 报错是良性噪音**。已重写 v2:`tools/tune_moe_tp_noray.py`(无 ray、subprocess
-4 卡分片、monkeypatch 注入+自证、smem 预过滤 1920→648、E∈{64,128,256} 三档),
-step 09 升级(smoke 先行 + tuned serial 全网格复测 + 09v 自动裁决)。
+4 卡分片、monkeypatch 注入+自证、smem 预过滤 1920→648),**默认只调主报数形状
+E=64/topk8/hidden4096/gateup6144(键 E=64,N=768,~15min;NE sweep 档用
+TUNE_E="64 128 256")**,step 09 升级(smoke 先行 + tuned serial t256/512/1024
+复测 + 09v 自动裁决)。
 **下一步:重跑 `TUNE=1 bash tools/run_tp_all.sh` 拿 tuned serial 报终数**。docs/28。
 **【TP 第七轮(历史)】**35/35 全过。**T=1024 异常解除且创最佳比率
 (4199 vs 5021 = 1.20×)**;NE=64 2264(1.16×)、NE=128 1.11×。双峰漂移(上轮 t1024→本轮

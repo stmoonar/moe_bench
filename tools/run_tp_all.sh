@@ -210,22 +210,20 @@ else
     fi
 fi
 
-# ---------- 9. TP-T3 v2: vLLM triton 无 ray 调优(可选, TUNE=1 打开, ~2h) ----------
+# ---------- 9. TP-T3 v2: vLLM triton 无 ray 调优(可选, TUNE=1 打开, ~30min) ----------
 # v1 的 benchmark_moe.py ray 在本机卡死 2.5h 被 SIGTERM(docs/28);
-# v2 = tune_moe_tp_noray.py: 先 <2min smoke 自检, 注入无效立刻失败, 再 E 三档全调。
+# v2 = tune_moe_tp_noray.py: 先 <2min smoke 自检, 注入无效立刻失败。
+# 默认只调主报数形状 E=64(查表键 E=64,N=768); NE sweep 档位用 TUNE_E="64 128 256"。
 if [ "${TUNE:-0}" = "1" ] && [ "${SKIP_ALL:-0}" != "1" ]; then
     run_step 09_tune_vllm_tp 10800 bash "$MOE_DIR/tools/tune_vllm_moe_tp.sh"
-    # 调优后复测 serial 全网格(config 已装入 vllm configs; tktp 不走 triton 不必复测)
+    # 调优后复测 E=64 的三个 token 档(config 已装入 vllm configs;
+    # tktp 不走 triton 不必复测; ne128/256 查表键不同, 默认没调, 不复测)
     run_step 09_serial_tuned_512 600 python -m moe_bench.tools.run_tktp 64 --scheme serial \
         --no-verify --iters 50 --json "$JSONS/serial_tuned_ne64_t512.json"
     run_step 09_serial_tuned_t1024 600 python -m moe_bench.tools.run_tktp 64 --scheme serial \
         --no-verify --iters 30 --tokens 1024 --json "$JSONS/serial_tuned_t1024.json"
     run_step 09_serial_tuned_t256 600 python -m moe_bench.tools.run_tktp 64 --scheme serial \
         --no-verify --iters 30 --tokens 256 --json "$JSONS/serial_tuned_t256.json"
-    run_step 09_serial_tuned_ne128 600 python -m moe_bench.tools.run_tktp 128 --scheme serial \
-        --no-verify --iters 30 --json "$JSONS/serial_tuned_ne128.json"
-    run_step 09_serial_tuned_ne256 600 python -m moe_bench.tools.run_tktp 256 --scheme serial \
-        --no-verify --iters 30 --json "$JSONS/serial_tuned_ne256.json"
     # 裁决: 调优 config 是否真的被 serial 用上(任一 tuned 日志仍报默认 config 即失败)
     run_step 09v_tuned_applied 60 bash -c \
         "! grep -l 'Using default MoE config' \"$LOGS\"/09_serial_tuned_*.log"
