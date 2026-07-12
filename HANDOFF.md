@@ -9,7 +9,21 @@ L1 每 job 一块在 16 comm SM 上排 128 波。已修复:pull_order(min-slot �
 分阶段归因工具 time_tp_stages(一键脚本 step 08)。**等第二轮实测**。注意:TP serial 通信占比
 仅 ~23%,重叠天花板 ≈2.2ms,收益结构性低于 EP;大 NE 是相对机会(serial 随 NE 恶化)。
 首轮落地记录见 docs/19。
-**【TP 第九轮 2026-07-12·当前状态】**42/42 全过,TP-T3 v2 无 ray 调优 3 分钟
+**【TP 第十轮 2026-07-12·当前状态·待实测】**用户裁定弃 vLLM 调优线,回归自研
+算子。**通信拖慢计算的定量账(docs/30)**:L0 +254µs≈100% 是 SM 让渡(110/86
+模型吻合,数据等待≈0)、L1 +190µs 中 142 让渡+48 排空尾;comm_sms U 型 = 静态
+折衷,结构解法是转岗。**本轮四项落地(全带回滚开关,42 步脚本已更新)**:
+① L0 v2(TK_L0=v2):dispenser GEMM(全局原子发放 + smem 描述环,流水跨 task
+连续)+ comm 块常驻分波拉取后 bar.sync 2 转岗加入 GEMM(镜像 L1 的 comp 转岗);
+新表 blk_expert host/GPU 双实现+裁决扩展;② SwiGLU 融进 L0 epilogue
+(TK_L0_GLU=1):权重列交织 [gate64|up64],fp32 累加器上算 silu*up 直存 act,
+省 109µs silu + 75MB 读写,精度更好;风险=group::store 行置换(docs/05),
+03g/03o 分档正确性门可二分定位;③ sched 合并 all_gather(ids+权重位打包单
+gather,builder 改 packed 输入,位拷贝过 int32 视图);④ TK_COMM_SMS_L1 独立
+预算(05b 首扫 8/16)。本地 CPU 预检全绿。**e2e 预期 2260→~1950-2050
+(1.28-1.35×);下一步:跑 bash tools/run_tp_all.sh(不用 TUNE)看 03 三档门
++ 04 A/B 阶梯 + 08 归因(silu→0、L0_fused→~1050、sched→~205)**。docs/30。
+**【TP 第九轮(历史)】**42/42 全过,TP-T3 v2 无 ray 调优 3 分钟
 跑完(vs v1 ray 黑洞 2.5h),09v PASS。**kernel 级增益 3~7%,但 e2e 只有
 T=1024 兑现(5025→4883,−142µs),T=256/512 反而 +13/+44µs**——主嫌:vLLM
 查表键可能按 M×topk 而非 token 数,三档全部就近命中 8192 键拿到 M=4096 的
@@ -217,5 +231,6 @@ CUDA_VISIBLE_DEVICES=9,11,13,15 TK_DISPATCH=push3 python -m moe_bench.tools.time
 | **docs/27** | **TP 第七轮:T=1024 解除(1.20× 最佳)、双峰漂移+serial 离群→环境干扰假说与取证(clocks_per_step/重复跑);TP-T3 调优脚本就绪(TUNE=1);报数纪律(波动档看 min+重复一致性)** |
 | **docs/28** | **TP 第八轮:环境假说裁决=确认(外因,重复跑全一致+clocks 取证);TP-T3 v1 尸检(ray 卡死 RegisterClient 2.5h 零 trial)与 v2 无 ray 重写(subprocess 分片/注入自证/smem 预过滤/E 三档);step 09 全网格+自动裁决** |
 | **docs/29** | **TP 第九轮:TP-T3 v2 跑通(kernel 级 3~7%)但 e2e 收益错位(仅 T=1024 兑现,主嫌查表键 M×topk 错位/次嫌赢家诅咒);v2.1 finalize 终审(键探针自校准+复审+钉死默认+端到端自证);00_reset_tuned_cfg 保口径可比** |
+| **docs/30** | **TP 第十轮:通信拖慢计算定量账(L0 +254µs=纯 SM 让渡/L1 +190 中 48 是协议尾);L0 v2 dispenser+comm 转岗、SwiGLU 融合(列交织+fp32 epilogue)、sched 单 all_gather、L1 独立 comm 预算;回滚开关 TK_L0/TK_L0_GLU/TK_COMM_SMS_L1** |
 | experience/ | 12 篇相关工作与平台经验(01 总览、12 SM120/PCIe 适配最常用) |
 | blogs/ | 教学博客系列(6 篇, Astro 格式):TK 融合算子教程 + 本仓库实现细节 + 优化经验, 面向入门读者 |

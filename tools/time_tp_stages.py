@@ -50,6 +50,8 @@ def _worker(rank, world, init_method, ne, iters, tokens):
     # scratch for GEMM-alone references (same shapes as the fused calls)
     ref_gateup = torch.empty_like(s.gateup_out)
     ref_expout = torch.empty_like(s.expert_out)
+    ref_act = torch.empty_like(s.act)
+    ref_task_next = torch.zeros(1, dtype=torch.int32, device=device)
 
     stages = ["sched", "tok_copy", "L0_fused", "silu", "L1_fused", "final_red",
               "L0_gemm_alone", "L1_gemm_alone", "full_run"]
@@ -71,8 +73,9 @@ def _worker(rank, world, init_method, ne, iters, tokens):
 
     for _ in range(iters):
         def st_sched():
-            dist.all_gather_into_tensor(s._all_topk, s._topk_ids_local)
-            dist.all_gather_into_tensor(s._all_w, s._topk_w_local)
+            s._packed_local[..., 0].copy_(s._topk_ids_local)
+            s._packed_local[..., 1].copy_(s._topk_w_bits)
+            dist.all_gather_into_tensor(s._packed_all.view(-1), s._packed_local.view(-1))
             s._sched_graph.replay()
         timed("sched", st_sched)
 
@@ -94,6 +97,15 @@ def _worker(rank, world, init_method, ne, iters, tokens):
                     s.l0_push_cnt, s.barrier_l0, s.num_push_sms,
                     max(s.num_comm_sms - s.num_push_sms, 1),
                     s.num_padded_total, s.num_tokens, s._l0_seq)
+            elif s.l0_mode == "v2":
+                s.gemm_next.zero_()
+                l0_out = s.act if s.l0_glu else s.gateup_out
+                l0_w = s.w_gateup_il if s.l0_glu else s.w_gateup
+                s.tk.moe_tp_dispatch_gemm_v2(
+                    s.pre_tokens, s.gathered, l0_w, l0_out, s.padded,
+                    s.tp_slots, s.slack, s.pull_order, s.blk_expert,
+                    s.gemm_next, s.barrier_l0, s.num_comm_sms,
+                    s.num_padded_total, s.num_tokens, s.l0_glu)
             else:
                 s.tk.moe_tp_dispatch_gemm(
                     s.pre_tokens, s.gathered, s.w_gateup, s.gateup_out, s.padded,
@@ -101,8 +113,12 @@ def _worker(rank, world, init_method, ne, iters, tokens):
                     s.num_comm_sms, s.num_padded_total, s.num_tokens)
         timed("L0_fused", st_l0)
 
-        timed("silu", lambda: torch.mul(
-            F.silu(s.gateup_out[:, :s.inter]), s.gateup_out[:, s.inter:], out=s.act))
+        # GLU 路径下 silu 已并入 L0 GEMM epilogue,此阶段为 0(docs/30)
+        if s.l0_glu:
+            timed("silu", lambda: None)
+        else:
+            timed("silu", lambda: torch.mul(
+                F.silu(s.gateup_out[:, :s.inter]), s.gateup_out[:, s.inter:], out=s.act))
 
         def st_l1():
             s._l1_seq += 1
@@ -120,9 +136,18 @@ def _worker(rank, world, init_method, ne, iters, tokens):
             s.combine_staging, s.final_contrib, s.recv_from, s.combine_out,
             s.barrier_l1, s.num_tokens, s._l1_seq))
 
-        # references: same GEMMs, no comm/prered (gathered/act already populated)
-        timed("L0_gemm_alone", lambda: s.tk.grouped_gemm(
-            s.gathered, s.w_gateup, ref_gateup, s.padded, 0))
+        # references: same GEMMs, no comm/prered (gathered/act already populated).
+        # GLU 路径的 L0 参考 = 同款 dispenser+GLU store 的纯算版(苹果对苹果:
+        # L0_fused 里已含 silu,参考也得含),否则退回 plain grouped_gemm。
+        if s.l0_glu:
+            def st_l0_alone():
+                ref_task_next.zero_()
+                s.tk.grouped_gemm_glu(s.gathered, s.w_gateup_il, ref_act,
+                                      s.padded, s.blk_expert, ref_task_next, 0)
+            timed("L0_gemm_alone", st_l0_alone)
+        else:
+            timed("L0_gemm_alone", lambda: s.tk.grouped_gemm(
+                s.gathered, s.w_gateup, ref_gateup, s.padded, 0))
         timed("L1_gemm_alone", lambda: s.tk.grouped_gemm(
             s.act, s.w2, ref_expout, s.padded, 0))
 
@@ -132,8 +157,10 @@ def _worker(rank, world, init_method, ne, iters, tokens):
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     if rank == 0:
         print(f"\n== tktp stage attribution (NE={ne}, T={tokens}, iters={iters}, "
-              f"dispatch={s.dispatch_mode}, comm_sms={s.num_comm_sms}, "
-              f"push_sms={s.num_push_sms}, max over ranks, us) ==")
+              f"dispatch={s.dispatch_mode}, l0={s.l0_mode}"
+              f"{'+glu' if s.l0_glu else ''}, comm_sms={s.num_comm_sms}, "
+              f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.num_push_sms}, "
+              f"max over ranks, us) ==")
         for k, v in zip(stages, t.tolist()):
             print(f"  {k:14} {v:10.1f}")
         l0 = dict(zip(stages, t.tolist()))

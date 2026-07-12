@@ -54,12 +54,14 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
     topk_weights = all_w[rank].contiguous()
 
     # ---- host golden ----
-    (padded_g, slots_g, w_g, slack_g, pull_g, job_g, pusho_g, P) = _build_tp_schedules(
+    (padded_g, slots_g, w_g, slack_g, pull_g, job_g, pusho_g, blk_g, P) = _build_tp_schedules(
         topk_ids, topk_weights, T, world, ne, rank, device)
 
-    # ---- GPU builder ----
+    # ---- GPU builder (docs/30: single packed all_gather input) ----
     N = world * T * topk
     ar = torch.arange(N, device=device)
+    packed_all = torch.stack(
+        [all_ids, all_w.contiguous().view(torch.int32)], dim=-1).contiguous()
     out = {
         "src_dev_grid": ar // (T * topk),
         "src_tok_grid": (ar // topk) % T,
@@ -71,8 +73,9 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
         "pull_order": torch.zeros(world * T, dtype=torch.int32, device=device),
         "job_order": torch.zeros(world * T, dtype=torch.int32, device=device),
         "push_order": torch.zeros(world, T, dtype=torch.int32, device=device),
+        "blk_expert": torch.zeros(P // ROW_BLOCK, dtype=torch.int32, device=device),
     }
-    _build_tp_schedules_gpu(all_ids, all_w, world, ne, rank, out)
+    _build_tp_schedules_gpu(packed_all, world, ne, rank, out)
 
     fails = []
     for name, got, ref in [("padded", out["padded"], padded_g),
@@ -81,7 +84,8 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
                            ("slack", out["slack"], slack_g),
                            ("pull_order", out["pull_order"], pull_g),
                            ("job_order", out["job_order"], job_g),
-                           ("push_order", out["push_order"], pusho_g)]:
+                           ("push_order", out["push_order"], pusho_g),
+                           ("blk_expert", out["blk_expert"], blk_g)]:
         if got.shape != ref.shape:
             fails.append(f"{name} shape {tuple(got.shape)} != host {tuple(ref.shape)}")
         elif not torch.equal(got, ref):
@@ -111,6 +115,14 @@ def _worker(rank, world, init_method, T, ne, topk, dist_kind, seed, out_list):
     real_per_blk = torch.bincount(flat // ROW_BLOCK, minlength=P // ROW_BLOCK)
     if not torch.equal(real_per_blk + slack_g.long(), torch.full_like(real_per_blk, ROW_BLOCK)):
         fails.append("slack[b] + real_in_block != ROW_BLOCK somewhere")
+    # docs/30: blk_expert — non-decreasing, and expert e owns exactly
+    # padded[e]/ROW_BLOCK consecutive row blocks (the dispenser GEMM's B index)
+    blk = blk_g.long()
+    if not bool((blk[1:] >= blk[:-1]).all()):
+        fails.append("blk_expert not non-decreasing")
+    blk_counts = torch.bincount(blk, minlength=ne)
+    if not torch.equal(blk_counts, (padded_g.long() // ROW_BLOCK)):
+        fails.append("blk_expert counts != padded/ROW_BLOCK")
     # docs/20 orders: both must be permutations of [0, world*T), and sorted by
     # their respective keys (pull: min slot ascending, job: max slot ascending)
     S = world * T

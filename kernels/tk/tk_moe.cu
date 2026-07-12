@@ -97,6 +97,44 @@ void entry_nb(const at::Tensor &inputs, const at::Tensor &weights, at::Tensor &o
     kernel<<<num_blocks, gemm_config::NUM_THREADS, smem, stream>>>(G);
     CUDACHECK(cudaGetLastError());
 }
+// GLU compute-only reference (docs/30): the dispenser GEMM with the fused
+// SwiGLU store and NO gate — the apples-to-apples "L0 GEMM alone" baseline
+// for time_tp_stages when v2+GLU is active (outputs = act (P, inter),
+// weights column-interleaved).
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void kernel_glu(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+                int *__restrict__ task_next, const int num_tasks) {
+    grouped_gemm_sm120_dispenser(G, no_gate{}, noop_epilogue{},
+                                 glu_store_policy<globals::outputs_gl>{G.outputs},
+                                 blk_expert, task_next, num_tasks);
+}
+void entry_glu(const at::Tensor &inputs, const at::Tensor &weights, at::Tensor &outputs,
+               const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
+               at::Tensor &task_next, const int expert_offset) {
+    TORCH_CHECK(inputs.size(0) % gemm_config::ROW_BLOCK == 0, "tokens % 128");
+    TORCH_CHECK(inputs.size(1) % gemm_config::RED_BLOCK == 0, "K % 64");
+    TORCH_CHECK(weights.size(2) % gemm_config::COL_BLOCK == 0, "N % 128");
+    TORCH_CHECK(outputs.size(1) == weights.size(2) / 2, "GLU outputs width must be N/2");
+    TORCH_CHECK(task_next.numel() == 1, "task_next must be a single int counter");
+    globals G {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(inputs),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = static_cast<int>(weights.size(0)),
+        .expert_offset = expert_offset
+    };
+    const int nblk = static_cast<int>(inputs.size(0)) / gemm_config::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
+    const int num_tasks = nblk * (static_cast<int>(weights.size(2)) / gemm_config::COL_BLOCK);
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel_glu, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel_glu<<<sm, gemm_config::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks);
+    CUDACHECK(cudaGetLastError());
+}
 } // namespace gg
 
 /* ===================================================================== *
@@ -564,6 +602,164 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &post_tokens,
     CUDACHECK(cudaGetLastError());
 }
 } // namespace tpdisp
+
+/* ===================================================================== *
+ * 2c-v2. TP pull dispatch ⊕ dispenser GEMM ⊕ fused SwiGLU (docs/30).
+ *
+ * Two structural fixes over tpdisp (v1), both aimed at the comm-slows-compute
+ * account (L0 exposure ~255us at comm24 == the pure SM-yield cost, data-wait
+ * ~0; and a separate 109us torch silu pass):
+ *
+ *   1. COMM SMs JOIN THE GEMM once the AllGather drains. v1's dispatch blocks
+ *      were short-lived (one block per 12 tokens, queued on the comm SMs) and
+ *      the GEMM walk was statically partitioned, so after the pull front
+ *      passed, 24 SMs idled for the rest of L0. v2 launches num_comm_sms
+ *      PERSISTENT comm blocks that pull in waves over pull_order, then join
+ *      the dispenser-fed GEMM (grouped_gemm_sm120_dispenser) alongside the
+ *      comp blocks — the same all-hands drain trick layer1 already uses in
+ *      the opposite direction (gemm_push_kernel_tp, docs/20).
+ *   2. SwiGLU IS THE GEMM EPILOGUE (glu_store_policy). Weights are column-
+ *      interleaved at setup ([gate64 | up64] per 128-col block), so each
+ *      output tile holds both halves of the same intermediate columns; the
+ *      consumer computes silu(gate)*up on the fp32 accumulators and stores
+ *      the 64-wide act tile directly — the separate silu kernel (109us +
+ *      75MB of HBM round-trip) disappears, and accuracy IMPROVES (silu on
+ *      fp32 accs instead of rounded bf16). TK_L0_GLU=0 falls back to the
+ *      plain store (gateup_out) + torch silu, independently of the dispenser.
+ *
+ * Join uses the dedicated named barrier (bar.sync 2) — NOT __syncthreads —
+ * for the docs/24 reason (barrier 0 is cycled with a 256-thread count inside
+ * the GEMM consumer group).
+ * ===================================================================== */
+namespace tpdisp2 {
+using globals = tpdisp::globals;   // same tables; outputs = act (GLU) or gateup_out (plain)
+
+// Persistent comm block: pull waves over pull_order (stride = all comm blocks),
+// TMA-scatter each token row to its TOP_K slots, bump row-block counters.
+// Same protocol as tpdisp::dispatch, but one resident block loops many waves;
+// the per-lane mbarrier phase flips once per completed expect+arrive cycle.
+__device__ inline void dispatch_persistent(const globals &G, const int cb_idx, const int num_cb) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::token_vec (&token)[globals::TOKENS_PER_BLOCK] =
+        al.allocate<typename globals::token_vec, globals::TOKENS_PER_BLOCK>();
+    __shared__ semaphore token_arrived[globals::TOKENS_PER_BLOCK];
+    const int lane_id = threadIdx.x;
+    if (lane_id < globals::TOKENS_PER_BLOCK)
+        init_semaphore(token_arrived[lane_id], 0, 1);
+    __syncthreads();
+    int phase = 0;
+    for (int base = cb_idx * globals::TOKENS_PER_BLOCK; base < G.s_max;
+         base += num_cb * globals::TOKENS_PER_BLOCK) {
+        const int i = base + lane_id;
+        if (lane_id < globals::TOKENS_PER_BLOCK && i < G.s_max) {
+            const int d = G.pull_order[{i}];
+            const int src_dev = d / G.num_tokens;
+            const int src_tok = d % G.num_tokens;
+            tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
+            tma::load_async(token[lane_id], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[lane_id]);
+            wait(token_arrived[lane_id], phase);
+            #pragma unroll
+            for (int k = 0; k < globals::TOP_K; k++) {
+                const int slot = G.tp_slots[{d, k}];
+                if (slot >= 0)
+                    tma::store_async(G.activations, token[lane_id], {slot, 0});
+            }
+            tma::store_async_wait();
+            #pragma unroll
+            for (int k = 0; k < globals::TOP_K; k++) {
+                const int slot = G.tp_slots[{d, k}];
+                if (slot >= 0)
+                    asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
+                                 :: "l"(&G.barrier[G.dev_idx][{slot / gemm_config::ROW_BLOCK}]), "r"(1) : "memory");
+            }
+            phase ^= 1;   // this lane's mbarrier completed one cycle
+        }
+        __syncthreads(); // wave's smem fully consumed before reuse
+    }
+}
+
+template <bool GLU>
+__global__ __launch_bounds__(gemm_config::NUM_THREADS, 1)
+void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+            int *__restrict__ task_next, const int num_tasks) {
+    if (blockIdx.x >= G.num_comp_sms) {
+        dispatch_persistent(G, blockIdx.x - G.num_comp_sms, gridDim.x - G.num_comp_sms);
+        // join the GEMM pool on the DEDICATED named barrier (docs/24: barrier 0
+        // is cycled with a 256-count inside the GEMM consumer group).
+        asm volatile("bar.sync 2, %0;" :: "n"(gemm_config::NUM_THREADS));
+    }
+    if constexpr (GLU) {
+        grouped_gemm_sm120_dispenser(G, tpdisp::dispatch_gate{G}, noop_epilogue{},
+                                     glu_store_policy<globals::outputs_gl>{G.outputs},
+                                     blk_expert, task_next, num_tasks);
+    } else {
+        grouped_gemm_sm120_dispenser(G, tpdisp::dispatch_gate{G}, noop_epilogue{},
+                                     plain_store_policy<globals::outputs_gl>{G.outputs},
+                                     blk_expert, task_next, num_tasks);
+    }
+}
+
+void entry(kittens::py::TKParallelTensor &pre_tokens, at::Tensor &post_tokens,
+           at::Tensor &weights, at::Tensor &outputs, at::Tensor &padded_tokens_per_expert,
+           at::Tensor &tp_slots, at::Tensor &slack, at::Tensor &pull_order,
+           at::Tensor &blk_expert, at::Tensor &gemm_next,
+           kittens::py::TKParallelTensor &barrier,
+           const int num_comm_sms, const int num_padded_local_tokens, const int num_tokens,
+           const bool glu) {
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
+    TORCH_CHECK(weights.size(0) == num_local_experts,
+                "TP weights first dim must equal the FULL expert count");
+    TORCH_CHECK(num_local_experts <= gemm_config::MAX_LOCAL_EXPERTS, "too many experts");
+    TORCH_CHECK(tp_slots.size(1) == globals::TOP_K, "tp_slots second dim must be TOP_K");
+    TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms must be >= 1 (deadlock otherwise)");
+    TORCH_CHECK(gemm_next.numel() == 1, "gemm_next must be a single int counter");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
+    const int num_comp_sms = sm - num_comm_sms;
+    const int s_max = static_cast<int>(tp_slots.size(0));
+    TORCH_CHECK(s_max == globals::NUM_DEVICES * num_tokens, "tp_slots rows must be world*T");
+    TORCH_CHECK(pull_order.size(0) == s_max, "pull_order must cover world*T tokens");
+    const int nblk = num_padded_local_tokens / gemm_config::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
+    const int col_blocks = static_cast<int>(weights.size(2)) / gemm_config::COL_BLOCK;
+    const int num_tasks = nblk * col_blocks;
+    // GLU output is (P, inter) in 64-wide tiles; plain is (P, 2*inter).
+    TORCH_CHECK(outputs.size(1) == (glu ? weights.size(2) / 2 : weights.size(2)),
+                "outputs width mismatch for the chosen store policy");
+    globals G {
+        .pre_tokens = kittens::py::parallel_tensor_to_pgl<globals::pre_tokens_pgl>(pre_tokens),
+        .activations = kittens::py::tensor_to_gl<globals::post_tokens_gl>(post_tokens),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .tp_slots = kittens::py::tensor_to_gl<globals::slots_gl>(tp_slots),
+        .slack = kittens::py::tensor_to_gl<globals::slack_gl>(slack),
+        .pull_order = kittens::py::tensor_to_gl<globals::order_gl>(pull_order),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_local_experts = num_local_experts,
+        .expert_offset = 0,
+        .num_padded_local_tokens = num_padded_local_tokens, .num_tokens = num_tokens,
+        .s_max = s_max, .num_comp_sms = num_comp_sms
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = gemm_config::DYNAMIC_SHARED_MEMORY + 1024;
+    if (glu) {
+        CUDACHECK(cudaFuncSetAttribute(kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel<true><<<sm, gemm_config::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks);
+    } else {
+        CUDACHECK(cudaFuncSetAttribute(kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel<false><<<sm, gemm_config::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks);
+    }
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / gemm_config::ROW_BLOCK + 255) / 256 + 1;
+    tpdisp::reset_kernel<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace tpdisp2
 
 /* ===================================================================== *
  * 2d. TP PUSH AllGather-dispatch ⊕ grouped GEMM (layer0, TP-T1; docs/23).
@@ -2029,6 +2225,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_gemm_prered_push_fused", &preredpush::gemm_push_entry);
     m.def("moe_final_reduce_push", &preredpush::final_reduce_push_entry);
     m.def("moe_tp_dispatch_gemm", &tpdisp::entry);
+    m.def("moe_tp_dispatch_gemm_v2", &tpdisp2::entry);
+    m.def("grouped_gemm_glu", &gg::entry_glu);
     m.def("moe_tp_dispatch_push_gemm", &tppdisp::entry);
     m.def("moe_tp_gemm_prered_push", &preredpush::gemm_push_entry_tp);
 }

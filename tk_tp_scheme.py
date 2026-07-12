@@ -122,12 +122,19 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     # within a row, argsort stability irrelevant).
     push_order = torch.argsort(mins.view(world_size, num_tokens), dim=1).to(torch.int32)
 
+    # docs/30: row block -> expert id (drives the dispenser GEMM's B-tile index;
+    # first expert whose cumulative row-block end exceeds the block index).
+    rb_end = torch.cumsum(padded // ROW_BLOCK, dim=0)
+    blk_expert = torch.searchsorted(
+        rb_end, torch.arange(nblk, device="cpu"), right=True).to(torch.int32)
+
     return (padded.to(torch.int32).to(device), tp_slots.to(device),
             tp_w.to(device), slack.to(device), pull_order.to(device),
-            job_order.to(device), push_order.to(device), num_padded_total)
+            job_order.to(device), push_order.to(device), blk_expert.to(device),
+            num_padded_total)
 
 
-def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out):
+def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     """GPU-vectorized rebuild of the TP schedule tables, element-for-element
     identical to the host `_build_tp_schedules` golden (tools/verify_tp_schedule
     adjudicates). Called each run() and counted in timing — the fair analogue of
@@ -136,6 +143,12 @@ def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out)
     assignment in the total order (eid, ring, src_tok, kpos), every key unique
     (bijection over flattened all_topk) so stability is not required.
 
+    docs/30 sched-merge: the input is now ONE gathered tensor
+    `packed_all (world, T, TOP_K, 2) int32` — [..., 0] = topk ids,
+    [..., 1] = the float32 routing weights' BIT PATTERN (view(int32)); one
+    NCCL all_gather replaces the former two. Weights are bit-copied into
+    prered_w through its int32 view (reinterpret, not a dtype cast).
+
     In TP every assignment is local, so there is no trash-row redirect; and the
     layer1 tables (push_expected_l1 / recv_from / final_contrib / prered_dst)
     are routing-INDEPENDENT constants (every card holds all experts), set once
@@ -143,12 +156,12 @@ def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out)
 
     Fixed shapes, no host sync, no bincount — CUDA-graph capturable.
     """
-    device = all_topk.device
-    T = all_topk.shape[1]
-    top_k = all_topk.shape[2]
+    device = packed_all.device
+    T = packed_all.shape[1]
+    top_k = packed_all.shape[2]
     N = world_size * T * top_k
 
-    eid = all_topk.reshape(N).long()
+    eid = packed_all[..., 0].reshape(N).long()
     # canonical order within an expert = (src_dev, src_tok, kpos) = flat index n
     # (docs/23: all ranks must build the SAME layout for the push dispatch).
     key = eid * N + torch.arange(N, device=device)
@@ -172,8 +185,10 @@ def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out)
     slot_by_n = torch.empty(N, dtype=torch.int32, device=device)
     slot_by_n.scatter_(0, order, slot_sorted.to(torch.int32))
     out["tp_slots"].copy_(slot_by_n.view(world_size * T, top_k))
-    # weights: flat n already IS (j, kpos) — no reorder needed.
-    out["prered_w"].copy_(all_w.reshape(world_size * T, top_k))
+    # weights: flat n already IS (j, kpos); bit-copy the float32 pattern
+    # through prered_w's int32 view (docs/30 sched-merge packing).
+    out["prered_w"].view(torch.int32).copy_(
+        packed_all[..., 1].reshape(world_size * T, top_k))
 
     # slack: only the tail block of each expert carries (padded - real); scatter
     # via a trash slot for empty experts (capture-safe, no boolean compaction).
@@ -197,6 +212,14 @@ def _build_tp_schedules_gpu(all_topk, all_w, world_size, num_experts, rank, out)
     if "push_order" in out:
         out["push_order"].copy_(
             torch.argsort(mins.view(world_size, T), dim=1).to(torch.int32))
+
+    # docs/30: row block -> expert (dispenser GEMM B-tile index). searchsorted
+    # keeps shapes fixed (capture-safe), mirrors the host golden formula.
+    if "blk_expert" in out:
+        nblk = out["blk_expert"].shape[0]
+        rb_end = torch.cumsum(padded // ROW_BLOCK, dim=0)
+        out["blk_expert"].copy_(torch.searchsorted(
+            rb_end, torch.arange(nblk, device=device), right=True).to(torch.int32))
 
 
 class TKFusedTP(DistributedScheme):
@@ -231,7 +254,7 @@ class TKFusedTP(DistributedScheme):
 
         # ---- host golden schedule (not timed) ----
         (padded, tp_slots, tp_w, slack, pull_order, job_order, push_order,
-         num_padded_total) = _build_tp_schedules(
+         blk_expert, num_padded_total) = _build_tp_schedules(
             problem.topk_ids, problem.topk_weights, num_tokens, world,
             num_experts, ctx.rank, device)
         self.padded = padded
@@ -241,10 +264,20 @@ class TKFusedTP(DistributedScheme):
         self.pull_order = pull_order.contiguous()
         self.job_order = job_order.contiguous()
         self.push_order = push_order.contiguous()
+        self.blk_expert = blk_expert.contiguous()
         self.num_padded_total = num_padded_total
         self.num_jobs = world * num_tokens
         # layer1 dispenser counter (docs/20), zeroed each iter (same-stream)
         self.job_next = torch.zeros(1, dtype=torch.int32, device=device)
+        # docs/30: layer0 v2 = dispenser GEMM (comm blocks join after the AG)
+        # + fused SwiGLU store (weights column-interleaved). Independent
+        # rollback switches: TK_L0=v1 restores the static-walk kernel wholesale,
+        # TK_L0_GLU=0 keeps the dispenser but stores gateup_out + torch silu.
+        self.l0_mode = os.environ.get("TK_L0", "v2")
+        self.l0_glu = (os.environ.get("TK_L0_GLU", "1") == "1"
+                       and self.l0_mode == "v2")
+        # layer0 dispenser task counter, zeroed each iter (same-stream)
+        self.gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
         # TP-T1 (docs/23): dispatch data plane. "pull" = tpdisp (weak path,
         # 23.5GB/s under 4-way concurrency, 16 comm SMs); "push" = tppdisp
         # (strong path 50.9GB/s, 4 SMs saturate, chunk watermarks). Default
@@ -277,12 +310,15 @@ class TKFusedTP(DistributedScheme):
         if self.gpu_schedule:
             N = world * num_tokens * self.top_k
             ar = torch.arange(N, device=device)
-            self._all_topk = torch.empty(world, num_tokens, self.top_k,
-                                         device=device, dtype=problem.topk_ids.dtype)
-            self._all_w = torch.empty(world, num_tokens, self.top_k,
-                                      device=device, dtype=torch.float32)
+            # docs/30 sched-merge: ids + weight bits ride ONE all_gather.
+            # packed[..., 0] = topk ids, packed[..., 1] = float32 bit pattern.
+            self._packed_local = torch.empty(num_tokens, self.top_k, 2,
+                                             device=device, dtype=torch.int32)
+            self._packed_all = torch.empty(world, num_tokens, self.top_k, 2,
+                                           device=device, dtype=torch.int32)
             self._topk_ids_local = problem.topk_ids.contiguous()
             self._topk_w_local = problem.topk_weights.float().contiguous()
+            self._topk_w_bits = self._topk_w_local.view(torch.int32)
             self._num_experts = num_experts
             self._sched_out = {
                 "src_dev_grid": ar // (num_tokens * self.top_k),
@@ -291,6 +327,7 @@ class TKFusedTP(DistributedScheme):
                 "padded": self.padded, "tp_slots": self.tp_slots,
                 "prered_w": self.prered_w, "slack": self.slack,
                 "pull_order": self.pull_order, "job_order": self.job_order,
+                "blk_expert": self.blk_expert,
             }
             # push_order is only consumed by the (frozen) push dispatch — keep
             # it out of the timed per-iter rebuild on the pull path (docs/26:
@@ -303,6 +340,16 @@ class TKFusedTP(DistributedScheme):
         w1 = problem.w1                                     # (E, 2*inter, H), [gate; up]
         self.w_gateup = w1.transpose(1, 2).contiguous()     # (E, H, 2*inter), [gate | up]
         self.w2 = problem.w2.transpose(1, 2).contiguous()   # (E, inter, H)
+        if self.l0_glu:
+            # docs/30: column-interleave so every 128-col GEMM tile is
+            # [gate64 | up64] of the SAME intermediate columns — the SwiGLU
+            # epilogue pairs the halves inside the accumulator. Setup-time
+            # permutation, run-time free.
+            E = self.w_gateup.shape[0]
+            gate = self.w_gateup[:, :, :inter].reshape(E, H, inter // 64, 64)
+            up = self.w_gateup[:, :, inter:].reshape(E, H, inter // 64, 64)
+            self.w_gateup_il = torch.stack([gate, up], dim=3) \
+                                    .reshape(E, H, 2 * inter).contiguous()
 
         # ---- buffers ----
         TK = self.tk.TKParallelTensor
@@ -350,7 +397,13 @@ class TKFusedTP(DistributedScheme):
         # 2290@24, round 5) — TP is GEMM-bound but the L0 dispatch queue AND
         # the L1 dispenser both live on comm blocks; 24 is the measured best
         # so far (32/40 swept next round for the knee).
+        # docs/30: with v2 the L0 comm blocks convert to GEMM workers after the
+        # AG, so L0's knee may move; L1 gets its own budget (TK_COMM_SMS_L1) —
+        # its comm blocks stream pushes but never help the GEMM before it ends,
+        # so a SMALLER L1 budget may win (push saturates at ~4 SMs, docs/22).
         self.num_comm_sms = int(os.environ.get("TK_COMM_SMS", "24"))
+        self.num_comm_sms_l1 = int(os.environ.get("TK_COMM_SMS_L1",
+                                                  str(self.num_comm_sms)))
         self._l0_seq = 0
         self._l1_seq = 0
 
@@ -361,16 +414,21 @@ class TKFusedTP(DistributedScheme):
         # Table shapes/addresses are fixed (routing invariant per problem);
         # the pure-compute builder is CUDA-graph captured after first use.
         if self.gpu_schedule:
-            torch.distributed.all_gather_into_tensor(self._all_topk, self._topk_ids_local)
-            torch.distributed.all_gather_into_tensor(self._all_w, self._topk_w_local)
+            # docs/30 sched-merge: pack ids + weight bits, ONE all_gather
+            # (saves an NCCL launch ~40us; pack copies are ~5us device kernels
+            # and stay inside the timed region for fairness).
+            self._packed_local[..., 0].copy_(self._topk_ids_local)
+            self._packed_local[..., 1].copy_(self._topk_w_bits)
+            torch.distributed.all_gather_into_tensor(
+                self._packed_all.view(-1), self._packed_local.view(-1))
             if self._sched_graph is None:
-                _build_tp_schedules_gpu(self._all_topk, self._all_w,
+                _build_tp_schedules_gpu(self._packed_all,
                                         self.ctx.world_size, self._num_experts,
                                         self.ctx.rank, self._sched_out)  # warmup
                 torch.cuda.synchronize()
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
-                    _build_tp_schedules_gpu(self._all_topk, self._all_w,
+                    _build_tp_schedules_gpu(self._packed_all,
                                             self.ctx.world_size, self._num_experts,
                                             self.ctx.rank, self._sched_out)
                 self._sched_graph = g
@@ -397,6 +455,19 @@ class TKFusedTP(DistributedScheme):
                 self.push_order, self.l0_push_cnt, self.barrier_l0,
                 self.num_push_sms, max(self.num_comm_sms - self.num_push_sms, 1),
                 self.num_padded_total, self.num_tokens, self._l0_seq)
+        elif self.l0_mode == "v2":
+            # docs/30: dispenser GEMM (comm blocks join after the AG drains) +
+            # fused SwiGLU store (GLU) or plain store + torch silu (rollback).
+            self.gemm_next.zero_()
+            l0_out = self.act if self.l0_glu else self.gateup_out
+            l0_w = self.w_gateup_il if self.l0_glu else self.w_gateup
+            tk.moe_tp_dispatch_gemm_v2(self.pre_tokens, self.gathered, l0_w,
+                                       l0_out, self.padded, self.tp_slots,
+                                       self.slack, self.pull_order,
+                                       self.blk_expert, self.gemm_next,
+                                       self.barrier_l0, self.num_comm_sms,
+                                       self.num_padded_total, self.num_tokens,
+                                       self.l0_glu)
         else:
             tk.moe_tp_dispatch_gemm(self.pre_tokens, self.gathered, self.w_gateup,
                                     self.gateup_out, self.padded, self.tp_slots,
@@ -404,10 +475,12 @@ class TKFusedTP(DistributedScheme):
                                     self.num_comm_sms, self.num_padded_total,
                                     self.num_tokens)
 
-        # silu(gate) * up on the halves (up compute hid under the AG comm)
-        inter = self.inter
-        torch.mul(F.silu(self.gateup_out[:, :inter]),
-                  self.gateup_out[:, inter:], out=self.act)
+        # silu(gate) * up on the halves — skipped when the GLU store already
+        # produced act inside the L0 GEMM epilogue (docs/30).
+        if not self.l0_glu:
+            inter = self.inter
+            torch.mul(F.silu(self.gateup_out[:, :inter]),
+                      self.gateup_out[:, inter:], out=self.act)
 
         # layer1: W2 GEMM ⊕ local top-k prered ⊕ push (dense ReduceScatter),
         # then the source-side reduce over the world partial planes.
@@ -419,7 +492,7 @@ class TKFusedTP(DistributedScheme):
                                    self.tp_slots, self.prered_w,
                                    self.combine_local_cnt, self.push_expected_l1,
                                    self.job_order, self.job_next,
-                                   self.barrier_l1, self.num_comm_sms,
+                                   self.barrier_l1, self.num_comm_sms_l1,
                                    self.num_padded_total, self.num_tokens,
                                    self.num_jobs, self._l1_seq)
         tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,

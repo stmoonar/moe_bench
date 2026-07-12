@@ -147,7 +147,11 @@ else
     run_step 02_verify_tp_schedule 900 python -m moe_bench.tools.verify_tp_schedule
 
     # ---------- 3. 正确性对拍（harness 自动 verify vs reference_moe） ----------
+    # 默认路径现在是 L0 v2 + GLU(docs/30);再单独门控 v2 无 GLU 与 v1 回归,
+    # 三者分开跑,失败时可以直接定位是 dispenser 还是 GLU store 的问题。
     run_step 03_correct_ne64            600 python -m moe_bench.tools.run_tktp 64  --iters 10
+    run_step 03g_correct_ne64_gluoff 600 env TK_L0_GLU=0 python -m moe_bench.tools.run_tktp 64 --iters 10
+    run_step 03o_correct_ne64_l0v1   600 env TK_L0=v1 python -m moe_bench.tools.run_tktp 64 --iters 10
     run_step 03p_correct_ne64_push 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 --iters 10
     if [ "$QUICK" != "1" ]; then
         run_step 03_correct_ne128       600 python -m moe_bench.tools.run_tktp 128 --iters 10
@@ -162,18 +166,30 @@ else
         --no-verify --iters 50 --json "$JSONS/serial_ne64_t512.json"
     run_step 04_bench_tktp_512   600 python -m moe_bench.tools.run_tktp 64 --scheme tktp \
         --no-verify --iters 50 --json "$JSONS/tktp_ne64_t512.json"
+    # docs/30 A/B: v2 无 GLU(隔离 dispenser 收益)与 v1(上代基线)
+    run_step 04g_bench_gluoff_512 600 env TK_L0_GLU=0 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_gluoff_ne64_t512.json"
+    run_step 04o_bench_l0v1_512 600 env TK_L0=v1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_l0v1_ne64_t512.json"
     # push 路径已冻结(docs/25: TP 是 GEMM-bound, push 无收益且 scatter 粒度受限),
     # 保留单点 bench 作回归记录
     run_step 04p_bench_push_512 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_push_ne64_t512.json"
 
     if [ "$QUICK" != "1" ]; then
-        # ---------- 5. comm SM 预算 sweep（docs/25: 拐点在 24 之后, 扫到 40） ----------
+        # ---------- 5. comm SM 预算 sweep（docs/30: v2 下 comm 块会转岗,
+        # L0 拐点可能右移, 重扫; L1 独立预算 TK_COMM_SMS_L1 首扫） ----------
         for CS in 8 16 24 32 40; do
             run_step "05_sweep_commsms_${CS}" 600 \
                 env TK_COMM_SMS=$CS python -m moe_bench.tools.run_tktp 64 \
                 --scheme tktp --no-verify --iters 30 \
                 --json "$JSONS/tktp_commsms${CS}.json"
+        done
+        for CS1 in 8 16; do
+            run_step "05b_sweep_l1sms_${CS1}" 600 \
+                env TK_COMM_SMS_L1=$CS1 python -m moe_bench.tools.run_tktp 64 \
+                --scheme tktp --no-verify --iters 30 \
+                --json "$JSONS/tktp_l1sms${CS1}.json"
         done
         # ---------- 6. token 数 sweep ----------
         for T in 256 1024; do
@@ -215,6 +231,7 @@ else
 
     # ---------- 8. 分阶段归因(docs/09 三件套: 各阶段 + GEMM-alone 对照) ----------
     run_step 08_time_stages 900 python -m moe_bench.tools.time_tp_stages 64 20
+    run_step 08o_time_stages_l0v1 900 env TK_L0=v1 python -m moe_bench.tools.time_tp_stages 64 20
     run_step 08p_time_stages_push 900 env TK_TP_DISPATCH=push python -m moe_bench.tools.time_tp_stages 64 20
     if [ "$QUICK" != "1" ]; then
         run_step 08_time_stages_cs8 900 env TK_COMM_SMS=8 python -m moe_bench.tools.time_tp_stages 64 20
