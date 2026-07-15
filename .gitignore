@@ -10,3 +10,4 @@ kernels/tileoverlap/**/_C*.so
 kernels/tk/build/
 kernels/tk/sm120_common.cuh
 configs/tk_ep_bf16.yaml
+tmp/

@@ -1,5 +1,10 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：主测试配置写入协作规则
+
+- `AGENTS.md` 已明确所有测试先以 `configs/tp_rtx_pro5000_4gpu_fp8.yaml` 为唯一默认口径；通用 benchmark 必须显式传 `--config`，专用脚本不能直接读取 YAML 时必须逐项对齐。
+- A/B 只能最小化覆盖实验字段，覆盖项必须写入 run manifest、结果目录和 `HANDOFF.md`；`.gitignore` 同步忽略本地回流的 `tmp/` 结果目录。
+
 ## 2026-07-16：持久化 tp_run_20260715_124912 测试配置
 
 - 新增 `configs/tp_rtx_pro5000_4gpu_fp8.yaml`：可由 `MoEBenchConfig` 直接加载的 RTX PRO 5000 四卡 TP FP8 正式主工作负载（H=4096、I=3072、E=64、TopK=8、T/rank=512、warmup=20、FP8 block 128x128）。
