@@ -1,5 +1,11 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：docs 文档收敛与历史归档
+
+- 将原 `docs/01~46` 完整移入 `docs/归档/2026-07-08_至_2026-07-16_迭代记录/`，原始实验、负结果和复现命令均保留；历史正文中的 `docs/NN` 统一解释为归档目录中的同编号文件。
+- 新增 `docs/README.md` 总入口，并按当前状态、实现架构、性能方法论、平台边界与负结果、测试调试五个长期主题完成收敛。新 session 应先读 `docs/README.md` 和本文件顶部，不再把某一篇历史轮次文档当作当前任务清单。
+- 后续当前结论直接维护到主题文档；单次实验参数进入 `configs/runs/`，长过程记录进入 `docs/归档/`，避免再次形成顶层编号碎片。
+
 ## 2026-07-16：沉淀 ThunderKittens 融合 kernel profiling 方法
 
 - 新增 `experience/13_ThunderKittens融合Kernel性能分析.md`，整理端到端 CUDA Event、torch/Chrome trace、nsys、NCU 与设备端 `TKProfiler` 的四层下钻流程，并补充多进程 `torchrun`、application replay、Source/SASS 和 marker 设计注意事项。
@@ -9,7 +15,7 @@
 
 - 新增 `distributed.run_distributed_suite` 和 `tools/run_tp_bench_suite.py`：主配置显式读取 `configs/tp_rtx_pro5000_4gpu_fp8.yaml`，23 个核心性能 case 只启动一次四 worker，并缓存同 shape/precision 权重；每 case 仍独立 setup/close、恢复 `TK_*` 环境并输出原 JSON 文件名。
 - `tools/run_tp_all.sh` 默认 `REUSE_BENCH=1`，核心性能步骤合并为 `04_bench_suite_reuse`；`REUSE_BENCH=0` 恢复逐 case 隔离，`STEPS`/`FOCUS` 默认自动回退。正确性、schedule 和 stage attribution 保持独立；runner 默认 conda Python 和自动卡组也已对齐当前 8 卡环境（0–3/4–7，并校验 index 存在）。
-- 本地已过 py_compile、23-case plan/输出唯一性/环境覆盖校验；Windows 无 vLLM/CUDA，待上机先跑 `QUICK=1`，异常时用 `REUSE_BENCH=0` 对照。详见 docs/46。
+- 本地已过 py_compile、23-case plan/输出唯一性/环境覆盖校验；Windows 无 vLLM/CUDA，待上机先跑 `QUICK=1`，异常时用 `REUSE_BENCH=0` 对照。当前操作说明见 `docs/05_测试与调试指南.md`，原始实现记录归档为 `docs/归档/2026-07-08_至_2026-07-16_迭代记录/46_TP性能矩阵单进程复用.md`。
 
 ## 2026-07-16：主测试配置写入协作规则
 
@@ -22,7 +28,7 @@
 - 新增 `configs/runs/tp_run_20260715_124912.yaml`：保存该轮 git/环境/卡组/QUICK runner 参数，以及 44 步 BF16/FP8、CE、COMM SM sweep、正确性和分阶段计时矩阵；严格重放需切到记录的 commit 后执行 manifest 中的命令。
 - 注意：该历史 run 使用卡组 `0,1,2,3`、未调优 vLLM serial config，且日志存在 Triton 导入错误；这些限制已写入 manifest，不能把结果直接当作推荐拓扑下的最终数值。
 
-> 新 session 从这里接手。读完本文 + 最新一篇 docs/ 即可继续。
+> 新 session 从这里接手。先读本文顶部 + `docs/README.md`；下面内容是按时间倒序保留的历史记录。
 
 **最后更新**:2026-07-11(TP 分支 tp_test 第二轮:**首轮实测正确性全绿但性能 0.73× serial
 (3613 vs 2624µs),归因为两处调度串行**(docs/20):L0 ring 拉取序使 GEMM 停在整个 AG 后 +
