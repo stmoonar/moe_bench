@@ -21,6 +21,7 @@
 | [10_坑与反模式清单.md](10_坑与反模式清单.md) | 死锁面、内存序、false sharing、one-wave、隐式同步等 40+ 条具体的坑 | 全程对照，code review 清单 |
 | [11_ThunderKittens多GPU与MoE融合实战.md](11_ThunderKittens多GPU与MoE融合实战.md) | TK 多 GPU 基础设施（pgl/multimem/TKParallelTensor）、仓库 4 个融合 kernel 逐个拆解、MoE TP/EP tile 粒度 overlap 的 TK 实施方案与 TK 特有坑 | 用 TK 动手实现时（本篇例外地含真实 API 名与文件路径） |
 | [12_SM120与PCIe拓扑适配.md](12_SM120与PCIe拓扑适配.md) | 实际硬件（RTX PRO 5000 / SM120 + PCIe）上 11 篇的勘误：multimem/跨卡原子/wgmma 失效清单与替代、st 版信号协议、PCIe 通信账重算、SM120 GEMM 模板改造 | 与 11 篇对照读，动手前先跑 §1/§6 的平台微基准 |
+| [13_ThunderKittens融合Kernel性能分析.md](13_ThunderKittens融合Kernel性能分析.md) | TK 的 CUDA Event、torch trace、nsys/NCU 与设备端 TKProfiler 分层用法；融合 kernel 内 comm/comp 拆账、multi-rank replay 风险及 SM120 移植边界 | 融合 kernel 已能运行、需要定位等待/通信/计算瓶颈时 |
 
 ## 十条最重要的经验（速览）
 

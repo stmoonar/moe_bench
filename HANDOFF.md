@@ -1,5 +1,10 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：沉淀 ThunderKittens 融合 kernel profiling 方法
+
+- 新增 `experience/13_ThunderKittens融合Kernel性能分析.md`，整理端到端 CUDA Event、torch/Chrome trace、nsys、NCU 与设备端 `TKProfiler` 的四层下钻流程，并补充多进程 `torchrun`、application replay、Source/SASS 和 marker 设计注意事项。
+- 源码审计确认 TK 原生 `TKProfiler` 当前仅在 `KITTENS_SM10X`（SM100/103）编译，仓库融合 kernel 尚未接入；本项目 SM120 应先用 nsys/NCU，需要内部阶段时间戳时实现普通 global-store 的轻量后端，不能直接删除架构宏。
+
 ## 2026-07-16：核心性能矩阵复用四进程/NCCL 生命周期
 
 - 新增 `distributed.run_distributed_suite` 和 `tools/run_tp_bench_suite.py`：主配置显式读取 `configs/tp_rtx_pro5000_4gpu_fp8.yaml`，23 个核心性能 case 只启动一次四 worker，并缓存同 shape/precision 权重；每 case 仍独立 setup/close、恢复 `TK_*` 环境并输出原 JSON 文件名。
