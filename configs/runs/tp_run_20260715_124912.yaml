@@ -1,0 +1,152 @@
+# tp_run_20260715_124912 的可追溯运行清单。
+#
+# 这是 suite manifest，不直接传给 MoEBenchConfig.from_file；可直接加载的主
+# workload 在 ../tp_rtx_pro5000_4gpu_fp8.yaml。要严格复现本轮，应在下方记录
+# 的 git commit 上使用 replay.command。
+
+format_version: 1
+run_id: tp_run_20260715_124912
+captured_at: "2026-07-15T12:49:12Z"
+
+source:
+  git_commit: 09f5a6b9ef8950a6a5c8de9772217cfdc4bb3328
+  git_branch: fp8_tp
+  result_directory: tmp/tp_run_20260715_124912
+  primary_config: configs/tp_rtx_pro5000_4gpu_fp8.yaml
+
+environment:
+  host: 262e1de522ad
+  gpu: NVIDIA RTX PRO 5000 72GB Blackwell
+  visible_gpu_count: 8
+  cards: [0, 1, 2, 3]
+  python: "3.12.0"
+  torch: "2.10.0+cu128"
+  torch_cuda: "12.8"
+  nvcc: "12.9"
+  driver: "580.105.08"
+  driver_cuda: "13.0"
+  venv: /data/cinnzhang_vllm_td_test/venvs/vllm-td/bin/activate
+
+replay:
+  script: tools/run_tp_all.sh
+  quick: true
+  focus: false
+  tune: false
+  steps_filter: null
+  # 必须在 moe_bench 上一级目录执行。
+  working_directory: /data/cinnzhang_vllm_td_test/xxy
+  command: >-
+    CARDS=0,1,2,3 QUICK=1 VENV=/data/cinnzhang_vllm_td_test/venvs/vllm-td/bin/activate
+    bash moe_bench/tools/run_tp_all.sh
+
+workload:
+  hidden_size: 4096
+  intermediate_size: 3072
+  num_experts: 64
+  topk: 8
+  parallel_mode: tp
+  world_size: 4
+  block_shape: [128, 128]
+  routing: balanced
+  distributed: true
+  warmup_iters: 5
+  use_cuda_graph: false
+  seed: 0
+
+suite:
+  preflight:
+    - reset_vllm_tuned_configs
+    - cpu_schedule_and_layout_checks
+    - clean_build_sm120_world_size_4
+
+  schedule_verification:
+    num_experts: [64, 128, 256]
+    routing: [balanced, skewed]
+
+  grouped_gemm_verification:
+    - {precision: fp8, experts: 64, padded_rows: 16384, k: 4096, n: 1536}
+    - {precision: fp8, experts: 64, padded_rows: 16384, k: 768, n: 4096}
+
+  correctness:
+    bench_iters: 10
+    tokens_per_rank: 512
+    cases:
+      - {name: bf16_default, precision: bf16, scheme: tktp}
+      - {name: bf16_glu_off, precision: bf16, scheme: tktp, env: {TK_L0_GLU: 0}}
+      - {name: bf16_l0_v1, precision: bf16, scheme: tktp, env: {TK_L0: v1}}
+      - {name: bf16_l1_v2, precision: bf16, scheme: tktp, env: {TK_L1: v2}}
+      - {name: bf16_push, precision: bf16, scheme: tktp, env: {TK_TP_DISPATCH: push}}
+      - {name: fp8_serial, precision: fp8, scheme: serial}
+      - {name: fp8_default, precision: fp8, scheme: tktp}
+      - name: fp8_both_ce
+        precision: fp8
+        scheme: tktp
+        env: {TK_L0_CE: 1, TK_L1_CE: 1}
+
+  benchmarks:
+    verify: false
+    cases:
+      - {name: bf16_serial_t512, precision: bf16, scheme: serial, tokens_per_rank: 512, bench_iters: 50}
+      - {name: bf16_default_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50}
+      - {name: bf16_glu_off_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0_GLU: 0}}
+      - {name: bf16_l0_v1_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0: v1}}
+      - {name: bf16_l1_v2_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1: v2}}
+      - {name: bf16_push_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_TP_DISPATCH: push}}
+      - {name: fp8_serial_t512, precision: fp8, scheme: serial, tokens_per_rank: 512, bench_iters: 50}
+      - {name: fp8_serial_t1024, precision: fp8, scheme: serial, tokens_per_rank: 1024, bench_iters: 30}
+      - {name: fp8_default_t512, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50}
+      - {name: fp8_default_t1024, precision: fp8, scheme: tktp, tokens_per_rank: 1024, bench_iters: 30}
+      - {name: fp8_l1_off_t512, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1_FP8: 0}}
+      - {name: fp8_l0_ce_t512, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0_CE: 1}}
+      - {name: fp8_l1_ce_t512, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1_CE: 1}}
+      - name: fp8_both_ce_t512
+        precision: fp8
+        scheme: tktp
+        tokens_per_rank: 512
+        bench_iters: 50
+        env: {TK_L0_CE: 1, TK_L1_CE: 1}
+      - name: fp8_both_ce_t1024
+        precision: fp8
+        scheme: tktp
+        tokens_per_rank: 1024
+        bench_iters: 30
+        env: {TK_L0_CE: 1, TK_L1_CE: 1}
+
+  comm_sms_sweeps:
+    precision: fp8
+    scheme: tktp
+    tokens_per_rank: 512
+    bench_iters: 30
+    verify: false
+    cases:
+      - {name: sm_driven, values: [8, 12, 16, 24], env_key: TK_COMM_SMS}
+      - name: both_ce
+        values: [4, 8, 12, 16]
+        env_key: TK_COMM_SMS
+        fixed_env: {TK_L0_CE: 1, TK_L1_CE: 1}
+
+  stage_attribution:
+    tokens_per_rank: 512
+    bench_iters: 20
+    cases:
+      - {name: bf16_default, precision: bf16}
+      - {name: bf16_l1_sms4, precision: bf16, env: {TK_COMM_SMS_L1: 4}}
+      - {name: bf16_l0_v1, precision: bf16, env: {TK_L0: v1}}
+      - {name: bf16_l1_v2, precision: bf16, env: {TK_L1: v2}}
+      - {name: bf16_push, precision: bf16, env: {TK_TP_DISPATCH: push}}
+      - {name: fp8_default, precision: fp8}
+      - name: fp8_both_ce
+        precision: fp8
+        env: {TK_L0_CE: 1, TK_L1_CE: 1}
+
+artifacts:
+  json_results: 23
+  log_files: 45
+  runner_steps: 44
+  clock_snapshots: 352
+
+known_caveats:
+  - 性能步骤使用 no-verify；正确性由独立的 correctness cases 检查。
+  - 本轮 serial 使用 vLLM 默认 MoE config，不是 RTX PRO 5000 调优配置。
+  - 日志中 Triton 导入失败，因此复现时必须同时核对实际 kernel 路径。
+  - 本轮卡组为 0,1,2,3，不是当前 AGENTS.md 推荐的间隔卡组。

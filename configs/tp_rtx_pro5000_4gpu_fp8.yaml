@@ -1,0 +1,55 @@
+# RTX PRO 5000 四卡 TP FP8 主测试配置。
+#
+# 对应 tp_run_20260715_124912 的主工作负载。该轮完整 A/B 矩阵（BF16、
+# copy-engine、COMM SM sweep、正确性和分阶段计时）记录在：
+#   configs/runs/tp_run_20260715_124912.yaml
+#
+# 可从 moe_bench 上一级目录直接加载：
+#   python -m moe_bench.bench \
+#     --config moe_bench/configs/tp_rtx_pro5000_4gpu_fp8.yaml
+
+# ---- Model / weight shape ----
+hidden_size: 4096
+intermediate_size: 3072
+num_experts: 64
+topk: 8
+
+# ---- Parallelism ----
+parallel_mode: tp
+world_size: 4
+
+# ---- Precision ----
+precision: fp8
+block_shape: [128, 128]
+
+# ---- Workload ----
+# 正式口径为每个 rank 512 tokens，四卡总 token 数为 2048。
+num_tokens: [512]
+
+# ---- Routing / load balance ----
+routing:
+  distribution: balanced
+  skew_alpha: 1.0
+  num_active_experts: null
+
+# ---- Distributed ----
+distributed: true
+all2all_backend: allgather_reducescatter
+
+# ---- Timing ----
+warmup_iters: 20
+# 历史 run 使用 warmup=5，并额外测了 T=1024/30 iters；主配置采用正式
+# T=512 口径和更充分的 warmup=20，历史参数精确值见 run manifest。
+bench_iters: 50
+use_cuda_graph: false
+seed: 0
+
+# ---- Correctness ----
+# 主配置默认开启验证；历史性能步骤通过 --no-verify 覆盖，并另跑 10 次正确性。
+verify: true
+verify_atol: null
+verify_rtol: null
+
+# ---- Output ----
+device: cuda
+output_json: null

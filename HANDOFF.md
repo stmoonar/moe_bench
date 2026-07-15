@@ -1,5 +1,11 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：持久化 tp_run_20260715_124912 测试配置
+
+- 新增 `configs/tp_rtx_pro5000_4gpu_fp8.yaml`：可由 `MoEBenchConfig` 直接加载的 RTX PRO 5000 四卡 TP FP8 正式主工作负载（H=4096、I=3072、E=64、TopK=8、T/rank=512、warmup=20、FP8 block 128x128）。
+- 新增 `configs/runs/tp_run_20260715_124912.yaml`：保存该轮 git/环境/卡组/QUICK runner 参数，以及 44 步 BF16/FP8、CE、COMM SM sweep、正确性和分阶段计时矩阵；严格重放需切到记录的 commit 后执行 manifest 中的命令。
+- 注意：该历史 run 使用卡组 `0,1,2,3`、未调优 vLLM serial config，且日志存在 Triton 导入错误；这些限制已写入 manifest，不能把结果直接当作推荐拓扑下的最终数值。
+
 > 新 session 从这里接手。读完本文 + 最新一篇 docs/ 即可继续。
 
 **最后更新**:2026-07-11(TP 分支 tp_test 第二轮:**首轮实测正确性全绿但性能 0.73× serial
