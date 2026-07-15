@@ -17,9 +17,12 @@ only has to implement ``setup``/``run``.
 from __future__ import annotations
 
 import dataclasses
+import gc
 import os
 import statistics
 import traceback
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
@@ -31,6 +34,48 @@ from .data import make_golden_problem, make_logical_weights, make_problem, make_
 from .reference import reference_moe, verify_output
 from .report import print_report, write_json
 from .schemes import DistributedScheme, get_scheme
+
+
+@dataclass(frozen=True)
+class DistributedRunSpec:
+    """One case in a shared-worker distributed benchmark suite."""
+
+    name: str
+    config: MoEBenchConfig
+    scheme_name: str
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@contextmanager
+def _temporary_environment(overrides: dict[str, str]):
+    """Apply per-case environment switches without leaking into the next case."""
+
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        os.environ.update(overrides)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _weights_cache_key(config: MoEBenchConfig) -> tuple:
+    """Fields that determine the generated local weight tensors."""
+
+    return (
+        config.hidden_size,
+        config.intermediate_size,
+        config.num_experts,
+        config.parallel_mode.value,
+        config.world_size,
+        config.precision.value,
+        tuple(config.block_shape),
+        config.seed,
+        config.device,
+    )
 
 
 def _time_scheme(scheme: DistributedScheme, config: MoEBenchConfig) -> dict[str, float]:
@@ -89,12 +134,19 @@ def _verify_rank(
 
 
 def _run_rank(
-    config: MoEBenchConfig, ctx: DistContext, scheme_name: str
+    config: MoEBenchConfig,
+    ctx: DistContext,
+    scheme_name: str,
+    *,
+    weights=None,
+    golden_weights=None,
 ) -> list[dict]:
     """Run the token sweep on this rank; rank 0 reports max latency over ranks."""
     # Weights don't depend on the token count; build once for the sweep.
-    weights = make_weights(config, rank=ctx.rank)
-    golden_weights = make_logical_weights(config) if config.verify else None
+    if weights is None:
+        weights = make_weights(config, rank=ctx.rank)
+    if config.verify and golden_weights is None:
+        golden_weights = make_logical_weights(config)
     results: list[dict] = []
     any_verify_failed = False
 
@@ -140,6 +192,7 @@ def _run_rank(
 
         scheme.close()
         del problem, scheme
+        gc.collect()
         torch.cuda.empty_cache()
 
     if ctx.is_rank0:
@@ -200,6 +253,72 @@ def _worker(
             dist.destroy_process_group()
 
 
+def _worker_suite(
+    local_rank: int,
+    world_size: int,
+    init_method: str,
+    specs: list[DistributedRunSpec],
+) -> None:
+    """Run many cases inside one worker/NCCL lifetime."""
+
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    torch.set_default_device(device)
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl",
+        init_method=init_method,
+        rank=local_rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    dist.all_reduce(torch.tensor([local_rank], device=device))
+    ctx = DistContext(
+        rank=local_rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+        group=None,
+    )
+    weights_cache: dict[tuple, object] = {}
+    golden_cache: dict[tuple, object] = {}
+    try:
+        for index, spec in enumerate(specs, start=1):
+            dist.barrier()
+            if ctx.is_rank0:
+                print(
+                    f"\n[suite {index}/{len(specs)}] {spec.name}: "
+                    f"scheme={spec.scheme_name} env={spec.env or '{}'}",
+                    flush=True,
+                )
+            key = _weights_cache_key(spec.config)
+            weights = weights_cache.get(key)
+            if weights is None:
+                weights = make_weights(spec.config, rank=ctx.rank)
+                weights_cache[key] = weights
+            golden_weights = None
+            if spec.config.verify:
+                golden_weights = golden_cache.get(key)
+                if golden_weights is None:
+                    golden_weights = make_logical_weights(spec.config)
+                    golden_cache[key] = golden_weights
+            with _temporary_environment(spec.env):
+                _run_rank(
+                    spec.config,
+                    ctx,
+                    spec.scheme_name,
+                    weights=weights,
+                    golden_weights=golden_weights,
+                )
+            dist.barrier()
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def run_distributed(config: MoEBenchConfig, scheme_name: str = "serial") -> None:
     """Spawn ``world_size`` GPU workers and run the distributed benchmark."""
     if not torch.cuda.is_available():
@@ -222,5 +341,45 @@ def run_distributed(config: MoEBenchConfig, scheme_name: str = "serial") -> None
         _worker,
         args=(config.world_size, init_method, config, scheme_name),
         nprocs=config.world_size,
+        join=True,
+    )
+
+
+def run_distributed_suite(specs: list[DistributedRunSpec]) -> None:
+    """Run multiple distributed cases with one process-group initialization.
+
+    Cases remain isolated at the scheme level (fresh ``setup``/``close``), while
+    worker processes, NCCL initialization, and compatible weight tensors are
+    reused. A suite failure terminates the whole worker group; rerun with the
+    legacy per-case runner when deadlock isolation is needed.
+    """
+
+    if not specs:
+        raise ValueError("Distributed suite must contain at least one case")
+    world_size = specs[0].config.world_size
+    if any(spec.config.world_size != world_size for spec in specs):
+        raise ValueError("All suite cases must use the same world_size")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed benchmark requires CUDA GPUs.")
+    if torch.cuda.device_count() < world_size:
+        raise RuntimeError(
+            f"world_size={world_size} but only {torch.cuda.device_count()} GPU(s) visible."
+        )
+
+    normalized: list[DistributedRunSpec] = []
+    for spec in specs:
+        config = spec.config
+        if config.use_cuda_graph:
+            config = dataclasses.replace(config, use_cuda_graph=False)
+        normalized.append(dataclasses.replace(spec, config=config))
+
+    from vllm.utils.network_utils import get_open_port
+
+    host = os.getenv("LOCALHOST", "localhost")
+    init_method = f"tcp://{host}:{get_open_port()}"
+    mp.spawn(
+        _worker_suite,
+        args=(world_size, init_method, normalized),
+        nprocs=world_size,
         join=True,
     )

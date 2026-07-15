@@ -4,7 +4,7 @@
 # workload 在 ../tp_rtx_pro5000_4gpu_fp8.yaml。要严格复现本轮，应在下方记录
 # 的 git commit 上使用 replay.command。
 
-format_version: 1
+format_version: 2
 run_id: tp_run_20260715_124912
 captured_at: "2026-07-15T12:49:12Z"
 
@@ -86,26 +86,28 @@ suite:
   benchmarks:
     verify: false
     cases:
-      - {name: bf16_serial_t512, precision: bf16, scheme: serial, tokens_per_rank: 512, bench_iters: 50}
-      - {name: bf16_default_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50}
-      - {name: bf16_glu_off_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0_GLU: 0}}
-      - {name: bf16_l0_v1_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0: v1}}
-      - {name: bf16_l1_v2_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1: v2}}
-      - {name: bf16_push_t512, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_TP_DISPATCH: push}}
-      - {name: fp8_serial_t512, precision: fp8, scheme: serial, tokens_per_rank: 512, bench_iters: 50}
-      - {name: fp8_serial_t1024, precision: fp8, scheme: serial, tokens_per_rank: 1024, bench_iters: 30}
-      - {name: fp8_default_t512, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50}
-      - {name: fp8_default_t1024, precision: fp8, scheme: tktp, tokens_per_rank: 1024, bench_iters: 30}
-      - {name: fp8_l1_off_t512, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1_FP8: 0}}
-      - {name: fp8_l0_ce_t512, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0_CE: 1}}
-      - {name: fp8_l1_ce_t512, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1_CE: 1}}
+      - {name: bf16_serial_t512, output: serial_ne64_t512.json, precision: bf16, scheme: serial, tokens_per_rank: 512, bench_iters: 50}
+      - {name: bf16_default_t512, output: tktp_ne64_t512.json, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50}
+      - {name: bf16_glu_off_t512, output: tktp_gluoff_ne64_t512.json, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0_GLU: 0}}
+      - {name: bf16_l0_v1_t512, output: tktp_l0v1_ne64_t512.json, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0: v1}}
+      - {name: bf16_l1_v2_t512, output: tktp_l1v2_ne64_t512.json, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1: v2}}
+      - {name: bf16_push_t512, output: tktp_push_ne64_t512.json, precision: bf16, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_TP_DISPATCH: push}}
+      - {name: fp8_serial_t512, output: serial_fp8_ne64_t512.json, precision: fp8, scheme: serial, tokens_per_rank: 512, bench_iters: 50}
+      - {name: fp8_serial_t1024, output: serial_fp8_t1024.json, precision: fp8, scheme: serial, tokens_per_rank: 1024, bench_iters: 30}
+      - {name: fp8_default_t512, output: tktp_fp8_ne64_t512.json, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50}
+      - {name: fp8_default_t1024, output: tktp_fp8_t1024.json, precision: fp8, scheme: tktp, tokens_per_rank: 1024, bench_iters: 30}
+      - {name: fp8_l1_off_t512, output: tktp_fp8_l1off_ne64_t512.json, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1_FP8: 0}}
+      - {name: fp8_l0_ce_t512, output: tktp_fp8_l0ce_ne64_t512.json, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L0_CE: 1}}
+      - {name: fp8_l1_ce_t512, output: tktp_fp8_l1ce_ne64_t512.json, precision: fp8, scheme: tktp, tokens_per_rank: 512, bench_iters: 50, env: {TK_L1_CE: 1}}
       - name: fp8_both_ce_t512
+        output: tktp_fp8_bothce_ne64_t512.json
         precision: fp8
         scheme: tktp
         tokens_per_rank: 512
         bench_iters: 50
         env: {TK_L0_CE: 1, TK_L1_CE: 1}
       - name: fp8_both_ce_t1024
+        output: tktp_fp8_bothce_t1024.json
         precision: fp8
         scheme: tktp
         tokens_per_rank: 1024
@@ -119,10 +121,16 @@ suite:
     bench_iters: 30
     verify: false
     cases:
-      - {name: sm_driven, values: [8, 12, 16, 24], env_key: TK_COMM_SMS}
+      - name: sm_driven
+        values: [8, 12, 16, 24]
+        env_key: TK_COMM_SMS
+        case_name_template: fp8_commsms{value}
+        output_template: tktp_fp8_commsms{value}.json
       - name: both_ce
         values: [4, 8, 12, 16]
         env_key: TK_COMM_SMS
+        case_name_template: fp8_ce_commsms{value}
+        output_template: tktp_fp8_ce_commsms{value}.json
         fixed_env: {TK_L0_CE: 1, TK_L1_CE: 1}
 
   stage_attribution:

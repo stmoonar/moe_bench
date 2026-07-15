@@ -6,10 +6,12 @@
 #   bash moe_bench/tools/run_tp_all.sh
 #
 # 可覆盖的环境变量：
-#   VENV   python 虚拟环境 activate 脚本（默认 /data/cinnzhang_vllm_td_test/venvs/vllm-td/bin/activate；
-#          设为 "none" 表示当前环境已就绪，跳过 source）
-#   CARDS  使用的 4 卡组（如 "9,11,13,15"）；不设则按 AGENTS.md 优先级自动挑空闲组
+#   PYTHON_BIN conda Python（默认 /root/miniconda3/envs/vllm-td/bin/python）
+#   VENV   可选的 activate 脚本；默认 none，直接使用 PYTHON_BIN
+#   CARDS  使用的 4 卡组（如 "0,1,2,3"）；不设则按 AGENTS.md 优先级自动挑空闲组
 #   QUICK  =1 只跑核心步骤（编译+裁决+NE64 对拍+512token bench），跳过 sweep
+#   REUSE_BENCH =1 在一次四进程/NCCL 生命周期内跑完核心性能矩阵（默认）；
+#          =0 恢复逐 case 独立进程，适合定位死锁。使用 STEPS/FOCUS 时默认自动回退为 0。
 #   FOCUS  =1 本轮迭代验证集（~4 分钟）：编译 + 默认路径对拍 + 主形状 bench
 #          + 本轮 A/B + t1024 + 归因。serial 基线/comm sweep/NE sweep/push 回归
 #          等六轮稳定项全部跳过（serial 稳定在 ±0.3%，比率用历史 serial 即可）；
@@ -25,8 +27,10 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOE_DIR="$(dirname "$SCRIPT_DIR")"                 # .../moe_bench
 PARENT_DIR="$(dirname "$MOE_DIR")"                 # 必须从这里跑 python -m moe_bench.*
-VENV="${VENV:-/data/cinnzhang_vllm_td_test/venvs/vllm-td/bin/activate}"
+PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/vllm-td/bin/python}"
+VENV="${VENV:-none}"
 QUICK="${QUICK:-0}"
+REUSE_BENCH="${REUSE_BENCH:-auto}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT="$MOE_DIR/tp_test_results/tp_run_$TS"
@@ -56,6 +60,12 @@ if [ "$VENV" != "none" ]; then
     else
         note "WARN: venv 不存在（$VENV），尝试用当前环境继续。可用 VENV=none 静默。"
     fi
+elif [ -x "$PYTHON_BIN" ]; then
+    export PATH="$(dirname "$PYTHON_BIN"):$PATH"
+    note "python: $PYTHON_BIN"
+else
+    note "FATAL: PYTHON_BIN 不可执行: $PYTHON_BIN"
+    exit 1
 fi
 command -v python >/dev/null || { note "FATAL: 没有 python"; exit 1; }
 command -v nvcc  >/dev/null || note "WARN: PATH 里没有 nvcc，编译步骤可能失败"
@@ -77,14 +87,15 @@ if [ -z "${CARDS:-}" ]; then
 import subprocess
 out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu",
                       "--format=csv,noheader,nounits"], capture_output=True, text=True).stdout
-busy = set()
+available, busy = set(), set()
 for line in out.strip().splitlines():
     idx, mem, util = [int(x.strip()) for x in line.split(",")]
+    available.add(idx)
     if mem > 2000 or util > 10:
         busy.add(idx)
-for grp in ("8,10,12,14", "9,11,13,15", "1,3,5,7", "0,2,4,6"):
+for grp in ("0,1,2,3", "4,5,6,7"):
     ids = [int(x) for x in grp.split(",")]
-    if all(i not in busy for i in ids):
+    if all(i in available and i not in busy for i in ids):
         print(grp)
         break
 else:
@@ -105,6 +116,10 @@ note "使用 GPU 组: $CARDS (CUDA_VISIBLE_DEVICES)"
 if [ "${FOCUS:-0}" = "1" ] && [ -z "${STEPS:-}" ]; then
     STEPS='^00_|^01_|^03_correct_ne64$|^04_bench_tktp_512$|^04l_|^06_tktp_t1024$|^08_time_stages$'
 fi
+if [ "$REUSE_BENCH" = "auto" ]; then
+    if [ -n "${STEPS:-}" ]; then REUSE_BENCH=0; else REUSE_BENCH=1; fi
+fi
+note "核心性能矩阵进程复用: REUSE_BENCH=$REUSE_BENCH"
 
 # ---------- 通用步骤执行器 ----------
 PASS=0; FAIL=0; SKIP=0
@@ -183,6 +198,8 @@ else
     fi
 
     # ---------- 4. 性能：serial baseline vs tktp（同 harness 同 config） ----------
+    # 默认由 04_bench_suite_reuse 一次性执行；逐 case 模式仅作死锁排障回退。
+    if [ "$REUSE_BENCH" != "1" ]; then
     run_step 04_bench_serial_512 600 python -m moe_bench.tools.run_tktp 64 --scheme serial \
         --no-verify --iters 50 --json "$JSONS/serial_ne64_t512.json"
     run_step 04_bench_tktp_512   600 python -m moe_bench.tools.run_tktp 64 --scheme tktp \
@@ -198,12 +215,14 @@ else
     # 保留单点 bench 作回归记录
     run_step 04p_bench_push_512 600 env TK_TP_DISPATCH=push python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --no-verify --iters 50 --json "$JSONS/tktp_push_ne64_t512.json"
+    fi
     # ---------- 4f. FP8 serial 基线(docs/37 P0: 先定标, 再写 kernel) ----------
     run_step 03f_correct_serial_fp8 600 python -m moe_bench.tools.run_tktp 64 \
         --scheme serial --precision fp8 --iters 10
     # ---------- 4f8. FP8 tktp(docs/39 P2: fp8 AG + fp8 GEMM + GLU, L1 bf16) ----------
     run_step 03f8_correct_tktp_fp8 600 python -m moe_bench.tools.run_tktp 64 \
         --precision fp8 --iters 10
+    if [ "$REUSE_BENCH" != "1" ]; then
     run_step 04f8_bench_tktp_fp8_512 600 python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --precision fp8 --no-verify --iters 50 \
         --json "$JSONS/tktp_fp8_ne64_t512.json"
@@ -214,9 +233,16 @@ else
     run_step 04l8_bench_l1fp8_off_512 600 env TK_L1_FP8=0 python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --precision fp8 --no-verify --iters 50 \
         --json "$JSONS/tktp_fp8_l1off_ne64_t512.json"
+    fi
     # ---------- 4c8. Copy-engine A/B(docs/43: 线上字节 0 SM, 打破零和) ----------
     run_step 03c8_correct_tktp_fp8_ce 600 env TK_L0_CE=1 TK_L1_CE=1 \
         python -m moe_bench.tools.run_tktp 64 --precision fp8 --iters 10
+    if [ "$REUSE_BENCH" = "1" ]; then
+        run_step 04_bench_suite_reuse 3600 python -m moe_bench.tools.run_tp_bench_suite \
+            --config "$MOE_DIR/configs/tp_rtx_pro5000_4gpu_fp8.yaml" \
+            --manifest "$MOE_DIR/configs/runs/tp_run_20260715_124912.yaml" \
+            --output-dir "$JSONS"
+    else
     run_step 04c8_bench_l0ce_512 600 env TK_L0_CE=1 python -m moe_bench.tools.run_tktp 64 \
         --scheme tktp --precision fp8 --no-verify --iters 50 \
         --json "$JSONS/tktp_fp8_l0ce_ne64_t512.json"
@@ -236,23 +262,28 @@ else
             --scheme tktp --precision fp8 --no-verify --iters 30 \
             --json "$JSONS/tktp_fp8_ce_commsms${CS}.json"
     done
+    fi
     run_step 08c8_time_stages_fp8_ce 900 env TK_L0_CE=1 TK_L1_CE=1 \
         python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     # ---------- 5f. fp8 comm_sms 重扫(docs/40: AG 字节减半, 拐点应左移) ----------
+    if [ "$REUSE_BENCH" != "1" ]; then
     for CS in 8 12 16 24; do
         run_step "05f_fp8_commsms_${CS}" 600 \
             env TK_COMM_SMS=$CS python -m moe_bench.tools.run_tktp 64 \
             --scheme tktp --precision fp8 --no-verify --iters 30 \
             --json "$JSONS/tktp_fp8_commsms${CS}.json"
     done
+    fi
     # ---------- 8f. fp8 分阶段归因 ----------
     run_step 08f_time_stages_fp8 900 python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
+    if [ "$REUSE_BENCH" != "1" ]; then
     run_step 04f_bench_serial_fp8_512 600 python -m moe_bench.tools.run_tktp 64 \
         --scheme serial --precision fp8 --no-verify --iters 50 \
         --json "$JSONS/serial_fp8_ne64_t512.json"
     run_step 04f_bench_serial_fp8_t1024 600 python -m moe_bench.tools.run_tktp 64 \
         --scheme serial --precision fp8 --no-verify --iters 30 --tokens 1024 \
         --json "$JSONS/serial_fp8_t1024.json"
+    fi
 
     if [ "$QUICK" != "1" ]; then
         # ---------- 5. comm SM 预算 sweep（docs/30: v2 下 comm 块会转岗,

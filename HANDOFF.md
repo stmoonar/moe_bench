@@ -1,5 +1,11 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：核心性能矩阵复用四进程/NCCL 生命周期
+
+- 新增 `distributed.run_distributed_suite` 和 `tools/run_tp_bench_suite.py`：主配置显式读取 `configs/tp_rtx_pro5000_4gpu_fp8.yaml`，23 个核心性能 case 只启动一次四 worker，并缓存同 shape/precision 权重；每 case 仍独立 setup/close、恢复 `TK_*` 环境并输出原 JSON 文件名。
+- `tools/run_tp_all.sh` 默认 `REUSE_BENCH=1`，核心性能步骤合并为 `04_bench_suite_reuse`；`REUSE_BENCH=0` 恢复逐 case 隔离，`STEPS`/`FOCUS` 默认自动回退。正确性、schedule 和 stage attribution 保持独立；runner 默认 conda Python 和自动卡组也已对齐当前 8 卡环境（0–3/4–7，并校验 index 存在）。
+- 本地已过 py_compile、23-case plan/输出唯一性/环境覆盖校验；Windows 无 vLLM/CUDA，待上机先跑 `QUICK=1`，异常时用 `REUSE_BENCH=0` 对照。详见 docs/46。
+
 ## 2026-07-16：主测试配置写入协作规则
 
 - `AGENTS.md` 已明确所有测试先以 `configs/tp_rtx_pro5000_4gpu_fp8.yaml` 为唯一默认口径；通用 benchmark 必须显式传 `--config`，专用脚本不能直接读取 YAML 时必须逐项对齐。
