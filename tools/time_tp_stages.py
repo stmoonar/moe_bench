@@ -98,7 +98,18 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
         timed("tok_copy", st_copy)
 
         def st_l0():
-            if s.fp8:
+            if s.fp8 and getattr(s, "l0_lane", False):
+                # P1: per-lane comm 块(TK_L0_LANE=1), 与 scheme.run 相同
+                s.gemm_next.zero_()
+                s.pull_next.zero_()
+                s.tk.moe_tp_dispatch_gemm_fp8_lane(
+                    s.pre_tokens, s.pre_scales, s.ag_tokens, s.ag_scales,
+                    s.gathered, s.gathered_scales, s.w_gateup_fp8,
+                    s.w1_il_scales, s.act, s.padded, s.tp_slots, s.slack,
+                    s.pull_order, s.blk_expert, s.gemm_next, s.pull_next,
+                    s.barrier_l0, s.num_comm_sms, s.num_padded_total,
+                    s.num_tokens)
+            elif s.fp8:
                 if s.l0_ce:
                     s.ce_flags.zero_()
                     s.tk.ce_ag_pull(s.pre_tokens, s.pre_scales,

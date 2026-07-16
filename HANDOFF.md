@@ -14,7 +14,16 @@
 - **路径**：P1 comm 块 per-lane 化 + 扫 comm_sms{4..24}（预期让渡税 183→90-120，
   e2e→~1620-1650）→ P2 由 P1 门控：push 化重估（强路径 4 SM 打满，e2e→~1570-1600）
   → P3 sched 摊薄（最大单项 ~270，e2e→~1500-1540）。
-- **下一步：实现 P1**（改 tpdisp8::dispatch_persistent 为 per-lane 模式，带回滚开关）。
+- **P1 已落码（TK_L0_LANE=1，默认 0）**：`tpdisp8::dispatch_persistent_lane`（槽线程
+  stride-8 铺 5 个 warp、全局 pull_next 原子领取=严格 pull_order 消费序、零块内同步、
+  非槽线程 sync(2) 等转岗）+ `kernel_lane`/`entry_lane`/绑定 `*_fp8_lane`；scheme 分支
+  与 WARP/CE 互斥；time_tp_stages 已感知。脚本：03p1 门 + 04p1 e2e + 05p1 lane
+  comm_sms sweep{4..24} + 05p1_wave_commsms_4 对照 + 08p1 归因。本地 py_compile/
+  bash -n/preflight 已过。
+- **下一步（上机）**：`STEPS='^00_|^01_|^03f8_|^03p1_|^04f8_|^04p1_|^05p1_|^08f_|^08p1_'
+  bash tools/run_tp_all.sh`（01 必跑）。裁决：①03p1 正确性；②05p1 sweep 拐点是否左移
+  （目标 8-12 SM 持平或超 24 SM 波同步版的 1709）；③08p1 在拐点档的 L0 让渡税
+  （目标 183→90-120）；④若 12 SM 以下 L0 暴露回升 → 直接进 P2（push 化重估）。
 
 ## 2026-07-16：方案A 定位定案——per-SM TMA 队列共存税坐实，现形态判负
 

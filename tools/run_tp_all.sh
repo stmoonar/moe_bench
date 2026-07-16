@@ -294,8 +294,33 @@ else
             --json "$JSONS/tktp_fp8_commsms${CS}.json"
     done
     fi
+    # ---------- 4p1. P1: comm 块 per-lane 自由化(PK 路线重估 2026-07-16) ----------
+    run_step 03p1_correct_tktp_fp8_lane 600 env TK_L0_LANE=1 \
+        python -m moe_bench.tools.run_tktp 64 --precision fp8 --iters 10
+    if [ "$REUSE_BENCH" != "1" ]; then
+    run_step 04p1_bench_lane_512 600 env TK_L0_LANE=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_lane_ne64_t512.json"
+    run_step 04p1_bench_lane_t1024 600 env TK_L0_LANE=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 30 --tokens 1024 \
+        --json "$JSONS/tktp_fp8_lane_t1024.json"
+    # per-lane 版拐点应大幅左移(24 SM 是波同步低效的补偿, 不是带宽需要);
+    # 附 4 SM 波同步对照, 分离 "per-lane 收益" 与 "少 SM 本身"
+    for CS in 4 8 12 16 24; do
+        run_step "05p1_lane_commsms_${CS}" 600 \
+            env TK_L0_LANE=1 TK_COMM_SMS=$CS python -m moe_bench.tools.run_tktp 64 \
+            --scheme tktp --precision fp8 --no-verify --iters 30 \
+            --json "$JSONS/tktp_fp8_lane_commsms${CS}.json"
+    done
+    run_step 05p1_wave_commsms_4 600 env TK_COMM_SMS=4 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 30 \
+        --json "$JSONS/tktp_fp8_wave_commsms4.json"
+    fi
     # ---------- 8f. fp8 分阶段归因 ----------
     run_step 08f_time_stages_fp8 900 python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
+    # P1 归因: 最优 lane comm_sms 档的 L0 暴露(跑完 05p1 后把 TK_COMM_SMS 换成拐点值)
+    run_step 08p1_time_stages_lane 900 env TK_L0_LANE=1 TK_COMM_SMS=12 \
+        python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     # ---------- 8w8. 方案A 定位(逐迭代 + 融合税三分解: 纯GEMM上限/共存税/
     # gate-straggler 税; 裁决 L0 双稳机制①发射饥饿 vs ②TMA 队列 HoL) ----------
     run_step 08w8_diag_warp 900 python -m moe_bench.tools.diag_warp 64 30 512

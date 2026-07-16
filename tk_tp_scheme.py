@@ -241,6 +241,7 @@ class TKFusedTP(DistributedScheme):
         self.l1_fp8 = False  # fp8 分支里按 TK_L1_FP8 重置(docs/42)
         self.l0_warp = False  # 方案A 通信 warp 化, fp8 分支里按 TK_L0_WARP 重置
         self.l1_warp = False
+        self.l0_lane = False  # P1 per-lane comm 块, fp8 分支里按 TK_L0_LANE 重置
         if self.fp8:
             assert cfg.block_shape == [128, 128], "fp8 kernels assume [128,128] blocks"
         self.ctx = ctx
@@ -377,13 +378,21 @@ class TKFusedTP(DistributedScheme):
             self.l1_ce = os.environ.get("TK_L1_CE", "0") == "1"
             # 方案A(2026-07-16): 通信 warp 化 —— comm 角色降为 GEMM 块内
             # producer warp 的闲置 lane, GEMM 拿满全部 SM(回收让渡税)。
-            # 默认关, A/B 定价后再定默认(回滚纪律同 docs/23)。与 CE 互斥。
+            # 已判负(per-SM TMA 队列共存税, 归档 2026-07-16 方案A 文档),
+            # 默认关留档。与 CE 互斥。
             self.l0_warp = os.environ.get("TK_L0_WARP", "0") == "1"
             self.l1_warp = os.environ.get("TK_L1_WARP", "0") == "1"
             assert not (self.l0_warp and self.l0_ce), "TK_L0_WARP 与 TK_L0_CE 互斥"
             assert not (self.l1_warp and self.l1_ce), "TK_L1_WARP 与 TK_L1_CE 互斥"
             assert not (self.l1_warp and not self.l1_fp8), \
                 "TK_L1_WARP 需要 TK_L1_FP8=1(warp kernel 只有 fp8 版)"
+            # P1(PK 路线重估 2026-07-16): comm 块 per-lane 自由化 —— 保持
+            # inter-SM 几何(comm 块+转岗), 把波同步拉取(20 lane 等最慢者)
+            # 换成 per-lane 独立领取, 同样在飞并发用更少 comm SM 承载;
+            # 配 TK_COMM_SMS sweep 找新拐点。默认关, A/B 后定默认。
+            self.l0_lane = os.environ.get("TK_L0_LANE", "0") == "1"
+            assert not (self.l0_lane and (self.l0_warp or self.l0_ce)), \
+                "TK_L0_LANE 与 TK_L0_WARP/TK_L0_CE 互斥"
             s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
             w1_bf = (problem.w1.float() * s1.repeat_interleave(128, 1)
                                             .repeat_interleave(128, 2))
@@ -561,6 +570,18 @@ class TKFusedTP(DistributedScheme):
                 self.tp_slots, self.slack, self.pull_order, self.blk_expert,
                 self.gemm_next, self.pull_next, self.barrier_l0,
                 self.num_padded_total, self.num_tokens)
+        elif self.fp8 and self.l0_lane:
+            # P1: per-lane 自由化的 comm 块拉取(inter-SM 几何不变, 只换
+            # 拉取组织方式); 配 TK_COMM_SMS sweep 找新拐点。
+            self.gemm_next.zero_()
+            self.pull_next.zero_()
+            self.tk.moe_tp_dispatch_gemm_fp8_lane(
+                self.pre_tokens, self.pre_scales, self.ag_tokens,
+                self.ag_scales, self.gathered, self.gathered_scales,
+                self.w_gateup_fp8, self.w1_il_scales, self.act, self.padded,
+                self.tp_slots, self.slack, self.pull_order, self.blk_expert,
+                self.gemm_next, self.pull_next, self.barrier_l0,
+                self.num_comm_sms, self.num_padded_total, self.num_tokens)
         elif self.fp8:
             # docs/39 P2: fp8 AG(token 4KB + scales 128B)⊕ fp8 dispenser GEMM
             # ⊕ GLU epilogue(fp32 上 silu*up 直存 bf16 act); L1 保持 bf16。
