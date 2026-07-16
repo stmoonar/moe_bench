@@ -1514,6 +1514,268 @@ void entry_lane(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
     reset_kernel<<<rb, 256, 0, stream>>>(G);
     CUDACHECK(cudaGetLastError());
 }
+
+/* ---- P2(TK_L0_PUSH=1, PK 路线重估): L0 push 强路径 + lane 组织 --------
+ * P1 裁决: pull 弱路径(23.5GB/s)是 RTT 受限的, ~480 在飞并发是真实需求,
+ * 24 个 comm SM 压不下去。push 是 posted write(无往返, 微基准 4 SM 打满
+ * 50.9GB/s), 收侧只剩本地操作(本地 staging 读 ~0.5µs), 在飞并发需求暴跌
+ * —— 这是把 comm SM 从 24 压到 ~8 的结构性通道。
+ *
+ * 角色(comm 块内 per-lane, 组织同 dispatch_persistent_lane):
+ *  - push lane(前 num_push_sms 个 comm 块): 按 push_order(即各 dest 的
+ *    消费序, canonical 布局下全 rank 一致)把自己的量化行推到 3 个 peer 的
+ *    ag_staging 平面(plane=源 rank, 单写者), store_async_wait →
+ *    __threadfence_system → st.release.sys 写 per-token 到达 flag
+ *    (seq 门控, 免清零) —— T6-v1 已验证协议的逐 token 版;
+ *  - scatter lane(其余 comm 块): 严格 pull_order 领取; 远端 token 本地
+ *    acquire 自旋等 flag 后从本地 staging 读, 自己分片直读 pre_tokens;
+ *    scatter 8 槽 + red.add 行块计数与 pull 路径逐字节同构;
+ *  - 两类块干完照旧 sync(2) 转岗 GEMM worker。
+ * 跨迭代安全: 现有双 pcie_device_barrier 保证 peer 完成上迭代 scatter 后
+ * 本 rank 才会覆盖其 staging(等价于 pre_tokens 的保护)。
+ */
+struct pglobals {
+    using cfg = gemm_config_fp8;
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    static constexpr int TOP_K = 8;
+    static constexpr int NSC = H / 128;
+    using token_vec = sv_fp8e4m3<H>;
+    using scale_vec = sv_fl<NSC>;
+    static constexpr int SLOTS = 20;             // 每 comm 块 in-flight 槽数
+    using pre_tokens_pgl = pgl<gl<fp8e4m3, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
+    using pre_scales_pgl = pgl<gl<float, 1, 1, -1, NSC, scale_vec>, NUM_DEVICES, false>;
+    using flags_pgl      = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    using gathered_gl    = gl<fp8e4m3, 1, 1, -1, H, token_vec, cfg::A_tile>;
+    using gscales_gl     = gl<float, 1, 1, -1, NSC, scale_vec>;
+    using weights_gl     = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;
+    using w_scales_gl    = gl<float, 1, -1, -1, -1>;
+    using outputs_gl     = gl<bf16, 1, 1, -1, -1>;
+    using counts_gl      = gl<int, 1, 1, 1, -1>;
+    using slots_gl       = gl<int, 1, 1, -1, TOP_K>;
+    using slack_gl       = gl<int, 1, 1, 1, -1>;
+    using order_gl       = gl<int, 1, 1, 1, -1>;
+    using porder_gl      = gl<int, 1, 1, -1, -1>;   // (world, T)
+    using barrier_pgl    = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    pre_tokens_pgl pre_tokens;    // 本 rank 量化行(源侧读 + 自己分片直读)
+    pre_scales_pgl pre_scales;
+    pre_tokens_pgl ag_staging;    // peer 可写 (S, H) fp8, plane s = 源 s 单写者
+    pre_scales_pgl ag_sscales;    // peer 可写 (S, NSC)
+    flags_pgl ag_flags;           // peer 可写 (1, S), 值 = 到达 seq
+    gathered_gl activations;      // gathered(本地)
+    gscales_gl a_scales;
+    weights_gl weights;
+    w_scales_gl w_scales;
+    outputs_gl outputs;
+    slots_gl tp_slots;
+    slack_gl slack;
+    order_gl pull_order;
+    porder_gl push_order;
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int num_padded_local_tokens;
+    const int num_tokens;
+    const int s_max;
+    const int num_comp_sms;
+    const int num_push_sms;
+    const int seq;
+};
+struct dispatch_gate_p {
+    const pglobals &G;
+    __device__ inline void operator()(int row_idx) const {
+        int v;
+        asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        while (v != gemm_config_fp8::ROW_BLOCK) {
+            __nanosleep(32);
+            asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        }
+    }
+};
+__device__ inline void push_lane(const pglobals &G, int *__restrict__ push_next,
+                                 typename pglobals::token_vec &tok,
+                                 typename pglobals::scale_vec &sc, semaphore &sem) {
+    int phase = 0;
+    while (true) {
+        const int j = atomicAdd(push_next, 1);
+        if (j >= G.num_tokens) return;
+        const int t = G.push_order[{G.dev_idx, j}];   // 本源在各 dest 的消费序
+        tma::expect_bytes(sem, sizeof(typename pglobals::token_vec) +
+                               sizeof(typename pglobals::scale_vec));
+        tma::load_async(tok, G.pre_tokens[G.dev_idx], {t, 0}, sem);
+        tma::load_async(sc, G.pre_scales[G.dev_idx], {t, 0}, sem);
+        wait(sem, phase);
+        phase ^= 1;
+        const int d = G.dev_idx * G.num_tokens + t;
+        #pragma unroll
+        for (int dst = 0; dst < pglobals::NUM_DEVICES; dst++) {
+            if (dst == G.dev_idx) continue;
+            tma::store_async(G.ag_staging[dst], tok, {d, 0});
+            tma::store_async(G.ag_sscales[dst], sc, {d, 0});
+        }
+        tma::store_async_wait();      // 本 token 的远端 bulk 写已提交
+        __threadfence_system();
+        #pragma unroll
+        for (int dst = 0; dst < pglobals::NUM_DEVICES; dst++) {
+            if (dst == G.dev_idx) continue;
+            asm volatile("st.release.sys.global.s32 [%0], %1;"
+                         :: "l"(&G.ag_flags[dst][{0, d}]), "r"(G.seq) : "memory");
+        }
+    }
+}
+__device__ inline void scatter_lane(const pglobals &G, int *__restrict__ pull_next,
+                                    typename pglobals::token_vec &tok,
+                                    typename pglobals::scale_vec &sc, semaphore &sem) {
+    int phase = 0;
+    while (true) {
+        const int i = atomicAdd(pull_next, 1);
+        if (i >= G.s_max) return;
+        const int d = G.pull_order[{i}];
+        const int src = d / G.num_tokens;
+        const int t = d % G.num_tokens;
+        if (src != G.dev_idx) {       // 远端行: 本地 acquire 自旋等到达
+            int v;
+            do {
+                asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
+                             : "=r"(v) : "l"(&G.ag_flags[G.dev_idx][{0, d}]) : "memory");
+                if (v < G.seq) __nanosleep(64);
+            } while (v < G.seq);
+        }
+        tma::expect_bytes(sem, sizeof(typename pglobals::token_vec) +
+                               sizeof(typename pglobals::scale_vec));
+        if (src == G.dev_idx) {       // 自己分片直读(免 staging 一跳)
+            tma::load_async(tok, G.pre_tokens[src], {t, 0}, sem);
+            tma::load_async(sc, G.pre_scales[src], {t, 0}, sem);
+        } else {                      // 本地 staging 读(~0.5µs, 无 PCIe RTT)
+            tma::load_async(tok, G.ag_staging[G.dev_idx], {d, 0}, sem);
+            tma::load_async(sc, G.ag_sscales[G.dev_idx], {d, 0}, sem);
+        }
+        wait(sem, phase);
+        phase ^= 1;
+        #pragma unroll
+        for (int k = 0; k < pglobals::TOP_K; k++) {
+            const int s = G.tp_slots[{d, k}];
+            if (s >= 0) {
+                tma::store_async(G.activations, tok, {s, 0});
+                tma::store_async(G.a_scales, sc, {s, 0});
+            }
+        }
+        tma::store_async_wait();
+        #pragma unroll
+        for (int k = 0; k < pglobals::TOP_K; k++) {
+            const int s = G.tp_slots[{d, k}];
+            if (s >= 0)
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
+                             :: "l"(&G.barrier[G.dev_idx][{s / gemm_config_fp8::ROW_BLOCK}]), "r"(1) : "memory");
+        }
+    }
+}
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void kernel_push(const __grid_constant__ pglobals G, const int *__restrict__ blk_expert,
+                 int *__restrict__ task_next, const int num_tasks,
+                 int *__restrict__ push_next, int *__restrict__ pull_next) {
+    using cfg = gemm_config_fp8;
+    if (blockIdx.x >= G.num_comp_sms) {
+        extern __shared__ int __shm[];
+        tma_swizzle_allocator al((int*)&__shm[0]);
+        typename pglobals::token_vec (&tok)[pglobals::SLOTS] =
+            al.allocate<typename pglobals::token_vec, pglobals::SLOTS>();
+        typename pglobals::scale_vec (&sc)[pglobals::SLOTS] =
+            al.allocate<typename pglobals::scale_vec, pglobals::SLOTS>();
+        __shared__ semaphore arrived[pglobals::SLOTS];
+        const bool is_slot = (threadIdx.x % 8 == 0) &&
+                             (threadIdx.x / 8 < pglobals::SLOTS);
+        const int slot = threadIdx.x / 8;
+        if (is_slot)
+            init_semaphore(arrived[slot], 0, 1);
+        __syncthreads();
+        if (is_slot) {
+            const int cb = blockIdx.x - G.num_comp_sms;
+            if (cb < G.num_push_sms)
+                push_lane(G, push_next, tok[slot], sc[slot], arrived[slot]);
+            else
+                scatter_lane(G, pull_next, tok[slot], sc[slot], arrived[slot]);
+        }
+        kittens::group<cfg::NUM_WARPS>::sync(2);  // 全块汇合后转岗(docs/24)
+    }
+    grouped_gemm_sm120_fp8_dispenser(G, dispatch_gate_p{G}, noop_epilogue{},
+                                     glu_store_policy<pglobals::outputs_gl>{G.outputs},
+                                     blk_expert, task_next, num_tasks);
+}
+__global__ __launch_bounds__(256)
+void reset_kernel_p(const __grid_constant__ pglobals G) {
+    const int nb = (G.num_padded_local_tokens + gemm_config_fp8::ROW_BLOCK - 1) / gemm_config_fp8::ROW_BLOCK;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < nb; i += gridDim.x * blockDim.x)
+        G.barrier[G.dev_idx][{i}] = G.slack[{i}];
+}
+void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTensor &pre_scales,
+           kittens::py::TKParallelTensor &ag_staging, kittens::py::TKParallelTensor &ag_sscales,
+           kittens::py::TKParallelTensor &ag_flags,
+           at::Tensor &gathered, at::Tensor &gathered_scales,
+           at::Tensor &weights, at::Tensor &w_scales, at::Tensor &act,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &tp_slots,
+           at::Tensor &slack, at::Tensor &pull_order, at::Tensor &push_order,
+           at::Tensor &blk_expert, at::Tensor &gemm_next,
+           at::Tensor &push_next, at::Tensor &pull_next,
+           kittens::py::TKParallelTensor &barrier,
+           const int num_comm_sms, const int num_push_sms,
+           const int num_padded_local_tokens, const int num_tokens, const int seq) {
+    using cfg = gemm_config_fp8;
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
+    TORCH_CHECK(weights.size(0) == num_local_experts, "weights (E,N,K) E mismatch");
+    TORCH_CHECK(weights.size(2) == pglobals::H, "weights (E,N,K) K must be H");
+    TORCH_CHECK(act.size(1) == weights.size(1) / 2, "act width must be N/2 (GLU)");
+    TORCH_CHECK(gathered_scales.size(1) == pglobals::NSC, "gathered_scales (P, H/128)");
+    TORCH_CHECK(gemm_next.numel() == 1 && push_next.numel() == 1 && pull_next.numel() == 1, "counters");
+    TORCH_CHECK(num_comm_sms >= 2 && num_push_sms >= 1 && num_push_sms < num_comm_sms,
+                "need >=1 push SM and >=1 scatter SM");
+    const int s_max = static_cast<int>(tp_slots.size(0));
+    TORCH_CHECK(s_max == pglobals::NUM_DEVICES * num_tokens, "tp_slots rows must be world*T");
+    TORCH_CHECK(ag_staging.data_.size(0) == s_max, "ag_staging rows must be world*T");
+    TORCH_CHECK(ag_flags.data_.numel() >= s_max, "ag_flags must cover world*T");
+    TORCH_CHECK(push_order.size(0) == pglobals::NUM_DEVICES && push_order.size(1) == num_tokens,
+                "push_order must be (world, T)");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
+    const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
+    pglobals G {
+        .pre_tokens = kittens::py::parallel_tensor_to_pgl<pglobals::pre_tokens_pgl>(pre_tokens),
+        .pre_scales = kittens::py::parallel_tensor_to_pgl<pglobals::pre_scales_pgl>(pre_scales),
+        .ag_staging = kittens::py::parallel_tensor_to_pgl<pglobals::pre_tokens_pgl>(ag_staging),
+        .ag_sscales = kittens::py::parallel_tensor_to_pgl<pglobals::pre_scales_pgl>(ag_sscales),
+        .ag_flags = kittens::py::parallel_tensor_to_pgl<pglobals::flags_pgl>(ag_flags),
+        .activations = kittens::py::tensor_to_gl<pglobals::gathered_gl>(gathered),
+        .a_scales = kittens::py::tensor_to_gl<pglobals::gscales_gl>(gathered_scales),
+        .weights = kittens::py::tensor_to_gl<pglobals::weights_gl>(weights),
+        .w_scales = kittens::py::tensor_to_gl<pglobals::w_scales_gl>(w_scales),
+        .outputs = kittens::py::tensor_to_gl<pglobals::outputs_gl>(act),
+        .tp_slots = kittens::py::tensor_to_gl<pglobals::slots_gl>(tp_slots),
+        .slack = kittens::py::tensor_to_gl<pglobals::slack_gl>(slack),
+        .pull_order = kittens::py::tensor_to_gl<pglobals::order_gl>(pull_order),
+        .push_order = kittens::py::tensor_to_gl<pglobals::porder_gl>(push_order),
+        .barrier = kittens::py::parallel_tensor_to_pgl<pglobals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx,
+        .num_padded_local_tokens = num_padded_local_tokens, .num_tokens = num_tokens,
+        .s_max = s_max, .num_comp_sms = sm - num_comm_sms,
+        .num_push_sms = num_push_sms, .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = pglobals::SLOTS *
+        (sizeof(pglobals::token_vec) + sizeof(pglobals::scale_vec)) + 2048 >
+        cfg::DYNAMIC_SHARED_MEMORY + 1024
+        ? pglobals::SLOTS * (sizeof(pglobals::token_vec) + sizeof(pglobals::scale_vec)) + 2048
+        : cfg::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel_push, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel_push<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+        push_next.data_ptr<int>(), pull_next.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
+    reset_kernel_p<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
 } // namespace tpdisp8
 
 /* ===================================================================== *
@@ -3793,6 +4055,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tp_dispatch_gemm_fp8_warp", &tpdisp8::entry_warp);
     m.def("moe_tp_dispatch_gemm_fp8_warp_probe", &tpdisp8::entry_warp_probe);
     m.def("moe_tp_dispatch_gemm_fp8_lane", &tpdisp8::entry_lane);
+    m.def("moe_tp_dispatch_gemm_fp8_push", &tpdisp8::entry_push);
     m.def("moe_tp_gemm_prered_push_fp8_warp", &tppr8::entry_warp);
     m.def("ce_ag_pull", &ce::ag_pull_entry);
     m.def("ce_rs_push", &ce::rs_push_entry);

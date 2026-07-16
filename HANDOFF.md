@@ -1,5 +1,23 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：P2 L0 push 强路径落码（TK_L0_PUSH=1，待上机）
+
+- 设计：源侧 push lane（TK_L0_PUSH_SMS=4 个 comm 块）按 push_order 把量化行推到
+  3 个 peer 的 ag_staging 平面（单写者），每 token store_async_wait →
+  threadfence_system → st.release.sys 写 per-token seq flag（免清零）；收侧
+  scatter lane 严格 pull_order 领取，远端 token 本地自旋等 flag 后**从本地
+  staging 读**（无 PCIe RTT——comm SM 可压的结构性原因），自己分片直读
+  pre_tokens；scatter/计数/转岗与 pull 逐字节同构。依赖无环（GEMM←scatter←
+  flags←push，push 只依赖本地数据）；跨迭代由既有双 pcie_device_barrier 保护。
+- 落码：tpdisp8::pglobals/push_lane/scatter_lane/kernel_push/entry_push，绑定
+  moe_tp_dispatch_gemm_fp8_push；scheme TK_L0_PUSH（默认 0，优先级高于 lane）+
+  TK_L0_PUSH_SMS + push 缓冲（staging/sscales/flags TKParallelTensor）+
+  push_order 进计时重建；stages 工具已感知。本地 py_compile/bash -n/preflight 过。
+- **下一步（上机）**：`STEPS='^00_|^01_|^03f8_|^03p2_|^04f8_|^04p1_|^04p2_|^05p2|^08p2_'
+  bash tools/run_tp_all.sh`（01 必跑）。裁决：①03p2 正确性；②04p2 vs lane 1681；
+  ③05p2 拐点应大幅左移（目标 8 SM 档 ≤1620）；④05p2b 验证 4 push SM 够用；
+  ⑤08p2 拐点档 L0 让渡税（目标 →~50-70）。预期 e2e ~1570-1610。
+
 ## 2026-07-16：P1 实测——lane 全档赢翻默认（1681/2831），拐点未左移→P2 门控触发
 
 - tp_run_20260716_073019：lane@24 = **1681**（vs 波同步 1709，−28）、T=1024 = **2831**

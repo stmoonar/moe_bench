@@ -242,6 +242,7 @@ class TKFusedTP(DistributedScheme):
         self.l0_warp = False  # 方案A 通信 warp 化, fp8 分支里按 TK_L0_WARP 重置
         self.l1_warp = False
         self.l0_lane = False  # P1 per-lane comm 块, fp8 分支里按 TK_L0_LANE 重置
+        self.l0_push = False  # P2 push 强路径, fp8 分支里按 TK_L0_PUSH 重置
         if self.fp8:
             assert cfg.block_shape == [128, 128], "fp8 kernels assume [128,128] blocks"
         self.ctx = ctx
@@ -359,7 +360,8 @@ class TKFusedTP(DistributedScheme):
             # push_order is only consumed by the (frozen) push dispatch — keep
             # it out of the timed per-iter rebuild on the pull path (docs/26:
             # sched is the largest single compressible slice, 277µs @ 12%).
-            if self.dispatch_mode == "push":
+            # P2(fp8 push 强路径)同样消费 push_order。
+            if self.dispatch_mode == "push" or self.l0_push:
                 self._sched_out["push_order"] = self.push_order
             self._sched_graph = None  # captured lazily on first run()
 
@@ -396,6 +398,14 @@ class TKFusedTP(DistributedScheme):
             self.l0_lane = os.environ.get("TK_L0_LANE", "1") == "1"
             assert not (self.l0_lane and (self.l0_warp or self.l0_ce)), \
                 "TK_L0_LANE 与 TK_L0_WARP/TK_L0_CE 互斥"
+            # P2(PK 路线重估): L0 push 强路径 —— posted write 无 RTT 往返
+            # (4 SM 打满 50.9GB/s), 收侧只剩本地 staging 读, 在飞并发需求
+            # 暴跌, comm SM 可从 24 压到 ~8。优先级高于 lane/默认 pull。
+            # TK_L0_PUSH_SMS = comm 块里做源侧 push 的块数(其余做 scatter)。
+            self.l0_push = os.environ.get("TK_L0_PUSH", "0") == "1"
+            self.l0_push_sms = int(os.environ.get("TK_L0_PUSH_SMS", "4"))
+            assert not (self.l0_push and (self.l0_warp or self.l0_ce)), \
+                "TK_L0_PUSH 与 TK_L0_WARP/TK_L0_CE 互斥"
             s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
             w1_bf = (problem.w1.float() * s1.repeat_interleave(128, 1)
                                             .repeat_interleave(128, 2))
@@ -447,6 +457,22 @@ class TKFusedTP(DistributedScheme):
                                  local_rank=lr, local_world_size=lws, multicast=False)
             self.pre_scales = TK((num_tokens, H // 128), dtype=torch.float32,
                                  local_rank=lr, local_world_size=lws, multicast=False)
+            if self.l0_push:
+                # P2 push 缓冲: plane s = 源 s 单写者; flags 值 = 到达 seq
+                # (单调, 免清零)。staging 覆盖安全由双 pcie_device_barrier
+                # 保证(等价于 pre_tokens 的保护)。
+                S_ag = world * num_tokens
+                self.ag_staging_fp8 = TK((S_ag, H), dtype=torch.float8_e4m3fn,
+                                         local_rank=lr, local_world_size=lws,
+                                         multicast=False)
+                self.ag_sscales = TK((S_ag, H // 128), dtype=torch.float32,
+                                     local_rank=lr, local_world_size=lws,
+                                     multicast=False)
+                self.ag_flags = TK((1, S_ag), dtype=torch.int,
+                                   local_rank=lr, local_world_size=lws,
+                                   multicast=False)
+                self.ag_flags.data_.zero_()
+                self.push_next = torch.zeros(1, dtype=torch.int32, device=device)
         else:
             self.pre_tokens = TK((num_tokens, H), dtype=torch.bfloat16, local_rank=lr,
                                  local_world_size=lws, multicast=False)
@@ -573,6 +599,21 @@ class TKFusedTP(DistributedScheme):
                 self.tp_slots, self.slack, self.pull_order, self.blk_expert,
                 self.gemm_next, self.pull_next, self.barrier_l0,
                 self.num_padded_total, self.num_tokens)
+        elif self.fp8 and self.l0_push:
+            # P2: push 强路径(源侧按消费序推 3 个 peer + per-token seq flag,
+            # 收侧本地 scatter); seq 用 _l0_seq 当前值(每迭代单调 +2)。
+            self.gemm_next.zero_()
+            self.push_next.zero_()
+            self.pull_next.zero_()
+            self.tk.moe_tp_dispatch_gemm_fp8_push(
+                self.pre_tokens, self.pre_scales, self.ag_staging_fp8,
+                self.ag_sscales, self.ag_flags, self.gathered,
+                self.gathered_scales, self.w_gateup_fp8, self.w1_il_scales,
+                self.act, self.padded, self.tp_slots, self.slack,
+                self.pull_order, self.push_order, self.blk_expert,
+                self.gemm_next, self.push_next, self.pull_next,
+                self.barrier_l0, self.num_comm_sms, self.l0_push_sms,
+                self.num_padded_total, self.num_tokens, self._l0_seq)
         elif self.fp8 and self.l0_lane:
             # P1: per-lane 自由化的 comm 块拉取(inter-SM 几何不变, 只换
             # 拉取组织方式); 配 TK_COMM_SMS sweep 找新拐点。

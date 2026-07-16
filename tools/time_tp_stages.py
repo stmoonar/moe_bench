@@ -98,7 +98,20 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
         timed("tok_copy", st_copy)
 
         def st_l0():
-            if s.fp8 and getattr(s, "l0_lane", False):
+            if s.fp8 and getattr(s, "l0_push", False):
+                # P2: push 强路径(TK_L0_PUSH=1), 与 scheme.run 相同
+                s.gemm_next.zero_()
+                s.push_next.zero_()
+                s.pull_next.zero_()
+                s.tk.moe_tp_dispatch_gemm_fp8_push(
+                    s.pre_tokens, s.pre_scales, s.ag_staging_fp8,
+                    s.ag_sscales, s.ag_flags, s.gathered, s.gathered_scales,
+                    s.w_gateup_fp8, s.w1_il_scales, s.act, s.padded,
+                    s.tp_slots, s.slack, s.pull_order, s.push_order,
+                    s.blk_expert, s.gemm_next, s.push_next, s.pull_next,
+                    s.barrier_l0, s.num_comm_sms, s.l0_push_sms,
+                    s.num_padded_total, s.num_tokens, s._l0_seq)
+            elif s.fp8 and getattr(s, "l0_lane", False):
                 # P1: per-lane comm 块(TK_L0_LANE=1), 与 scheme.run 相同
                 s.gemm_next.zero_()
                 s.pull_next.zero_()

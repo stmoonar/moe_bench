@@ -316,10 +316,40 @@ else
         --scheme tktp --precision fp8 --no-verify --iters 30 \
         --json "$JSONS/tktp_fp8_wave_commsms4.json"
     fi
+    # ---------- 4p2. P2: L0 push 强路径(posted write 无 RTT, 收侧本地
+    # scatter; 目标 comm SM 24 -> ~8, 让渡税 183 -> ~50-70) ----------
+    run_step 03p2_correct_tktp_fp8_push 600 env TK_L0_PUSH=1 \
+        python -m moe_bench.tools.run_tktp 64 --precision fp8 --iters 10
+    if [ "$REUSE_BENCH" != "1" ]; then
+    run_step 04p2_bench_push_512 600 env TK_L0_PUSH=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_push_ne64_t512.json"
+    run_step 04p2_bench_push_t1024 600 env TK_L0_PUSH=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 30 --tokens 1024 \
+        --json "$JSONS/tktp_fp8_push_t1024.json"
+    # push 模式收侧只剩本地操作, 拐点应大幅左移 —— 主扫小 comm_sms
+    for CS in 6 8 10 12 16 24; do
+        run_step "05p2_push_commsms_${CS}" 600 \
+            env TK_L0_PUSH=1 TK_COMM_SMS=$CS python -m moe_bench.tools.run_tktp 64 \
+            --scheme tktp --precision fp8 --no-verify --iters 30 \
+            --json "$JSONS/tktp_fp8_push_commsms${CS}.json"
+    done
+    # push SM 数 sweep(微基准: 4 SM 打满强路径; 在 comm_sms=8 档验证)
+    for PS in 2 4 6; do
+        run_step "05p2b_push_psms_${PS}" 600 \
+            env TK_L0_PUSH=1 TK_COMM_SMS=8 TK_L0_PUSH_SMS=$PS \
+            python -m moe_bench.tools.run_tktp 64 \
+            --scheme tktp --precision fp8 --no-verify --iters 30 \
+            --json "$JSONS/tktp_fp8_push_psms${PS}.json"
+    done
+    fi
     # ---------- 8f. fp8 分阶段归因 ----------
     run_step 08f_time_stages_fp8 900 python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     # P1 归因: 最优 lane comm_sms 档的 L0 暴露(跑完 05p1 后把 TK_COMM_SMS 换成拐点值)
     run_step 08p1_time_stages_lane 900 env TK_L0_LANE=1 TK_COMM_SMS=12 \
+        python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
+    # P2 归因: push 模式拐点档(跑完 05p2 后按拐点调 TK_COMM_SMS)
+    run_step 08p2_time_stages_push 900 env TK_L0_PUSH=1 TK_COMM_SMS=8 \
         python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     # ---------- 8w8. 方案A 定位(逐迭代 + 融合税三分解: 纯GEMM上限/共存税/
     # gate-straggler 税; 裁决 L0 双稳机制①发射饥饿 vs ②TMA 队列 HoL) ----------
