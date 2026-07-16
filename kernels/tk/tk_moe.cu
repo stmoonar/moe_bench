@@ -1146,6 +1146,150 @@ void entry(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTen
     reset_kernel<<<rb, 256, 0, stream>>>(G);
     CUDACHECK(cudaGetLastError());
 }
+
+/* ---- 方案A: 通信 warp 化(TK_L0_WARP=1, 2026-07-16) --------------------
+ * 动机: 归因显示 L0 的暴露 ≈ 100% 是 SM 让渡税(comm 块占走 TK_COMM_SMS=24
+ * 个整 SM), 但 AG 拉取本质是异步 DMA 编排, 全程没有算术指令在关键路径上。
+ * fp8 dispenser 的 producer warp(warp 8)只有 lane 0 发 GEMM TMA, lane
+ * 1..31 参与完唯一一次全员 __syncthreads 后本来就直接退出 —— 把 AG 拉取
+ * 放到这些闲置 lane 上, GEMM 拿满全部 SM, 通信只花 warp 8 的发射槽(该
+ * warp 无张量核工作), docs/35 "SM 零和" 的分母 S 被整个拿掉。
+ *
+ * 约束与协议:
+ *  - 线程数/launch_bounds/寄存器分配与非 warp 版完全一致(288), GEMM 模板
+ *    零改动; sm120 ITS 保证 lane 0 的 mbarrier 自旋与其余 lane 的通信循环
+ *    在同一 warp 内并发推进(nanosleep 自旋, 均让出发射槽);
+ *  - 每个 comm lane 完全独立: 自己 atomicAdd 领 token(全局仍按 pull_order
+ *    消费序)、自己的 smem 槽 + semaphore, 无任何 warp 内同步;
+ *  - 数据面逐字节同构 dispatch_persistent(CE=false): TMA pull 行+scale →
+ *    本地 scatter 到 TOP_K 槽 → red.release 行块计数; dispatch_gate/slack/
+ *    reset 协议不变;
+ *  - semaphore 在进 dispenser 前 init, 由 dispenser 内部的全员 __syncthreads
+ *    发布; 此后 comm lane 不再触碰任何块级 barrier(barrier 0/1 是 consumer
+ *    的 256 计数循环, 混计数并发到达是 UB, docs/24);
+ *  - comm smem 槽位于 GEMM 3×16KB 流水区之后(49152B 起), 共 ~17KB;
+ *  - in-flight 并发 = WARP_SLOTS × 全 SM 数 ≈ 4×110 = 440, 与 24 块 × 20
+ *    lane = 480 的现役并发同量级(pull 弱路径靠并发喂满的条件不变)。
+ */
+static constexpr int WARP_SLOTS = 4;   // 每块 in-flight token 数(lane 1..4)
+__device__ inline void comm_lane_pull(const globals &G, int *__restrict__ pull_next,
+                                      typename globals::token_vec &token,
+                                      typename globals::scale_vec &scales,
+                                      semaphore &sem) {
+    int phase = 0;
+    while (true) {
+        const int i = atomicAdd(pull_next, 1);
+        if (i >= G.s_max) return;
+        const int d = G.pull_order[{i}];
+        const int src_dev = d / G.num_tokens;
+        const int src_tok = d % G.num_tokens;
+        tma::expect_bytes(sem, sizeof(typename globals::token_vec) +
+                               sizeof(typename globals::scale_vec));
+        tma::load_async(token, G.pre_tokens[src_dev], {src_tok, 0}, sem);
+        tma::load_async(scales, G.pre_scales[src_dev], {src_tok, 0}, sem);
+        wait(sem, phase);
+        phase ^= 1;
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) {
+            const int slot = G.tp_slots[{d, k}];
+            if (slot >= 0) {
+                tma::store_async(G.activations, token, {slot, 0});
+                tma::store_async(G.a_scales, scales, {slot, 0});
+            }
+        }
+        tma::store_async_wait();
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) {
+            const int slot = G.tp_slots[{d, k}];
+            if (slot >= 0)
+                asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
+                             :: "l"(&G.barrier[G.dev_idx][{slot / gemm_config_fp8::ROW_BLOCK}]), "r"(1) : "memory");
+        }
+    }
+}
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void kernel_warp(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+                 int *__restrict__ task_next, const int num_tasks,
+                 int *__restrict__ pull_next) {
+    using cfg = gemm_config_fp8;
+    extern __shared__ int __shm[];
+    // comm 槽在 GEMM 流水区(cfg::DYNAMIC_SHARED_MEMORY)之后; 所有线程算出
+    // 同一组地址, allocate 只做指针推进, 无副作用。
+    tma_swizzle_allocator al((int*)&__shm[cfg::DYNAMIC_SHARED_MEMORY / sizeof(int)]);
+    typename globals::token_vec (&token)[WARP_SLOTS] =
+        al.allocate<typename globals::token_vec, WARP_SLOTS>();
+    typename globals::scale_vec (&scales)[WARP_SLOTS] =
+        al.allocate<typename globals::scale_vec, WARP_SLOTS>();
+    __shared__ semaphore token_arrived[WARP_SLOTS];
+    const int lane_id = kittens::laneid();
+    const bool is_comm = (kittens::warpid() == cfg::CONSUMER_WARPS &&
+                          lane_id >= 1 && lane_id <= WARP_SLOTS);
+    if (is_comm)
+        init_semaphore(token_arrived[lane_id - 1], 0, 1);
+    // 全员进入 dispenser: 其内部的 __syncthreads 是唯一一次全块栅栏, 顺带
+    // 发布上面的 init; warp 8 的 lane 1..31 在栅栏后自然返回。
+    grouped_gemm_sm120_fp8_dispenser(G, dispatch_gate{G}, noop_epilogue{},
+                                     glu_store_policy<globals::outputs_gl>{G.outputs},
+                                     blk_expert, task_next, num_tasks);
+    if (is_comm)
+        comm_lane_pull(G, pull_next, token[lane_id - 1], scales[lane_id - 1],
+                       token_arrived[lane_id - 1]);
+}
+void entry_warp(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTensor &pre_scales,
+           at::Tensor &ag_tokens, at::Tensor &ag_scales,
+           at::Tensor &gathered, at::Tensor &gathered_scales,
+           at::Tensor &weights, at::Tensor &w_scales, at::Tensor &act,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &tp_slots,
+           at::Tensor &slack, at::Tensor &pull_order, at::Tensor &blk_expert,
+           at::Tensor &gemm_next, at::Tensor &pull_next,
+           kittens::py::TKParallelTensor &barrier,
+           const int num_padded_local_tokens, const int num_tokens) {
+    using cfg = gemm_config_fp8;
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
+    TORCH_CHECK(weights.size(0) == num_local_experts, "weights (E,N,K) E mismatch");
+    TORCH_CHECK(weights.size(2) == globals::H, "weights (E,N,K) K must be H");
+    TORCH_CHECK(act.size(1) == weights.size(1) / 2, "act width must be N/2 (GLU)");
+    TORCH_CHECK(gathered_scales.size(1) == globals::NSC, "gathered_scales (P, H/128)");
+    TORCH_CHECK(gemm_next.numel() == 1 && pull_next.numel() == 1, "counters");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    const int s_max = static_cast<int>(tp_slots.size(0));
+    TORCH_CHECK(s_max == globals::NUM_DEVICES * num_tokens, "tp_slots rows must be world*T");
+    const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
+    globals G {
+        .pre_tokens = kittens::py::parallel_tensor_to_pgl<globals::pre_tokens_pgl>(pre_tokens),
+        .pre_scales = kittens::py::parallel_tensor_to_pgl<globals::pre_scales_pgl>(pre_scales),
+        .ag_tokens = kittens::py::tensor_to_gl<globals::ag_tokens_gl>(ag_tokens),
+        .ag_scales = kittens::py::tensor_to_gl<globals::ag_scales_gl>(ag_scales),
+        .activations = kittens::py::tensor_to_gl<globals::gathered_gl>(gathered),
+        .a_scales = kittens::py::tensor_to_gl<globals::gscales_gl>(gathered_scales),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .w_scales = kittens::py::tensor_to_gl<globals::w_scales_gl>(w_scales),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(act),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .tp_slots = kittens::py::tensor_to_gl<globals::slots_gl>(tp_slots),
+        .slack = kittens::py::tensor_to_gl<globals::slack_gl>(slack),
+        .pull_order = kittens::py::tensor_to_gl<globals::order_gl>(pull_order),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_local_experts = num_local_experts,
+        .expert_offset = 0,
+        .num_padded_local_tokens = num_padded_local_tokens, .num_tokens = num_tokens,
+        .s_max = s_max, .num_comp_sms = sm   // warp 版: 全部 SM 都是 GEMM 块
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + WARP_SLOTS *
+        (sizeof(globals::token_vec) + sizeof(globals::scale_vec)) + 2048;
+    CUDACHECK(cudaFuncSetAttribute(kernel_warp, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel_warp<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+        pull_next.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
+    reset_kernel<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
 } // namespace tpdisp8
 
 /* ===================================================================== *
@@ -3100,6 +3244,209 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
     reset_kernel<<<rb, 256, 0, stream>>>(G);
     CUDACHECK(cudaGetLastError());
 }
+
+/* ---- 方案A: 通信 warp 化(TK_L1_WARP=1, 2026-07-16) --------------------
+ * 与 tpdisp8::kernel_warp 同思路: comm 角色从整块 SM(TK_COMM_SMS_L1=24)
+ * 降为 producer warp 的闲置 lane 1..31, W2 GEMM 拿满全部 SM。归因里 L1
+ * 的让渡税(bf16 时代 +142µs)是这里要回收的账; 真实 wire 尾巴不受影响
+ * (照旧 job_order 就绪序流推 + 全员排空)。
+ *
+ * 排空分两个独立团队, 各自从同一个 job_next dispenser 领 job:
+ *  - comm 团队 = warp 8 的 lane 1..31(31 线程, __syncwarp(0xFFFFFFFE)
+ *    同步, 排除仍在 GEMM producer 循环里的 lane 0), GEMM 全程在其下
+ *    流推最早就绪的 job; 专属 smem 行在 GEMM 流水区之后;
+ *  - GEMM 排空团队 = 8 个 consumer warp(256 线程), GEMM 出完后在 named
+ *    barrier 2(256 计数)汇合, 复用已排空的 GEMM 流水区放 smem 行。
+ *    不能用 __syncthreads: 它是 barrier 0 的全员计数, 而 comm 团队还在
+ *    独立跑, 且 GEMM 内 consumer 曾按 256 计数循环 barrier 0 —— 混计数
+ *    并发到达是 UB(docs/24)。producer lane 0 出 GEMM 后直接收工。
+ * push_job_team 与 push_job(SM 版)逐行同构: wait_slot 行块就绪 → fp32
+ * 加权求和 8 条 expert_out 行 → TMA 推源卡 staging → 本地选举 + watermark。
+ */
+template <int NT, typename Sync>
+__device__ inline void push_job_team(const globals &G, const int j,
+                                     typename globals::row_vec &row,
+                                     int *__restrict__ scr, const int tid,
+                                     const Sync &sync) {
+    if (j >= G.num_jobs) return;
+    constexpr int H = globals::H, VEC = 8, HVEC = H / VEC;
+    int *s_slot = scr;                                   // [0..7]
+    float *s_w = reinterpret_cast<float *>(scr + 8);     // [8..15]
+    // scr[16]=src_dev, scr[17]=src_tok, scr[18]=has
+    if (tid < globals::TOP_K) {
+        const int k = tid;
+        const int slot = G.prered_slots[{j, k}];
+        s_slot[k] = slot;
+        s_w[k] = G.prered_w[{j, k}];
+        if (slot >= 0)
+            pcie_sync::wait_slot(G.barrier, G.dev_idx, 1, slot / gemm_config_fp8::ROW_BLOCK, G.seq);
+    }
+    if (tid == 0) {
+        scr[16] = G.prered_dst[{j, 0}];
+        scr[17] = G.prered_dst[{j, 1}];
+        int has = 0;
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) has |= (G.prered_slots[{j, k}] >= 0);
+        scr[18] = has;
+    }
+    sync();
+    if (!scr[18]) return;   // 团队所有线程读到同一值, 一致返回
+    const int s_s = scr[16], s_t = scr[17];
+
+    bf16 *row_ptr = reinterpret_cast<bf16 *>(&row);
+    float4 *row_v = reinterpret_cast<float4 *>(row_ptr);
+    for (int c = tid; c < HVEC; c += NT) {
+        float acc[VEC];
+        #pragma unroll
+        for (int i = 0; i < VEC; i++) acc[i] = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < globals::TOP_K; k++) {
+            const int slot = s_slot[k];
+            if (slot < 0) continue;
+            const float w = s_w[k];
+            const bf16 *e_row = &G.outputs[{slot, 0}];
+            const float4 packed = reinterpret_cast<const float4 *>(e_row)[c];
+            const bf16_2 *pv = reinterpret_cast<const bf16_2 *>(&packed);
+            #pragma unroll
+            for (int jj = 0; jj < VEC / 2; jj++) {
+                float2 f = __bfloat1622float2(pv[jj]);
+                acc[2*jj] += w * f.x; acc[2*jj+1] += w * f.y;
+            }
+        }
+        bf16_2 res[VEC / 2];
+        #pragma unroll
+        for (int jj = 0; jj < VEC / 2; jj++) res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
+        row_v[c] = *reinterpret_cast<const float4 *>(res);
+    }
+    sync();
+    if (tid == 0) {
+        const int dst_row = G.dev_idx * G.num_source_tokens + s_t;
+        tma::store_async(G.staging[s_s], row, {dst_row, 0});
+        tma::store_async_wait();
+        int old;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(old) : "l"(&G.local_cnt[{s_s}]) : "memory");
+        if (old + 1 == G.push_expected_l1[{s_s}]) {
+            __threadfence_system();
+            pcie_sync::signal_slot(G.barrier, s_s, 2 + G.dev_idx, 0, G.seq);
+        }
+    }
+}
+struct warp_sync_comm {   // warp 8 的 lane 1..31(lane 0 仍在 GEMM producer 循环)
+    __device__ inline void operator()() const { __syncwarp(0xFFFFFFFEu); }
+};
+struct team_sync_consumers {   // 8 个 consumer warp, named barrier 2(256 计数)
+    __device__ inline void operator()() const {
+        kittens::group<gemm_config_fp8::CONSUMER_WARPS>::sync(2);
+    }
+};
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void kernel_warp(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+                 int *__restrict__ gemm_next,
+                 const int *__restrict__ job_order, int *__restrict__ job_next) {
+    using cfg = gemm_config_fp8;
+    extern __shared__ int __shm[];
+    __shared__ int scr_comm[20];   // [0..18] push_job_team 暂存, [19] 领取广播
+    __shared__ int scr_team[20];
+    const int col_blocks = static_cast<int>(G.weights.rows()) / cfg::COL_BLOCK;
+    const int nblk = G.num_padded_local_tokens / cfg::ROW_BLOCK;
+    grouped_gemm_sm120_fp8_dispenser(
+        G, no_gate{}, signal_epilogue{G, col_blocks},
+        plain_store_policy<globals::outputs_gl>{G.outputs},
+        blk_expert, gemm_next, nblk * col_blocks);
+    if (kittens::warpid() == cfg::CONSUMER_WARPS) {
+        const int lane_id = kittens::laneid();
+        if (lane_id == 0) return;   // producer: GEMM 发完即收工
+        // ---- comm 团队: GEMM 全程在其下流推(job_order 就绪序) ----
+        tma_swizzle_allocator al((int*)&__shm[cfg::DYNAMIC_SHARED_MEMORY / sizeof(int)]);
+        typename globals::row_vec &row = al.allocate<typename globals::row_vec>();
+        const int tid = lane_id - 1;   // 0..30
+        const warp_sync_comm sync{};
+        while (true) {
+            if (tid == 0) scr_comm[19] = atomicAdd(job_next, 1);
+            sync();
+            const int idx = scr_comm[19];
+            if (idx >= G.num_jobs) break;
+            push_job_team<31>(G, job_order[idx], row, scr_comm, tid, sync);
+            sync();   // smem 行/暂存彻底消费完再领下一个
+        }
+    } else {
+        // ---- GEMM 排空团队: consumer warp 0..7 = threadIdx 0..255 ----
+        const team_sync_consumers sync{};
+        sync();   // 汇合; 此后 barrier 0/1 空闲, GEMM 流水区可复用
+        tma_swizzle_allocator al((int*)&__shm[0]);
+        typename globals::row_vec &row = al.allocate<typename globals::row_vec>();
+        const int tid = threadIdx.x;
+        while (true) {
+            if (tid == 0) scr_team[19] = atomicAdd(job_next, 1);
+            sync();
+            const int idx = scr_team[19];
+            if (idx >= G.num_jobs) break;
+            push_job_team<256>(G, job_order[idx], row, scr_team, tid, sync);
+            sync();
+        }
+    }
+}
+void entry_warp(at::Tensor &act_fp8, at::Tensor &act_scales,
+           at::Tensor &weights, at::Tensor &w_scales,
+           at::Tensor &expert_outputs, at::Tensor &out_planes,
+           at::Tensor &padded_tokens_per_expert,
+           kittens::py::TKParallelTensor &staging, at::Tensor &prered_dst,
+           at::Tensor &prered_slots, at::Tensor &prered_w, at::Tensor &local_cnt,
+           at::Tensor &push_expected_l1, at::Tensor &blk_expert,
+           at::Tensor &gemm_next, at::Tensor &job_order, at::Tensor &job_next,
+           kittens::py::TKParallelTensor &barrier,
+           const int num_padded_local_tokens, const int num_source_tokens,
+           const int num_jobs, const int seq) {
+    using cfg = gemm_config_fp8;
+    const int dev_idx = barrier.local_rank_;
+    const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
+    TORCH_CHECK(weights.size(0) == num_local_experts, "w2 (E,H,inter) E mismatch");
+    TORCH_CHECK(weights.size(1) == globals::H, "w2 rows must be H (B^T)");
+    TORCH_CHECK(weights.size(2) == act_fp8.size(1), "w2 K must match act inter");
+    TORCH_CHECK(act_fp8.size(1) % cfg::SCALE_K == 0, "inter % 128");
+    TORCH_CHECK(act_scales.size(1) == act_fp8.size(1) / cfg::SCALE_K, "act_scales (P, inter/128)");
+    TORCH_CHECK(w_scales.size(1) == globals::H / cfg::COL_BLOCK &&
+                w_scales.size(2) == static_cast<int>(weights.size(2)) / cfg::SCALE_K,
+                "w2_scales must be (E, H/128, inter/128)");
+    TORCH_CHECK(gemm_next.numel() == 1 && job_next.numel() == 1, "counters");
+    TORCH_CHECK(job_order.size(0) == num_jobs, "job_order");
+    const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    globals G {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(act_fp8),
+        .a_scales = kittens::py::tensor_to_gl<globals::a_scales_gl>(act_scales),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
+        .w_scales = kittens::py::tensor_to_gl<globals::w_scales_gl>(w_scales),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(expert_outputs),
+        .out_planes = kittens::py::tensor_to_gl<globals::planes_gl>(out_planes),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = num_local_experts, .expert_offset = 0,
+        .staging = kittens::py::parallel_tensor_to_pgl<globals::staging_pgl>(staging),
+        .prered_dst = kittens::py::tensor_to_gl<globals::dst_gl>(prered_dst),
+        .prered_slots = kittens::py::tensor_to_gl<globals::slots_gl>(prered_slots),
+        .prered_w = kittens::py::tensor_to_gl<globals::w_gl>(prered_w),
+        .local_cnt = kittens::py::tensor_to_gl<globals::cnt1d_gl>(local_cnt),
+        .push_expected_l1 = kittens::py::tensor_to_gl<globals::cnt1d_gl>(push_expected_l1),
+        .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_padded_local_tokens = num_padded_local_tokens,
+        .num_source_tokens = num_source_tokens, .num_jobs = num_jobs,
+        .num_comp_sms = sm,   // warp 版: 全部 SM 都是 GEMM 块
+        .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    // GEMM 流水 48KB + comm 团队专属 row(8KB) + 对齐余量
+    constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + sizeof(globals::row_vec) + 2048;
+    CUDACHECK(cudaFuncSetAttribute(kernel_warp, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel_warp<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(),
+        job_order.data_ptr<int>(), job_next.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
+    reset_kernel<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
 } // namespace tppr8
 
 /* ===================================================================== *
@@ -3219,6 +3566,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tp_gemm_prered_push", &preredpush::gemm_push_entry_tp);
     m.def("moe_tp_gemm_prered_push_v2", &tppr2::entry);
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
+    m.def("moe_tp_dispatch_gemm_fp8_warp", &tpdisp8::entry_warp);
+    m.def("moe_tp_gemm_prered_push_fp8_warp", &tppr8::entry_warp);
     m.def("ce_ag_pull", &ce::ag_pull_entry);
     m.def("ce_rs_push", &ce::rs_push_entry);
     m.def("ce_rs_fence", &ce::rs_fence_entry);

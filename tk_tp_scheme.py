@@ -239,6 +239,8 @@ class TKFusedTP(DistributedScheme):
         # (act/push/combine 精度不变, 阶段边界干净)。
         self.fp8 = problem.quant_config is not None
         self.l1_fp8 = False  # fp8 分支里按 TK_L1_FP8 重置(docs/42)
+        self.l0_warp = False  # 方案A 通信 warp 化, fp8 分支里按 TK_L0_WARP 重置
+        self.l1_warp = False
         if self.fp8:
             assert cfg.block_shape == [128, 128], "fp8 kernels assume [128,128] blocks"
         self.ctx = ctx
@@ -289,6 +291,8 @@ class TKFusedTP(DistributedScheme):
                        and self.l0_mode == "v2") or self.fp8  # fp8 kernel 自带 GLU
         # layer0 dispenser task counter, zeroed each iter (same-stream)
         self.gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
+        # 方案A: comm lane 的 token 领取计数器(warp 版专用), 每迭代清零
+        self.pull_next = torch.zeros(1, dtype=torch.int32, device=device)
         # docs/32~35: layer1 v2 = N 维分解 combine(Comet layer1-N)。三轮实测
         # 后**默认回 v1**(docs/35 负结果):GRP=16 修复粒度病后 v2 仍 786 vs
         # v1 691,小预算 sweep 单调反向 —— 本机 L1 GEMM 是 SM-bound + 后排空
@@ -371,6 +375,15 @@ class TKFusedTP(DistributedScheme):
             # TK 抽象 = TKParallelTensor.raw_ptrs_ + side streams(ce:: 编排)。
             self.l0_ce = os.environ.get("TK_L0_CE", "0") == "1"
             self.l1_ce = os.environ.get("TK_L1_CE", "0") == "1"
+            # 方案A(2026-07-16): 通信 warp 化 —— comm 角色降为 GEMM 块内
+            # producer warp 的闲置 lane, GEMM 拿满全部 SM(回收让渡税)。
+            # 默认关, A/B 定价后再定默认(回滚纪律同 docs/23)。与 CE 互斥。
+            self.l0_warp = os.environ.get("TK_L0_WARP", "0") == "1"
+            self.l1_warp = os.environ.get("TK_L1_WARP", "0") == "1"
+            assert not (self.l0_warp and self.l0_ce), "TK_L0_WARP 与 TK_L0_CE 互斥"
+            assert not (self.l1_warp and self.l1_ce), "TK_L1_WARP 与 TK_L1_CE 互斥"
+            assert not (self.l1_warp and not self.l1_fp8), \
+                "TK_L1_WARP 需要 TK_L1_FP8=1(warp kernel 只有 fp8 版)"
             s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
             w1_bf = (problem.w1.float() * s1.repeat_interleave(128, 1)
                                             .repeat_interleave(128, 2))
@@ -536,7 +549,19 @@ class TKFusedTP(DistributedScheme):
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
 
         # layer0: AllGather-dedup dispatch ⊕ gate+up GEMM (one launch)
-        if self.fp8:
+        if self.fp8 and self.l0_warp:
+            # 方案A: comm 角色寄生在 producer warp 的闲置 lane, GEMM 满 SM;
+            # 协议(pull_order/行块计数/gate)与 tpdisp8 非 warp 版逐字节同构。
+            self.gemm_next.zero_()
+            self.pull_next.zero_()
+            self.tk.moe_tp_dispatch_gemm_fp8_warp(
+                self.pre_tokens, self.pre_scales, self.ag_tokens,
+                self.ag_scales, self.gathered, self.gathered_scales,
+                self.w_gateup_fp8, self.w1_il_scales, self.act, self.padded,
+                self.tp_slots, self.slack, self.pull_order, self.blk_expert,
+                self.gemm_next, self.pull_next, self.barrier_l0,
+                self.num_padded_total, self.num_tokens)
+        elif self.fp8:
             # docs/39 P2: fp8 AG(token 4KB + scales 128B)⊕ fp8 dispenser GEMM
             # ⊕ GLU epilogue(fp32 上 silu*up 直存 bf16 act); L1 保持 bf16。
             # docs/43: TK_L0_CE=1 时线上字节由 copy engine 拉进本地 ag 缓冲
@@ -597,7 +622,20 @@ class TKFusedTP(DistributedScheme):
         self._l1_seq += 1
         self.combine_local_cnt.zero_()
         self.job_next.zero_()
-        if self.fp8 and self.l1_fp8:
+        if self.fp8 and self.l1_fp8 and self.l1_warp:
+            # 方案A: W2 GEMM 满 SM, push 由 producer warp 闲置 lane 流推 +
+            # consumer 团队排空; 信号/选举/watermark 协议与 v1 逐字节同构。
+            tk.rowgroup_quant_fp8(self.act, self.act_fp8, self.act_scales)
+            self.l1_gemm_next.zero_()
+            tk.moe_tp_gemm_prered_push_fp8_warp(
+                self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
+                self.expert_out, self.out_planes, self.padded,
+                self.combine_staging, self.prered_dst, self.tp_slots,
+                self.prered_w, self.combine_local_cnt, self.push_expected_l1,
+                self.blk_expert, self.l1_gemm_next, self.job_order,
+                self.job_next, self.barrier_l1, self.num_padded_total,
+                self.num_tokens, self.num_jobs, self._l1_seq)
+        elif self.fp8 and self.l1_fp8:
             # docs/42 P3: act 量化(单 kernel)+ fp8 W2 GEMM ⊕ v1 push/排空。
             # docs/43: TK_L1_CE=1 时归约直写本地 out_planes, 线上搬运与
             # watermark 由 ce::rs_push(copy engine)完成, final_red 零改动。

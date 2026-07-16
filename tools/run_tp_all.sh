@@ -234,6 +234,26 @@ else
         --scheme tktp --precision fp8 --no-verify --iters 50 \
         --json "$JSONS/tktp_fp8_l1off_ne64_t512.json"
     fi
+    # ---------- 4w8. 方案A 通信 warp 化(2026-07-16: comm 角色降为 producer
+    # warp 闲置 lane, GEMM 满 SM, 回收让渡税; A/B 阶梯单独定价 L0/L1) ----------
+    run_step 03w8_correct_tktp_fp8_warp 600 env TK_L0_WARP=1 TK_L1_WARP=1 \
+        python -m moe_bench.tools.run_tktp 64 --precision fp8 --iters 10
+    if [ "$REUSE_BENCH" != "1" ]; then
+    run_step 04w8_bench_l0warp_512 600 env TK_L0_WARP=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_l0warp_ne64_t512.json"
+    run_step 04w8_bench_l1warp_512 600 env TK_L1_WARP=1 python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_l1warp_ne64_t512.json"
+    run_step 04w8_bench_bothwarp_512 600 env TK_L0_WARP=1 TK_L1_WARP=1 \
+        python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_bothwarp_ne64_t512.json"
+    run_step 04w8_bench_bothwarp_t1024 600 env TK_L0_WARP=1 TK_L1_WARP=1 \
+        python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 30 --tokens 1024 \
+        --json "$JSONS/tktp_fp8_bothwarp_t1024.json"
+    fi
     # ---------- 4c8. Copy-engine A/B(docs/43: 线上字节 0 SM, 打破零和) ----------
     run_step 03c8_correct_tktp_fp8_ce 600 env TK_L0_CE=1 TK_L1_CE=1 \
         python -m moe_bench.tools.run_tktp 64 --precision fp8 --iters 10

@@ -1,5 +1,25 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：方案A 通信 warp 化落码（分支 comm_warp，待上机）
+
+- 动机：归因显示 L0 暴露 ≈100% 是 SM 让渡税（fp8 ~264µs）、L1 让渡 +142µs（bf16 实测），
+  而 comm 块的工作本质是异步 DMA 编排，不需要整块 SM。方案A 把通信角色降为 fp8 dispenser
+  里 producer warp（warp 8）的闲置 lane 1..31（该 warp 只有 lane 0 发 GEMM TMA），GEMM
+  拿满全部 SM；线程数/launch_bounds/寄存器分配/GEMM 模板全部零改动，协议与默认路径逐字节
+  同构。依赖 sm120 ITS 让 lane 0 自旋与其余 lane 通信并发（头号裁决假设）。
+- 落码：`tpdisp8::kernel_warp`（L0：lane 1..4 各管一个 in-flight token，独立领取/专属
+  semaphore，无 warp 内同步）+ `tppr8::kernel_warp`（L1：31-lane comm 团队 GEMM 下流推 +
+  8 consumer warp 出 GEMM 后经 named barrier 2 汇合排空，两团队共用 job dispenser）；
+  绑定 `moe_tp_dispatch_gemm_fp8_warp` / `moe_tp_gemm_prered_push_fp8_warp`；scheme 开关
+  `TK_L0_WARP`/`TK_L1_WARP`（默认 0，与 CE 互斥，L1 需 TK_L1_FP8=1）；脚本步骤 03w8 + 04w8
+  三档 A/B + t1024。设计与风险清单：`docs/归档/2026-07-16_方案A_通信warp化设计与落地.md`。
+- 本地已过：py_compile、bash -n、preflight_tp_cpu（本机无 CUDA，kernel 未编译）。
+- **下一步（上机）**：`STEPS='^00_|^01_|^03f8_|^03w8_|^04f8_|^04w8_|^08f_' bash
+  tools/run_tp_all.sh`——01 必跑（tk_moe.cu 变更需重编译），03w8 正确性门过了看 04w8
+  阶梯 vs 04f8 基线（1708）。裁决点：①GEMM-alone 是否被 producer 分歧拖慢 >2%；
+  ②L0 暴露是否回升（pull 并发 440 vs 480，不够把 WARP_SLOTS 4→6-8）；③L1 尾是否回升
+  （推流线程约现役一半，wire 瓶颈则无影响）。e2e 目标 ~1500-1550。
+
 ## 2026-07-16：性能收益统一为相对 baseline 的耗时降低
 
 - 新的唯一报数口径为 `(baseline_time - candidate_time) / baseline_time * 100%`；
