@@ -4,7 +4,8 @@
   1. 正确性:grouped_gemm_fp8(A 1×128 group 量化 + W 128×128 block 量化,
      mma e4m3,fp32 重标定)vs fp32 反量化参考,rel_err 必须 < 5e-3
      (两者输入 bit 相同,差异只有累加顺序;垮了 = scale 行映射/mma 布局错);
-  2. 性能:同 shape 的 bf16 grouped_gemm 对照,报 TFLOP/s 比(目标 ≥1.8×)。
+  2. 性能:同 shape 的 bf16 grouped_gemm 对照,报相对 bf16 的耗时降低百分比
+     (目标 ≥44.4%)。
 
   单卡运行(设 CUDA_VISIBLE_DEVICES 选一张空闲卡):
     python -m moe_bench.tools.verify_fp8_gemm [E] [rows_per_e] [K] [N] [iters]
@@ -124,7 +125,8 @@ def main():
     print(f"[fp8 gemm] fp8 {t8:8.1f}us ({fl / t8 / 1e6:6.1f} TFLOP/s)   "
           f"raw {traw:8.1f}us ({fl / traw / 1e6:6.1f} TFLOP/s)   "
           f"bf16 {t16:8.1f}us ({fl / t16 / 1e6:6.1f} TFLOP/s)   "
-          f"speedup {t16 / t8:.2f}x  raw-cap {t16 / traw:.2f}x")
+          f"time reduction vs bf16 {(t16 - t8) / t16 * 100:+.2f}%  "
+          f"raw-cap reduction {(t16 - traw) / t16 * 100:+.2f}%")
     return 0 if ok else 1
 
 

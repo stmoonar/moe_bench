@@ -132,16 +132,20 @@ def _worker(rank, world, init_method, out_list):
                     "l0_fusion_penalty_ms": t["L0_fused"] - t["L0_gemm"],
                     "l1_fusion_penalty_ms": t["L1_fused"] - t["L1_gemm"],
                     "tk_e2e_plus_sched_ms": t["tk_e2e"] + t["sched"],
-                    "speedup_vs_serial": t["serial_e2e"] / t["tk_e2e"],
-                    "speedup_vs_serial_with_sched":
-                        t["serial_e2e"] / (t["tk_e2e"] + t["sched"]),
+                    "time_reduction_vs_serial_pct":
+                        (t["serial_e2e"] - t["tk_e2e"])
+                        / t["serial_e2e"] * 100.0,
+                    "time_reduction_vs_serial_with_sched_pct":
+                        (t["serial_e2e"] - t["tk_e2e"] - t["sched"])
+                        / t["serial_e2e"] * 100.0,
                     "tk_vs_serial_rel_err": rel_err,
                 }
                 rows.append(row)
                 print(f"[mb4] tokens={total:5d}  serial={t['serial_e2e']*1e3:8.1f}us  "
                       f"tk={t['tk_e2e']*1e3:8.1f}us (+sched {t['sched']*1e3:5.0f}us)  "
-                      f"x{row['speedup_vs_serial']:.2f}/"
-                      f"x{row['speedup_vs_serial_with_sched']:.2f}  "
+                      f"time_reduction="
+                      f"{row['time_reduction_vs_serial_pct']:+.2f}%/"
+                      f"{row['time_reduction_vs_serial_with_sched_pct']:+.2f}%  "
                       f"L0pen={row['l0_fusion_penalty_ms']*1e3:6.0f}us "
                       f"L1pen={row['l1_fusion_penalty_ms']*1e3:6.0f}us  "
                       f"relerr={rel_err:.2e}", flush=True)

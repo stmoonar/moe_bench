@@ -34,4 +34,4 @@
 7. **确定性要验证而不是假设**：FlashOverlap 用"10 次实测完成序全部一致"作为方案准入条件——对 GPU 调度行为的任何假设都应有类似的验证机制。
 8. **拓扑决定策略**：NVSwitch/PCIe/IB 的最优 push-pull、swizzle、channel 数完全不同；跨节点要用"IB 只发同 GPU-index 的 rank + 节点内 NVLink 扇出"的两跳转发消除带宽不对称。
 9. **分层实施**：stream+signal 低侵入方案 → prologue/epilogue 融合 → block/warp specialization → persistent kernel + device 调度器。每一级都是上一级的对照组，用测量决定是否继续下沉。
-10. **收益天花板 = min(T_compute, T_comm) 且受通信占比约束**：NVLink 机器 TP 通信占比一般 15~25%，PCIe/跨节点 35~48%；预期收益（端到端 1.1~1.7×）要先算账再立项。
+10. **收益天花板 = min(T_compute, T_comm) 且受通信占比约束**：NVLink 机器 TP 通信占比一般 15~25%，PCIe/跨节点 35~48%；预期端到端耗时降低 9.1%~41.2%，要先算账再立项。

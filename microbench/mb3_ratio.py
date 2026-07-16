@@ -105,11 +105,15 @@ def analyze(results_dir: str, sched_ms: float | None = None) -> tuple[list[dict]
                                    if abs(total_gain) > 1e-9 else float("nan")),
             # 上限
             "bound_overlap_only_ms": bound1,
-            "speedup_bound_overlap_only": serial_e2e / bound1,
+            "time_reduction_bound_overlap_only_pct":
+                (serial_e2e - bound1) / serial_e2e * 100.0,
             "bound_tk_full_ms": bound_tk,
-            "speedup_bound_tk_full": serial_e2e / bound_tk,
-            "speedup_actual": serial_e2e / tk_e2e,
-            "speedup_actual_fair": serial_e2e / tk_e2e_fair,
+            "time_reduction_bound_tk_full_pct":
+                (serial_e2e - bound_tk) / serial_e2e * 100.0,
+            "time_reduction_actual_pct":
+                (serial_e2e - tk_e2e) / serial_e2e * 100.0,
+            "time_reduction_actual_fair_pct":
+                (serial_e2e - tk_e2e_fair) / serial_e2e * 100.0,
             "headroom_vs_bound_ms": tk_e2e_fair - bound_tk,
         }
         rows.append(row)
@@ -137,17 +141,18 @@ def analyze(results_dir: str, sched_ms: float | None = None) -> tuple[list[dict]
                  f"| {r['comm_overlap_gain_ms']*1e3:+.0f}us "
                  f"| **{r['compute_gain_share']*100:.0f}%** |")
     L.append("\n## 3. 理论上限 vs 实际\n")
-    L.append("| tokens | serial | 只重叠上限(x) | TK+全重叠上限(x) "
-             "| 实际 tkfused(x, fair) | 距上限 |")
+    L.append("| tokens | serial | 只重叠上限(耗时降低) | "
+             "TK+全重叠上限(耗时降低) | "
+             "实际 tkfused(耗时降低, fair) | 距上限 |")
     L.append("|---:|---:|---:|---:|---:|---:|")
     for r in rows:
         L.append(f"| {r['tokens_total']} | {r['serial_e2e_ms']*1e3:.0f}us "
                  f"| {r['bound_overlap_only_ms']*1e3:.0f}us "
-                 f"(x{r['speedup_bound_overlap_only']:.2f}) "
+                 f"({r['time_reduction_bound_overlap_only_pct']:+.2f}%) "
                  f"| {r['bound_tk_full_ms']*1e3:.0f}us "
-                 f"(x{r['speedup_bound_tk_full']:.2f}) "
+                 f"({r['time_reduction_bound_tk_full_pct']:+.2f}%) "
                  f"| {r['tk_e2e_fair_ms']*1e3:.0f}us "
-                 f"(x{r['speedup_actual_fair']:.2f}) "
+                 f"({r['time_reduction_actual_fair_pct']:+.2f}%) "
                  f"| {r['headroom_vs_bound_ms']*1e3:+.0f}us |")
     L.append("\n> 口径:计算收益 = vllm_compute - (tk GEMM链 + schedule);"
              "通信+重叠收益 = 总收益 - 计算收益。disp/comb 通信下限分别用 "

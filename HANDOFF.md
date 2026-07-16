@@ -1,5 +1,14 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：性能收益统一为相对 baseline 的耗时降低
+
+- 新的唯一报数口径为 `(baseline_time - candidate_time) / baseline_time * 100%`；
+  正数表示耗时降低，负数表示比 baseline 更慢，不再计算或输出加速比。
+- `mb1_compute.py`、`mb3_ratio.py`、`mb4_fusion.py` 和 `verify_fp8_gemm.py` 已改为
+  `time_reduction_*_pct` 字段和百分比输出；当前文档、计划和项目博客的自有性能数字已同步换算。
+- `microbench/results/`、`docs/归档/` 和本文下方的旧迭代记录保留生成当时的历史字段/表述，
+  不回写旧实验产物；从本条记录开始，所有新结果必须使用耗时降低百分比。
+
 ## 2026-07-16：明确“平台事实”的机器与拓扑作用域
 
 - `docs/04_平台边界与负结果.md` 将结论拆成架构约束、机器/拓扑实测、软件栈/工作负载裁决三层。归档带宽、RTT、`comm_sms=24`、CE/Comet-N 等主要来自早期 16 卡服务器，不能无复测迁移到当前 8 卡环境。

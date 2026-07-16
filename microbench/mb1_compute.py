@@ -148,7 +148,9 @@ def _worker(rank, world, init_method, out_list):
                         flops_eff / (t["tk_chain"] * 1e-3) / 1e12,
                     "tk_chain_tflops_padded":
                         flops_pad / (t["tk_chain"] * 1e-3) / 1e12,
-                    "tk_over_vllm_speedup": t["vllm_compute"] / t["tk_chain"],
+                    "tk_time_reduction_vs_vllm_pct":
+                        (t["vllm_compute"] - t["tk_chain"])
+                        / t["vllm_compute"] * 100.0,
                 }
                 rows.append(row)
                 print(f"[mb1] tokens={total:5d}  "
@@ -157,7 +159,8 @@ def _worker(rank, world, init_method, out_list):
                       f"tk_chain={t['tk_chain']*1e3:8.1f}us "
                       f"({row['tk_chain_tflops_eff']:6.1f} TF)  "
                       f"tk_sched={t['tk_sched']*1e3:7.1f}us  "
-                      f"speedup={row['tk_over_vllm_speedup']:.2f}x", flush=True)
+                      f"time_reduction="
+                      f"{row['tk_time_reduction_vs_vllm_pct']:+.2f}%", flush=True)
 
             del sch, problem, hidden_full, ids_full, w_full, g
             del x0, wd0, od0, x1, wd1, od1

@@ -484,7 +484,8 @@ class TKFusedEP(DistributedScheme):
         # under the W2 GEMM) + per-card watermark election, no full barrier —
         # fixes v0's ~0% comm overlap (docs/17). Correct at NE∈{64,128,256}
         # (validate_prered_push.py, rel ~7e-3); e2e (default shape) 2331->1963µs
-        # (1.48× serial). "prered" (v0) kept behind TK_COMBINE=prered; "pull"
+        # (32.4% less time than serial). "prered" (v0) kept behind
+        # TK_COMBINE=prered; "pull"
         # (moe_gemm_combine_fused) behind TK_COMBINE=pull.
         self.combine_mode = _os.environ.get("TK_COMBINE", "prered_push")
 
@@ -680,8 +681,9 @@ class TKFusedEP(DistributedScheme):
         # asserted unchanged. Only active on the default path (pull + prered).
         # P1 (docs/22): include prered_push — the DEFAULT combine — in the timed
         # GPU schedule rebuild. The old `== "prered"` skipped it, so the default
-        # path's e2e (1963µs / "1.48×") never paid the ~205µs sched cost; fair
-        # numbers are ~2170µs / 1.34× (microbench mb3_report_sched205us).
+        # path's e2e (1963µs / 32.4% time reduction) never paid the ~205µs
+        # sched cost; the fair result is ~2170µs / 25.3% time reduction
+        # (microbench mb3_report_sched205us).
         if self.gpu_schedule and self.dispatch_mode == "pull" \
                 and self.combine_mode in ("prered", "prered_push"):
             torch.distributed.all_gather_into_tensor(self._all_topk, self._topk_ids_local)

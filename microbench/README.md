@@ -109,7 +109,9 @@ MB_PRECISION=fp8 bash moe_bench/microbench/run_all.sh
    `combine_mode == "prered"` 时计入 `run()`(tk_scheme.py:681),而默认
    combine 是 `prered_push` —— 即 **当前默认路径的 e2e 数字不含 schedule 成本**
    (~200µs 量级)。mb4 单独测了 `sched`,mb3/mb4 同时给出
-   `speedup_vs_serial`(原样)与 `speedup_vs_serial_with_sched`(公平口径)。
+   `time_reduction_vs_serial_pct`(原样)与
+   `time_reduction_vs_serial_with_sched_pct`(公平口径)。两者均按
+   `(serial_time - tk_time) / serial_time * 100%` 计算，负数表示比 serial 更慢。
 5. mb2 的 TK 侧在 `TK_FUSE_GATEUP=0, TK_COMBINE=prered` 下构建(push_data 需要
    w_gate、final_reduce 需要 partials),只影响 buffer 准备,不影响被测通信 kernel。
 6. mb6 的计算代理是 fp32 FMA(对 SM 数/warp 数敏感),不是 tensor-core GEMM;

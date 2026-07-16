@@ -98,7 +98,8 @@
 ### 6.2 性能预期
 
 - 与"AllGather → grouped GEMM → ReduceScatter 串行"的 baseline 对比（同输入同验证）
-- PCIe 参照档：单层 **1.2x-1.5x** 即达到论文 L20 水平；M 小时（decode 场景）收益应更明显
+- PCIe 参照档：单层相对 baseline **耗时降低 16.7%-33.3%** 即达到论文
+  L20 水平；M 小时（decode 场景）收益应更明显
 - 若通信时间 > 计算时间（PCIe 上大 M 时可能发生）：收益封顶于计算时长，重点转向"吃满 PCIe 带宽"（加粗段、加大 n_c）而非更细的重叠
 
 ---

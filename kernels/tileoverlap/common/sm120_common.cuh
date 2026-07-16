@@ -604,7 +604,7 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
             // rt 行布局: data[偶] → 行 r0, data[奇] → r0+8(global_to_register)
             const int r0 = row_idx * cfg::ROW_BLOCK + store_strip * 16 + (lane_id >> 2);
 
-            // scale 预取(docs/38: 首测 1.27×, 边界处的 3 个 global scale 读
+            // scale 预取(docs/38: 首测耗时降低 21.3%, 边界处的 3 个 global scale 读
             // 在关键路径上, 32 个边界 × L2 延迟 ≈ 40% 气泡)。边界只消费
             // 已在寄存器的值, 同时发起下一块的加载(2 个 red step 的着陆窗)。
             float bsc_n = G.w_scales[{e, col_idx, 0}];

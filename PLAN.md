@@ -70,12 +70,13 @@
 - 扫参建表（tile 形状、n_split、RS_BLOCKS、sm_margin）
 - 接入 moe_bench，与 serial baseline 对比
 - 输出性能报告
-- **产出**：性能数据，达到 PCIe 参照档（1.2×–1.5×）
+- **产出**：性能数据，相对 serial baseline 的耗时降低达到 PCIe 参照档
+  （16.7%–33.3%）
 
 ## 6. 成功标准
 
 1. **正确性**：moe_bench `verify` 列全部 `ok`（FP8 容差 atol=3.5e-2, rtol=3.5e-2）
-2. **性能**：单层延迟低于 serial baseline（PCIe 参照档 1.2×–1.5× 加速）
+2. **性能**：单层延迟低于 serial baseline（PCIe 参照档耗时降低 16.7%–33.3%）
 3. **鲁棒性**：边界场景通过（某专家 0 行、极端倾斜路由、token 数不能整除等）
 
 ## 7. 参考文档索引
