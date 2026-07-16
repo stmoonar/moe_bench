@@ -1633,11 +1633,18 @@ __device__ inline void scatter_lane(const pglobals &G, int *__restrict__ pull_ne
         const int src = d / G.num_tokens;
         const int t = d % G.num_tokens;
         if (src != G.dev_idx) {       // 远端行: 本地 acquire 自旋等到达
+            // 有界自旋(踩坑加固): 协议 bug 导致 flag 永不到达时, ~30s 后
+            // trap 杀死整个 kernel -> CUDA error -> 进程干净退出, 避免
+            // 持久 kernel 自旋 wedge 整机(不可抢占 + IPC 级联, docs/44 类)。
+            long long spins = 0;
             int v;
             do {
                 asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
                              : "=r"(v) : "l"(&G.ag_flags[G.dev_idx][{0, d}]) : "memory");
-                if (v < G.seq) __nanosleep(64);
+                if (v < G.seq) {
+                    __nanosleep(64);
+                    if (++spins > 500000000LL) asm volatile("trap;");
+                }
             } while (v < G.seq);
         }
         tma::expect_bytes(sem, sizeof(typename pglobals::token_vec) +
@@ -1693,11 +1700,15 @@ __device__ inline void scatter_warp(const pglobals &G, int *__restrict__ pull_ne
         int myslot = -1;
         if (lane < pglobals::TOP_K) myslot = G.tp_slots[{d, lane}];
         if (src != G.dev_idx && lane == 0) {   // 远端行: 等到达(本地 acquire)
+            long long spins = 0;   // 有界自旋 + trap(见 scatter_lane 注释)
             int v;
             do {
                 asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
                              : "=r"(v) : "l"(&G.ag_flags[G.dev_idx][{0, d}]) : "memory");
-                if (v < G.seq) __nanosleep(64);
+                if (v < G.seq) {
+                    __nanosleep(64);
+                    if (++spins > 500000000LL) asm volatile("trap;");
+                }
             } while (v < G.seq);
         }
         __syncwarp();   // lane 0 的 acquire + warp 同步 => 全员可读该行

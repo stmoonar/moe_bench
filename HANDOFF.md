@@ -1,5 +1,21 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：P2.5 首测整机 wedge 事故 + 自旋 trap 加固（待复测）
+
+- 现象：P2.5 首测把容器整个卡死（nvidia-smi 挂）。机理：持久 kernel 挂死后超时
+  kill 不能抢占自旋 kernel（进程 D 态），且一个 rank 死后其余 rank 经 IPC 继续
+  自旋访问已死上下文显存 → 驱动通道 wedge。**非驱动损坏**，恢复：宿主机 kill -9
+  → `nvidia-smi -r -i 0,1,2,3` → 容器/宿主机重启逐级升级。已入 docs/04 坑索引。
+- 头号嫌疑：scatter_warp（本轮唯一首跑的新设备代码）或其与 psms=2/默认 push 的
+  组合。**flag 自旋已加有界 + trap（~30s 超时杀 kernel → CUDA error → 干净退出），
+  下次挂死会变成可诊断的 FAIL 而不是 wedge**（scatter_lane/scatter_warp 两处）。
+- **恢复后的复测纪律**：①先 `dmesg | grep -iE "nvrm|xid"` + 上轮 summary.txt 定位
+  挂死步骤；②单步隔离跑 `STEPS='^01_|^03p25_' bash tools/run_tp_all.sh`（不要挂长
+  矩阵）；③trap 触发则看是哪个自旋（Xid/驱动日志 + FAIL step），协议 bug 定位后
+  再放开 04p25/05p25。
+- 注意：TK_L0_PUSH 默认已是 1——03f8/04f8 等所有 fp8 步骤现在默认走 push 路径
+  （上轮 push 全绿，但若要排除变量可 TK_L0_PUSH=0 回滚到 lane）。
+
 ## 2026-07-16：P2 实测——push 双档全赢翻默认（1629/2777），瓶颈转移到本地 scatter
 
 - tp_run_20260716_075314：push@24 = **1629**（vs lane 1682，−53）、T=1024 = **2777**
