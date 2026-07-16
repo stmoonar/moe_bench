@@ -16,10 +16,13 @@
   满 SM 收益），与 docs/35 "L1 v1 近最优"一致，建议定案回 v1。
 - 本轮 08f stages full_run 3983 与同 session bench 1709 严重失配，stages 数字
   本轮不采信（比 docs/41 的失真大得多，原因未查）。
-- **下一步**：①复跑 `STEPS='^01_|^04w8_bench_l0warp' ×3` 裁决双稳；②确认后 nsys
-  区分机制（GEMM tile 发射间隔 vs TMA 队列）；③修复候选：gate 自助拉取（饥饿
-  自愈）/ comm lane 改普通向量加载绕开 TMA 队列 / 混合方案（少量专职 comm SM
-  兜底）。详见 docs/归档/2026-07-16_方案A_通信warp化设计与落地.md §0。
+- **定位工具已落码（第二批提交）**：`tools/diag_warp.py` + kernel 探针
+  `moe_tp_dispatch_gemm_fp8_warp_probe`（gate_off + num_slots 旋钮），逐迭代打印，
+  一次把融合税拆成 满SM纯GEMM上限 / 共存税（发射槽+TMA队列，机制②读数）/
+  gate-straggler 税（机制①读数），L0/L1 各一套阶梯 + comm lane 数 sweep。
+- **下一步（上机）**：`STEPS='^00_|^01_|^08w8_' bash tools/run_tp_all.sh`（01 必跑，
+  tk_moe.cu 有新探针）。裁决树与修复方向映射见
+  docs/归档/2026-07-16_方案A_通信warp化设计与落地.md §下一步。
 
 ## 2026-07-16：方案A 通信 warp 化落码（分支 comm_warp，待上机）
 

@@ -296,6 +296,9 @@ else
     fi
     # ---------- 8f. fp8 分阶段归因 ----------
     run_step 08f_time_stages_fp8 900 python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
+    # ---------- 8w8. 方案A 定位(逐迭代 + 融合税三分解: 纯GEMM上限/共存税/
+    # gate-straggler 税; 裁决 L0 双稳机制①发射饥饿 vs ②TMA 队列 HoL) ----------
+    run_step 08w8_diag_warp 900 python -m moe_bench.tools.diag_warp 64 30 512
     if [ "$REUSE_BENCH" != "1" ]; then
     run_step 04f_bench_serial_fp8_512 600 python -m moe_bench.tools.run_tktp 64 \
         --scheme serial --precision fp8 --no-verify --iters 50 \

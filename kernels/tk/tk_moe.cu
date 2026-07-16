@@ -1235,13 +1235,54 @@ void kernel_warp(const __grid_constant__ globals G, const int *__restrict__ blk_
         comm_lane_pull(G, pull_next, token[lane_id - 1], scales[lane_id - 1],
                        token_arrived[lane_id - 1]);
 }
-void entry_warp(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTensor &pre_scales,
+// 探针 kernel(诊断专用, tools/diag_warp.py): 与 kernel_warp 同体, 两个旋钮
+// 把"融合税"拆成可辨成分 —— GATED=false 关掉 dispatch_gate(GEMM 不等数据,
+// 直接读 gathered 旧值, **输出无意义, 只用于计时**); num_slots 运行时限制
+// comm lane 数(配合 host 侧把 pull_next 预填成 s_max, comm lane 领不到
+// token 立即退出, 得到"满 SM 纯 GEMM"硬上限参考)。
+//   l0_warp_gemm = GATED=0 + pull 跳过      -> GEMM@全SM 上限
+//   l0_warp_ng   = GATED=0 + pull 正常      -> 上限 + 共存税(发射槽/TMA队列)
+//   l0_warp      = GATED=1 + pull 正常      -> 再 + 数据等待/straggler 车队税
+struct no_gate_probe { __device__ inline void operator()(int) const {} };
+template <bool GATED>
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void kernel_warp_probe(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
+                       int *__restrict__ task_next, const int num_tasks,
+                       int *__restrict__ pull_next, const int num_slots) {
+    using cfg = gemm_config_fp8;
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[cfg::DYNAMIC_SHARED_MEMORY / sizeof(int)]);
+    typename globals::token_vec (&token)[WARP_SLOTS] =
+        al.allocate<typename globals::token_vec, WARP_SLOTS>();
+    typename globals::scale_vec (&scales)[WARP_SLOTS] =
+        al.allocate<typename globals::scale_vec, WARP_SLOTS>();
+    __shared__ semaphore token_arrived[WARP_SLOTS];
+    const int lane_id = kittens::laneid();
+    const int ns = num_slots < WARP_SLOTS ? num_slots : WARP_SLOTS;
+    const bool is_comm = (kittens::warpid() == cfg::CONSUMER_WARPS &&
+                          lane_id >= 1 && lane_id <= ns);
+    if (is_comm)
+        init_semaphore(token_arrived[lane_id - 1], 0, 1);
+    if constexpr (GATED)
+        grouped_gemm_sm120_fp8_dispenser(G, dispatch_gate{G}, noop_epilogue{},
+                                         glu_store_policy<globals::outputs_gl>{G.outputs},
+                                         blk_expert, task_next, num_tasks);
+    else
+        grouped_gemm_sm120_fp8_dispenser(G, no_gate_probe{}, noop_epilogue{},
+                                         glu_store_policy<globals::outputs_gl>{G.outputs},
+                                         blk_expert, task_next, num_tasks);
+    if (is_comm)
+        comm_lane_pull(G, pull_next, token[lane_id - 1], scales[lane_id - 1],
+                       token_arrived[lane_id - 1]);
+}
+// entry_warp / entry_warp_probe 共用的 globals 组装 + 校验
+static globals _warp_globals(kittens::py::TKParallelTensor &pre_tokens,
+           kittens::py::TKParallelTensor &pre_scales,
            at::Tensor &ag_tokens, at::Tensor &ag_scales,
            at::Tensor &gathered, at::Tensor &gathered_scales,
            at::Tensor &weights, at::Tensor &w_scales, at::Tensor &act,
            at::Tensor &padded_tokens_per_expert, at::Tensor &tp_slots,
-           at::Tensor &slack, at::Tensor &pull_order, at::Tensor &blk_expert,
-           at::Tensor &gemm_next, at::Tensor &pull_next,
+           at::Tensor &slack, at::Tensor &pull_order,
            kittens::py::TKParallelTensor &barrier,
            const int num_padded_local_tokens, const int num_tokens) {
     using cfg = gemm_config_fp8;
@@ -1251,14 +1292,10 @@ void entry_warp(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
     TORCH_CHECK(weights.size(2) == globals::H, "weights (E,N,K) K must be H");
     TORCH_CHECK(act.size(1) == weights.size(1) / 2, "act width must be N/2 (GLU)");
     TORCH_CHECK(gathered_scales.size(1) == globals::NSC, "gathered_scales (P, H/128)");
-    TORCH_CHECK(gemm_next.numel() == 1 && pull_next.numel() == 1, "counters");
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
     const int s_max = static_cast<int>(tp_slots.size(0));
     TORCH_CHECK(s_max == globals::NUM_DEVICES * num_tokens, "tp_slots rows must be world*T");
-    const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
-    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
-    const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
-    globals G {
+    return globals {
         .pre_tokens = kittens::py::parallel_tensor_to_pgl<globals::pre_tokens_pgl>(pre_tokens),
         .pre_scales = kittens::py::parallel_tensor_to_pgl<globals::pre_scales_pgl>(pre_scales),
         .ag_tokens = kittens::py::tensor_to_gl<globals::ag_tokens_gl>(ag_tokens),
@@ -1278,13 +1315,69 @@ void entry_warp(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
         .num_padded_local_tokens = num_padded_local_tokens, .num_tokens = num_tokens,
         .s_max = s_max, .num_comp_sms = sm   // warp 版: 全部 SM 都是 GEMM 块
     };
+}
+static constexpr int WARP_SMEM = gemm_config_fp8::DYNAMIC_SHARED_MEMORY + WARP_SLOTS *
+    (sizeof(globals::token_vec) + sizeof(globals::scale_vec)) + 2048;
+void entry_warp(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTensor &pre_scales,
+           at::Tensor &ag_tokens, at::Tensor &ag_scales,
+           at::Tensor &gathered, at::Tensor &gathered_scales,
+           at::Tensor &weights, at::Tensor &w_scales, at::Tensor &act,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &tp_slots,
+           at::Tensor &slack, at::Tensor &pull_order, at::Tensor &blk_expert,
+           at::Tensor &gemm_next, at::Tensor &pull_next,
+           kittens::py::TKParallelTensor &barrier,
+           const int num_padded_local_tokens, const int num_tokens) {
+    using cfg = gemm_config_fp8;
+    TORCH_CHECK(gemm_next.numel() == 1 && pull_next.numel() == 1, "counters");
+    const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
+    globals G = _warp_globals(pre_tokens, pre_scales, ag_tokens, ag_scales,
+                              gathered, gathered_scales, weights, w_scales, act,
+                              padded_tokens_per_expert, tp_slots, slack,
+                              pull_order, barrier, num_padded_local_tokens, num_tokens);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + WARP_SLOTS *
-        (sizeof(globals::token_vec) + sizeof(globals::scale_vec)) + 2048;
-    CUDACHECK(cudaFuncSetAttribute(kernel_warp, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    kernel_warp<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+    CUDACHECK(cudaFuncSetAttribute(kernel_warp, cudaFuncAttributeMaxDynamicSharedMemorySize, WARP_SMEM));
+    kernel_warp<<<G.num_comp_sms, cfg::NUM_THREADS, WARP_SMEM, stream>>>(
         G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
         pull_next.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+    const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
+    reset_kernel<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+void entry_warp_probe(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParallelTensor &pre_scales,
+           at::Tensor &ag_tokens, at::Tensor &ag_scales,
+           at::Tensor &gathered, at::Tensor &gathered_scales,
+           at::Tensor &weights, at::Tensor &w_scales, at::Tensor &act,
+           at::Tensor &padded_tokens_per_expert, at::Tensor &tp_slots,
+           at::Tensor &slack, at::Tensor &pull_order, at::Tensor &blk_expert,
+           at::Tensor &gemm_next, at::Tensor &pull_next,
+           kittens::py::TKParallelTensor &barrier,
+           const int num_padded_local_tokens, const int num_tokens,
+           const bool gate_off, const int num_slots) {
+    using cfg = gemm_config_fp8;
+    TORCH_CHECK(gemm_next.numel() == 1 && pull_next.numel() == 1, "counters");
+    TORCH_CHECK(num_slots >= 0 && num_slots <= WARP_SLOTS, "num_slots in [0, WARP_SLOTS]");
+    const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
+    globals G = _warp_globals(pre_tokens, pre_scales, ag_tokens, ag_scales,
+                              gathered, gathered_scales, weights, w_scales, act,
+                              padded_tokens_per_expert, tp_slots, slack,
+                              pull_order, barrier, num_padded_local_tokens, num_tokens);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (gate_off) {
+        CUDACHECK(cudaFuncSetAttribute(kernel_warp_probe<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, WARP_SMEM));
+        kernel_warp_probe<false><<<G.num_comp_sms, cfg::NUM_THREADS, WARP_SMEM, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+            pull_next.data_ptr<int>(), num_slots);
+    } else {
+        CUDACHECK(cudaFuncSetAttribute(kernel_warp_probe<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, WARP_SMEM));
+        kernel_warp_probe<true><<<G.num_comp_sms, cfg::NUM_THREADS, WARP_SMEM, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+            pull_next.data_ptr<int>(), num_slots);
+    }
     CUDACHECK(cudaGetLastError());
     const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
     reset_kernel<<<rb, 256, 0, stream>>>(G);
@@ -3567,6 +3660,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tp_gemm_prered_push_v2", &tppr2::entry);
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
     m.def("moe_tp_dispatch_gemm_fp8_warp", &tpdisp8::entry_warp);
+    m.def("moe_tp_dispatch_gemm_fp8_warp_probe", &tpdisp8::entry_warp_probe);
     m.def("moe_tp_gemm_prered_push_fp8_warp", &tppr8::entry_warp);
     m.def("ce_ag_pull", &ce::ag_pull_entry);
     m.def("ce_rs_push", &ce::rs_push_entry);
