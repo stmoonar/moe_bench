@@ -1,5 +1,21 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：PK 框架路线重估——P1 comm 块 per-lane 自由化（新主线）
+
+- 依据 PK 论文三层框架 × 本机事实完成路线重估（docs/归档/2026-07-16_PK框架下的
+  路线重估.md）：①CE 判负获理论背书（≥256MB 粒度判据）；②register-op/in-network
+  路线本平台物理不存在（无 NVSwitch + 远端原子不可靠）；③intra-SM 的适用前提
+  （通信模式与计算 tile 流对齐）在我们 L0/L1 都不满足——方案A 判负与 PK 判据一致，
+  inter-SM + 转岗的现架构方向本来就对；④L1 定量定案：PK 隐藏判据 K≥sR/2B 给出
+  阈值 ≈3000 ≫ 我们的 K=768，wire 结构性藏不满，v1 不再动。
+- 核心洞察：错配在"通信占的 SM 数"——PK 说 TMA 15 SM 打满 450GB/s，我们 23.5GB/s
+  的 pull 却占 24 SM，根因是 dispatch_persistent 波同步低效（20 lane 等最慢者）。
+  方案A 的 comm_lane_pull（per-lane 自由运转）是对的代码放错了地方，应回专职 comm 块。
+- **路径**：P1 comm 块 per-lane 化 + 扫 comm_sms{4..24}（预期让渡税 183→90-120，
+  e2e→~1620-1650）→ P2 由 P1 门控：push 化重估（强路径 4 SM 打满，e2e→~1570-1600）
+  → P3 sched 摊薄（最大单项 ~270，e2e→~1500-1540）。
+- **下一步：实现 P1**（改 tpdisp8::dispatch_persistent 为 per-lane 模式，带回滚开关）。
+
 ## 2026-07-16：方案A 定位定案——per-SM TMA 队列共存税坐实，现形态判负
 
 - 08w8_diag_warp（tp_run_20260716_070406，30 迭代全稳）给出精确账：纯 GEMM@满SM
