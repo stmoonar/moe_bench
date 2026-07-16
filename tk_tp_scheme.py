@@ -398,11 +398,14 @@ class TKFusedTP(DistributedScheme):
             self.l0_lane = os.environ.get("TK_L0_LANE", "1") == "1"
             assert not (self.l0_lane and (self.l0_warp or self.l0_ce)), \
                 "TK_L0_LANE 与 TK_L0_WARP/TK_L0_CE 互斥"
-            # P2(PK 路线重估): L0 push 强路径 —— posted write 无 RTT 往返
-            # (4 SM 打满 50.9GB/s), 收侧只剩本地 staging 读, 在飞并发需求
-            # 暴跌, comm SM 可从 24 压到 ~8。优先级高于 lane/默认 pull。
-            # TK_L0_PUSH_SMS = comm 块里做源侧 push 的块数(其余做 scatter)。
-            self.l0_push = os.environ.get("TK_L0_PUSH", "0") == "1"
+            # P2(PK 路线重估): L0 push 强路径 —— posted write 无 RTT 往返,
+            # 收侧只剩本地 staging 读。实测(tp_run_20260716_075314)双档全赢:
+            # T=512 1629(-53 vs lane)/T=1024 2777(-53) -> 默认开。
+            # 拐点仍 24(瓶颈已转移到收侧 scatter 的 per-token TMA 串行等待,
+            # P2.5 warp 协作式 scatter 待做); push 2 个 SM 即饱和(psms sweep),
+            # 最好实测配置 = comm24+psms4, psms 默认保持 4(psms2 仅在 comm8
+            # 档验证过更优)。TK_L0_PUSH_SMS = 源侧 push 块数(其余 scatter)。
+            self.l0_push = os.environ.get("TK_L0_PUSH", "1") == "1"
             self.l0_push_sms = int(os.environ.get("TK_L0_PUSH_SMS", "4"))
             assert not (self.l0_push and (self.l0_warp or self.l0_ce)), \
                 "TK_L0_PUSH 与 TK_L0_WARP/TK_L0_CE 互斥"

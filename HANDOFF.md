@@ -1,5 +1,19 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：P2 实测——push 双档全赢翻默认（1629/2777），瓶颈转移到本地 scatter
+
+- tp_run_20260716_075314：push@24 = **1629**（vs lane 1682，−53）、T=1024 = **2777**
+  （vs 2830，−53）；正确性 rel_err 4.28e-2 同水位。**TK_L0_PUSH 默认已翻 1**。
+  当前最好口径 **1629/2777，vs serial fp8 2074/4030 = 耗时降低 21.5%/31.1%**。
+- 关键发现：①push 2 个 SM 即饱和（psms@comm8: 2/4/6 = 1750/1875/2518），wire 彻底
+  离开关键路径；②**拐点仍 24 未左移，但原因已换**——收侧 scatter 每 token 8 个 TMA
+  store + store_async_wait 的 per-token 串行等待（~10µs 级/lane），scatter SM 4→20
+  的 246µs 弹性与此吻合。最好实测配置 = comm24 + psms4（psms2 仅在 comm8 验证过）。
+- **下一步：P2.5 warp 协作式 scatter**——每 warp 一个 token，32 lane 分工搬 128B 段
+  （staging→8 槽全本地 HBM，纯 LSU 向量读写全流水，无 TMA/mbarrier/per-token wait），
+  fence 复用 signal_epilogue 的"全员 threadfence→sync→单线程 red"已验证模式。
+  预期 scatter 吞吐数倍 → comm SM 压到 8-12 或同 SM 数再挤 50-100µs。
+
 ## 2026-07-16：P2 L0 push 强路径落码（TK_L0_PUSH=1，待上机）
 
 - 设计：源侧 push lane（TK_L0_PUSH_SMS=4 个 comm 块）按 push_order 把量化行推到
