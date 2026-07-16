@@ -388,9 +388,12 @@ class TKFusedTP(DistributedScheme):
                 "TK_L1_WARP 需要 TK_L1_FP8=1(warp kernel 只有 fp8 版)"
             # P1(PK 路线重估 2026-07-16): comm 块 per-lane 自由化 —— 保持
             # inter-SM 几何(comm 块+转岗), 把波同步拉取(20 lane 等最慢者)
-            # 换成 per-lane 独立领取, 同样在飞并发用更少 comm SM 承载;
-            # 配 TK_COMM_SMS sweep 找新拐点。默认关, A/B 后定默认。
-            self.l0_lane = os.environ.get("TK_L0_LANE", "0") == "1"
+            # 换成 per-lane 独立领取。实测(tp_run_20260716_073019)全档赢:
+            # T=512 1681(-28)/T=1024 2831(-104), 每个 comm_sms 档位都优于
+            # 波同步 -> 默认开(TK_L0_LANE=0 回滚)。注意拐点未左移(16 SM 即
+            # 回升): pull 是 RTT 受限, ~480 在飞并发是真实需求, 压 SM 数
+            # 走 P2 push 化。
+            self.l0_lane = os.environ.get("TK_L0_LANE", "1") == "1"
             assert not (self.l0_lane and (self.l0_warp or self.l0_ce)), \
                 "TK_L0_LANE 与 TK_L0_WARP/TK_L0_CE 互斥"
             s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
