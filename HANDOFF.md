@@ -9,10 +9,16 @@
   离开关键路径；②**拐点仍 24 未左移，但原因已换**——收侧 scatter 每 token 8 个 TMA
   store + store_async_wait 的 per-token 串行等待（~10µs 级/lane），scatter SM 4→20
   的 246µs 弹性与此吻合。最好实测配置 = comm24 + psms4（psms2 仅在 comm8 验证过）。
-- **下一步：P2.5 warp 协作式 scatter**——每 warp 一个 token，32 lane 分工搬 128B 段
-  （staging→8 槽全本地 HBM，纯 LSU 向量读写全流水，无 TMA/mbarrier/per-token wait），
-  fence 复用 signal_epilogue 的"全员 threadfence→sync→单线程 red"已验证模式。
-  预期 scatter 吞吐数倍 → comm SM 压到 8-12 或同 SM 数再挤 50-100µs。
+- **P2.5 已落码（TK_L0_SCAT_WARP=1，默认 0）**：`tpdisp8::scatter_warp` +
+  `kernel_push<SCAT_WARP>`——scatter 块 9 个 warp 全员领 token（无 smem/semaphore），
+  每 token 32 lane 各搬 128B 段写 8 槽，lane 0 acquire 等 flag + syncwarp（既有
+  wait-then-sync 模式），全员 threadfence → syncwarp → lane 0..7 各发 red.release
+  （signal_epilogue 模式）；push 块不变，P2.5 步骤统一 psms=2（已实测饱和）。
+  脚本 03p25/04p25/05p25 sweep{4,6,8,12,16,24}/08p25。本地校验已过。
+- **下一步（上机）**：`STEPS='^00_|^01_|^03f8_|^03p25_|^04f8_|^04p2_|^04p25_|^05p25_|^08p25_'
+  bash tools/run_tp_all.sh`（01 必跑）。裁决：①03p25 正确性；②04p25 vs push 1629；
+  ③05p25 拐点是否真正左移（warp scatter 吞吐应数倍于 lane 版；若 8 SM 档 ≤1629
+  则转岗收益兑现）；④08p25 拐点档 L0_fused（目标 →~850 以下）。预期 e2e ~1530-1580。
 
 ## 2026-07-16：P2 L0 push 强路径落码（TK_L0_PUSH=1，待上机）
 

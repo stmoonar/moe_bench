@@ -1669,31 +1669,96 @@ __device__ inline void scatter_lane(const pglobals &G, int *__restrict__ pull_ne
         }
     }
 }
+/* P2.5(TK_L0_SCAT_WARP=1): warp 协作式 scatter。P2 首测裁决: wire 已离开
+ * 关键路径(push 2 SM 即饱和), 瓶颈 = scatter lane 每 token 8 个 TMA store
+ * + store_async_wait 的串行等待(~10µs/lane), scatter SM 4->20 有 246µs
+ * 弹性。warp 版: 每 warp 一个 token, 32 lane 分工搬 128B 段 —— staging→
+ * 8 槽全是本地 HBM, 纯 LSU 向量读写全流水, 无 TMA/mbarrier/smem/
+ * per-token wait。可见性 = signal_epilogue 已验证模式(全员 threadfence →
+ * warp 同步 → lane 0..7 发 red.release 计数); 远端到达 = lane 0 acquire
+ * 自旋 + __syncwarp(与 pcie_sync::wait_slot 后接块同步的既有模式同构)。 */
+__device__ inline void scatter_warp(const pglobals &G, int *__restrict__ pull_next) {
+    constexpr int NSC = pglobals::NSC;
+    constexpr int V4 = pglobals::H / (32 * 16);   // 每 lane 的 uint4 段数(=8 @H4096)
+    static_assert(pglobals::H % (32 * 16) == 0, "H must split into 32 uint4 lanes");
+    const int lane = kittens::laneid();
+    while (true) {
+        int i = 0;
+        if (lane == 0) i = atomicAdd(pull_next, 1);
+        i = __shfl_sync(0xffffffffu, i, 0);
+        if (i >= G.s_max) return;
+        const int d = G.pull_order[{i}];
+        const int src = d / G.num_tokens;
+        const int t = d % G.num_tokens;
+        int myslot = -1;
+        if (lane < pglobals::TOP_K) myslot = G.tp_slots[{d, lane}];
+        if (src != G.dev_idx && lane == 0) {   // 远端行: 等到达(本地 acquire)
+            int v;
+            do {
+                asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
+                             : "=r"(v) : "l"(&G.ag_flags[G.dev_idx][{0, d}]) : "memory");
+                if (v < G.seq) __nanosleep(64);
+            } while (v < G.seq);
+        }
+        __syncwarp();   // lane 0 的 acquire + warp 同步 => 全员可读该行
+        const fp8e4m3 *srow = (src == G.dev_idx)
+            ? &G.pre_tokens[G.dev_idx][{t, 0}]
+            : &G.ag_staging[G.dev_idx][{d, 0}];
+        const float *ssc = (src == G.dev_idx)
+            ? &G.pre_scales[G.dev_idx][{t, 0}]
+            : &G.ag_sscales[G.dev_idx][{d, 0}];
+        const uint4 *sv = reinterpret_cast<const uint4 *>(srow);
+        uint4 seg[V4];
+        #pragma unroll
+        for (int m = 0; m < V4; m++) seg[m] = sv[lane * V4 + m];
+        const float scv = (lane < NSC) ? ssc[lane] : 0.0f;
+        #pragma unroll
+        for (int k = 0; k < pglobals::TOP_K; k++) {
+            const int s = __shfl_sync(0xffffffffu, myslot, k);
+            if (s < 0) continue;
+            uint4 *dv = reinterpret_cast<uint4 *>(&G.activations[{s, 0}]);
+            #pragma unroll
+            for (int m = 0; m < V4; m++) dv[lane * V4 + m] = seg[m];
+            if (lane < NSC) (&G.a_scales[{s, 0}])[lane] = scv;
+        }
+        __threadfence();   // 全员 fence -> 同步 -> 发信号(signal_epilogue 模式)
+        __syncwarp();
+        if (lane < pglobals::TOP_K && myslot >= 0)
+            asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
+                         :: "l"(&G.barrier[G.dev_idx][{myslot / gemm_config_fp8::ROW_BLOCK}]), "r"(1) : "memory");
+    }
+}
+template <bool SCAT_WARP>
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel_push(const __grid_constant__ pglobals G, const int *__restrict__ blk_expert,
                  int *__restrict__ task_next, const int num_tasks,
                  int *__restrict__ push_next, int *__restrict__ pull_next) {
     using cfg = gemm_config_fp8;
     if (blockIdx.x >= G.num_comp_sms) {
-        extern __shared__ int __shm[];
-        tma_swizzle_allocator al((int*)&__shm[0]);
-        typename pglobals::token_vec (&tok)[pglobals::SLOTS] =
-            al.allocate<typename pglobals::token_vec, pglobals::SLOTS>();
-        typename pglobals::scale_vec (&sc)[pglobals::SLOTS] =
-            al.allocate<typename pglobals::scale_vec, pglobals::SLOTS>();
-        __shared__ semaphore arrived[pglobals::SLOTS];
-        const bool is_slot = (threadIdx.x % 8 == 0) &&
-                             (threadIdx.x / 8 < pglobals::SLOTS);
-        const int slot = threadIdx.x / 8;
-        if (is_slot)
-            init_semaphore(arrived[slot], 0, 1);
-        __syncthreads();
-        if (is_slot) {
-            const int cb = blockIdx.x - G.num_comp_sms;
-            if (cb < G.num_push_sms)
-                push_lane(G, push_next, tok[slot], sc[slot], arrived[slot]);
-            else
-                scatter_lane(G, pull_next, tok[slot], sc[slot], arrived[slot]);
+        const int cb = blockIdx.x - G.num_comp_sms;
+        if (SCAT_WARP && cb >= G.num_push_sms) {
+            // P2.5: scatter 块 = 9 个 warp 全员领 token, 无 smem/semaphore
+            scatter_warp(G, pull_next);
+        } else {
+            extern __shared__ int __shm[];
+            tma_swizzle_allocator al((int*)&__shm[0]);
+            typename pglobals::token_vec (&tok)[pglobals::SLOTS] =
+                al.allocate<typename pglobals::token_vec, pglobals::SLOTS>();
+            typename pglobals::scale_vec (&sc)[pglobals::SLOTS] =
+                al.allocate<typename pglobals::scale_vec, pglobals::SLOTS>();
+            __shared__ semaphore arrived[pglobals::SLOTS];
+            const bool is_slot = (threadIdx.x % 8 == 0) &&
+                                 (threadIdx.x / 8 < pglobals::SLOTS);
+            const int slot = threadIdx.x / 8;
+            if (is_slot)
+                init_semaphore(arrived[slot], 0, 1);
+            __syncthreads();
+            if (is_slot) {
+                if (cb < G.num_push_sms)
+                    push_lane(G, push_next, tok[slot], sc[slot], arrived[slot]);
+                else
+                    scatter_lane(G, pull_next, tok[slot], sc[slot], arrived[slot]);
+            }
         }
         kittens::group<cfg::NUM_WARPS>::sync(2);  // 全块汇合后转岗(docs/24)
     }
@@ -1718,7 +1783,8 @@ void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
            at::Tensor &push_next, at::Tensor &pull_next,
            kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_push_sms,
-           const int num_padded_local_tokens, const int num_tokens, const int seq) {
+           const int num_padded_local_tokens, const int num_tokens, const int seq,
+           const bool scat_warp) {
     using cfg = gemm_config_fp8;
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
@@ -1767,10 +1833,17 @@ void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
         cfg::DYNAMIC_SHARED_MEMORY + 1024
         ? pglobals::SLOTS * (sizeof(pglobals::token_vec) + sizeof(pglobals::scale_vec)) + 2048
         : cfg::DYNAMIC_SHARED_MEMORY + 1024;
-    CUDACHECK(cudaFuncSetAttribute(kernel_push, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    kernel_push<<<sm, cfg::NUM_THREADS, smem, stream>>>(
-        G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
-        push_next.data_ptr<int>(), pull_next.data_ptr<int>());
+    if (scat_warp) {
+        CUDACHECK(cudaFuncSetAttribute(kernel_push<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel_push<true><<<sm, cfg::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+            push_next.data_ptr<int>(), pull_next.data_ptr<int>());
+    } else {
+        CUDACHECK(cudaFuncSetAttribute(kernel_push<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel_push<false><<<sm, cfg::NUM_THREADS, smem, stream>>>(
+            G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+            push_next.data_ptr<int>(), pull_next.data_ptr<int>());
+    }
     CUDACHECK(cudaGetLastError());
     const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
     reset_kernel_p<<<rb, 256, 0, stream>>>(G);

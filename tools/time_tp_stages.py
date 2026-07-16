@@ -110,7 +110,8 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
                     s.tp_slots, s.slack, s.pull_order, s.push_order,
                     s.blk_expert, s.gemm_next, s.push_next, s.pull_next,
                     s.barrier_l0, s.num_comm_sms, s.l0_push_sms,
-                    s.num_padded_total, s.num_tokens, s._l0_seq)
+                    s.num_padded_total, s.num_tokens, s._l0_seq,
+                    getattr(s, "l0_scat_warp", False))
             elif s.fp8 and getattr(s, "l0_lane", False):
                 # P1: per-lane comm 块(TK_L0_LANE=1), 与 scheme.run 相同
                 s.gemm_next.zero_()

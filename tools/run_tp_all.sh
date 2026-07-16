@@ -343,6 +343,28 @@ else
             --json "$JSONS/tktp_fp8_push_psms${PS}.json"
     done
     fi
+    # ---------- 4p25. P2.5: warp 协作式 scatter(攻收侧 per-token 串行等待;
+    # psms=2 已实测饱和, SM 尽量给 scatter) ----------
+    run_step 03p25_correct_scatwarp 600 env TK_L0_PUSH=1 TK_L0_SCAT_WARP=1 TK_L0_PUSH_SMS=2 \
+        python -m moe_bench.tools.run_tktp 64 --precision fp8 --iters 10
+    if [ "$REUSE_BENCH" != "1" ]; then
+    run_step 04p25_bench_scatwarp_512 600 env TK_L0_PUSH=1 TK_L0_SCAT_WARP=1 TK_L0_PUSH_SMS=2 \
+        python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 50 \
+        --json "$JSONS/tktp_fp8_scatwarp_ne64_t512.json"
+    run_step 04p25_bench_scatwarp_t1024 600 env TK_L0_PUSH=1 TK_L0_SCAT_WARP=1 TK_L0_PUSH_SMS=2 \
+        python -m moe_bench.tools.run_tktp 64 \
+        --scheme tktp --precision fp8 --no-verify --iters 30 --tokens 1024 \
+        --json "$JSONS/tktp_fp8_scatwarp_t1024.json"
+    # warp scatter 吞吐应数倍于 lane 版 -> 拐点应真正左移, 主扫小 comm_sms
+    for CS in 4 6 8 12 16 24; do
+        run_step "05p25_scatwarp_commsms_${CS}" 600 \
+            env TK_L0_PUSH=1 TK_L0_SCAT_WARP=1 TK_L0_PUSH_SMS=2 TK_COMM_SMS=$CS \
+            python -m moe_bench.tools.run_tktp 64 \
+            --scheme tktp --precision fp8 --no-verify --iters 30 \
+            --json "$JSONS/tktp_fp8_scatwarp_commsms${CS}.json"
+    done
+    fi
     # ---------- 8f. fp8 分阶段归因 ----------
     run_step 08f_time_stages_fp8 900 python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     # P1 归因: 最优 lane comm_sms 档的 L0 暴露(跑完 05p1 后把 TK_COMM_SMS 换成拐点值)
@@ -350,6 +372,10 @@ else
         python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     # P2 归因: push 模式拐点档(跑完 05p2 后按拐点调 TK_COMM_SMS)
     run_step 08p2_time_stages_push 900 env TK_L0_PUSH=1 TK_COMM_SMS=8 \
+        python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
+    # P2.5 归因: warp scatter 拐点档
+    run_step 08p25_time_stages_scatwarp 900 env TK_L0_PUSH=1 TK_L0_SCAT_WARP=1 \
+        TK_L0_PUSH_SMS=2 TK_COMM_SMS=8 \
         python -m moe_bench.tools.time_tp_stages 64 20 512 fp8
     # ---------- 8w8. 方案A 定位(逐迭代 + 融合税三分解: 纯GEMM上限/共存税/
     # gate-straggler 税; 裁决 L0 双稳机制①发射饥饿 vs ②TMA 队列 HoL) ----------

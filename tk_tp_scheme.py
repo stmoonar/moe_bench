@@ -407,6 +407,11 @@ class TKFusedTP(DistributedScheme):
             # 档验证过更优)。TK_L0_PUSH_SMS = 源侧 push 块数(其余 scatter)。
             self.l0_push = os.environ.get("TK_L0_PUSH", "1") == "1"
             self.l0_push_sms = int(os.environ.get("TK_L0_PUSH_SMS", "4"))
+            # P2.5: warp 协作式 scatter(每 warp 一 token, 32 lane 分工搬
+            # 128B 段, 纯 LSU 全流水, 无 TMA/mbarrier/per-token wait)。
+            # 攻收侧 scatter 的 per-token 串行等待(P2 首测的新瓶颈)。
+            # 默认关, A/B 后定默认。
+            self.l0_scat_warp = os.environ.get("TK_L0_SCAT_WARP", "0") == "1"
             assert not (self.l0_push and (self.l0_warp or self.l0_ce)), \
                 "TK_L0_PUSH 与 TK_L0_WARP/TK_L0_CE 互斥"
             s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
@@ -616,7 +621,8 @@ class TKFusedTP(DistributedScheme):
                 self.pull_order, self.push_order, self.blk_expert,
                 self.gemm_next, self.push_next, self.pull_next,
                 self.barrier_l0, self.num_comm_sms, self.l0_push_sms,
-                self.num_padded_total, self.num_tokens, self._l0_seq)
+                self.num_padded_total, self.num_tokens, self._l0_seq,
+                self.l0_scat_warp)
         elif self.fp8 and self.l0_lane:
             # P1: per-lane 自由化的 comm 块拉取(inter-SM 几何不变, 只换
             # 拉取组织方式); 配 TK_COMM_SMS sweep 找新拐点。
