@@ -32,6 +32,15 @@ using namespace kittens::prototype;
 
 namespace pcie_sync {
 
+/* 死锁红线(AGENTS.md, 2026-07-16 整机 wedge 事故): 所有跨卡/跨块自旋必须
+ * 有界。~32s(5e8 次 nanosleep(64))等不到就 trap 杀死整个 kernel -> CUDA
+ * error -> 进程干净退出。持久 kernel 的无界自旋一旦挂死不可抢占, 上下文
+ * 销毁抱着 RM GPU 锁永不返回, nvidia-smi/新 CUDA 进程全部排队 -> 整机只能
+ * 重启宿主机。合法等待最长 ~几 ms, 32s 裕量 1000 倍, miss 路径加一次计数
+ * 零成本。 */
+#define PCIE_SPIN_GUARD_DECL  long long _spin_guard = 0
+#define PCIE_SPIN_GUARD_TICK  do { if (++_spin_guard > 500000000LL) asm volatile("trap;"); } while (0)
+
 /**
  * Slot-based all-device barrier. Legal on PCIe because every slot has exactly
  * one writer (plain release store, no atomics) and every wait polls local
@@ -54,10 +63,11 @@ __device__ static inline void pcie_barrier_all(const BAR &bar, const int dev_idx
                      :: "l"(&bar[threadIdx.x][{1, dev_idx}]), "r"(seq) : "memory");
         // poll my local copy until every device has arrived
         int val = 0;
+        PCIE_SPIN_GUARD_DECL;
         do {
             asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
                          : "=r"(val) : "l"(&bar[dev_idx][{1, static_cast<int>(threadIdx.x)}]) : "memory");
-            if (val < seq) __nanosleep(64);
+            if (val < seq) { __nanosleep(64); PCIE_SPIN_GUARD_TICK; }
         } while (val < seq);
     }
     __syncthreads();
@@ -78,10 +88,11 @@ __device__ static inline void signal_slot(const BAR &bar, const int dst_dev, con
 template <kittens::ducks::pgl::all BAR>
 __device__ static inline void wait_slot(const BAR &bar, const int my_dev, const int row, const int col, const int seq) {
     int val = 0;
+    PCIE_SPIN_GUARD_DECL;
     do {
         asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
                      : "=r"(val) : "l"(&bar[my_dev][{row, col}]) : "memory");
-        if (val < seq) __nanosleep(64);
+        if (val < seq) { __nanosleep(64); PCIE_SPIN_GUARD_TICK; }
     } while (val < seq);
 }
 

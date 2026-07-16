@@ -364,8 +364,9 @@ struct dispatch_gate {
     __device__ inline void operator()(int row_idx) const {
         int v;
         asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        PCIE_SPIN_GUARD_DECL;
         while (v != gemm_config::ROW_BLOCK) {
-            __nanosleep(32);
+            __nanosleep(32); PCIE_SPIN_GUARD_TICK;
             asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         }
     }
@@ -527,8 +528,9 @@ struct dispatch_gate {
     __device__ inline void operator()(int row_idx) const {
         int v;
         asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        PCIE_SPIN_GUARD_DECL;
         while (v != gemm_config::ROW_BLOCK) {
-            __nanosleep(32);
+            __nanosleep(32); PCIE_SPIN_GUARD_TICK;
             asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         }
     }
@@ -701,8 +703,9 @@ struct dispatch_gate {
     __device__ inline void operator()(int row_idx) const {
         int v;
         asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        PCIE_SPIN_GUARD_DECL;
         while (v != gemm_config::ROW_BLOCK) {
-            __nanosleep(32);
+            __nanosleep(32); PCIE_SPIN_GUARD_TICK;
             asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         }
     }
@@ -988,8 +991,9 @@ struct dispatch_gate {
     __device__ inline void operator()(int row_idx) const {
         int v;
         asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        PCIE_SPIN_GUARD_DECL;
         while (v != gemm_config_fp8::ROW_BLOCK) {
-            __nanosleep(32);
+            __nanosleep(32); PCIE_SPIN_GUARD_TICK;
             asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         }
     }
@@ -1022,7 +1026,7 @@ __device__ inline void dispatch_persistent(const globals &G, const int *__restri
             const int src_tok = d % G.num_tokens;
             if constexpr (CE) {  // 远端分片按 flag 放行; 自己的分片直读本地
                 if (src_dev != G.dev_idx)
-                    while (((volatile const int *)flags)[src_dev] == 0) __nanosleep(64);
+                    { PCIE_SPIN_GUARD_DECL; while (((volatile const int *)flags)[src_dev] == 0) { __nanosleep(64); PCIE_SPIN_GUARD_TICK; } }
             }
             tma::expect_bytes(token_arrived[lane_id],
                               sizeof(globals::token_vec) + sizeof(globals::scale_vec));
@@ -1111,7 +1115,7 @@ __device__ inline void dispatch_persistent_lane(const globals &G, const int *__r
         const int src_tok = d % G.num_tokens;
         if constexpr (CE) {   // 远端分片按 flag 放行; 自己的分片直读本地
             if (src_dev != G.dev_idx)
-                while (((volatile const int *)flags)[src_dev] == 0) __nanosleep(64);
+                { PCIE_SPIN_GUARD_DECL; while (((volatile const int *)flags)[src_dev] == 0) { __nanosleep(64); PCIE_SPIN_GUARD_TICK; } }
         }
         tma::expect_bytes(token_arrived[slot],
                           sizeof(typename globals::token_vec) +
@@ -1585,8 +1589,9 @@ struct dispatch_gate_p {
     __device__ inline void operator()(int row_idx) const {
         int v;
         asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        PCIE_SPIN_GUARD_DECL;
         while (v != gemm_config_fp8::ROW_BLOCK) {
-            __nanosleep(32);
+            __nanosleep(32); PCIE_SPIN_GUARD_TICK;
             asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         }
     }
@@ -2013,8 +2018,9 @@ struct dispatch_gate {
     __device__ inline void operator()(int row_idx) const {
         int v;
         asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        PCIE_SPIN_GUARD_DECL;
         while (v != gemm_config::ROW_BLOCK) {
-            __nanosleep(32);
+            __nanosleep(32); PCIE_SPIN_GUARD_TICK;
             asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         }
     }
@@ -2232,8 +2238,9 @@ struct push_gate {
     __device__ inline void operator()(int row_idx) const {
         int v;
         asm volatile("{ld.acquire.sys.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        PCIE_SPIN_GUARD_DECL;
         while (v != gemm_config::ROW_BLOCK) {
-            __nanosleep(64);
+            __nanosleep(64); PCIE_SPIN_GUARD_TICK;
             asm volatile("{ld.acquire.sys.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         }
     }

@@ -1,5 +1,27 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-16：wedge 事故定位收窄 + 全量自旋加固 + 死锁红线入 AGENTS.md
+
+- 现场收窄（tp_run_20260716_081949）：03p25 正确性/04p25/05p25 全套 sweep **全部
+  通过**，挂死发生在 **08p25_time_stages_scatwarp**；且卡住的 worker 内核栈停在
+  `uvm_map_external_allocation`（TKParallelTensor IPC 映射 = setup 阶段，还没跑
+  benchmark）——它是排队在 RM GPU 锁后面的**受害者**。dmesg 证实 wedge 机理 =
+  RM GPU 组锁被卡死持有者占住，deviceQuery/nvidia-smi/cache_mgr 全部排队 →
+  8 卡"全灭"（锁是全局的，实际只用了 0-3）。元凶未收口：候选 = 前一步（05p25
+  commsms_24）teardown 残留 或 08p25 自身 worker 集内的先发故障；**待复测取证**
+  （需要该轮 summary.txt 全文 + 08p25 log 尾部）。
+- **全量自旋加固（保证死锁有界）**：`PCIE_SPIN_GUARD_DECL/TICK` 宏（sm120_common
+  正本，~32s 超时 trap）覆盖所有等待点——pcie_sync::wait_slot / pcie_barrier_all
+  （L1 push/final_red/设备栅栏）、7 处 GEMM gate（disp/ddisp/tpdisp/tpdisp2/
+  tpdisp8×2/prered 系）、2 处 CE flag poll、scatter_lane/scatter_warp flag 自旋。
+  **代码中已无任何无界跨卡/跨块等待**：任何协议 bug ≤32s 变成干净的 kernel abort
+  + 进程退出，不再 wedge 整机。
+- **死锁红线已写入 AGENTS.md**（每次改 kernel 必须过）：①提交前逐等待点审计
+  （信号生产者/永不到达情形/跨 rank 无环），结论写进提交信息；②所有自旋必须用
+  guard 宏，禁止无界；③新协议首测单步隔离。
+- **复测（重启宿主机后）**：先 `STEPS='^01_|^08p25_'` 单步复现 08p25——trap 会把
+  真死锁变成 FAIL 现场；若 08p25 过了则怀疑 teardown 残留竞态，改跑完整序列取证。
+
 ## 2026-07-16：P2.5 首测整机 wedge 事故 + 自旋 trap 加固（待复测）
 
 - 现象：P2.5 首测把容器整个卡死（nvidia-smi 挂）。机理：持久 kernel 挂死后超时
