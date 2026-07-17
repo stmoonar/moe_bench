@@ -93,7 +93,7 @@ __device__ inline void dispatch(const globals &G, const int sm_idx) {
                 tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
                 tma::load_async(token[lane_id], G.pre_tokens[src_dev_idx], {src_token_idx, 0}, token_arrived[lane_id]);
 
-                wait(token_arrived[lane_id], 0);
+                pcie_sync::guarded_wait(token_arrived[lane_id], 0);  // 跨卡 TMA, 对端死亡时有界退出
                 tma::store_async(G.activations, token[lane_id], {token_idx, 0});
                 tma::store_async_wait();
             }
@@ -115,8 +115,9 @@ struct dispatch_gate {
         int bar_val;
         asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}"
                      : "=r"(bar_val) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+        PCIE_SPIN_GUARD_DECL;
         while (bar_val != gemm_config::ROW_BLOCK) {
-            __nanosleep(32);
+            __nanosleep(32); PCIE_SPIN_GUARD_TICK;
             asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}"
                          : "=r"(bar_val) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         }

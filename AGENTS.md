@@ -41,12 +41,22 @@ nvidia-smi/新 CUDA 进程全部排队 → 只能重启宿主机）。为此立�
    barrier、mbarrier、跨卡 flag/watermark/计数器），逐个回答"这个信号由谁生产、
    生产者在什么情况下永不到达"（包括对端 rank 崩溃/被 kill/超时被杀的情形）；
    跨 rank 的等待依赖必须构成无环链。审计结论写进提交信息。
-2. **所有跨卡/跨块自旋必须有界 + trap**：使用 `PCIE_SPIN_GUARD_DECL` /
+2. **所有跨卡/跨块等待必须有界 + trap**：自旋用 `PCIE_SPIN_GUARD_DECL` /
    `PCIE_SPIN_GUARD_TICK`（sm120_common.cuh，~32s 超时 trap 杀 kernel →
-   CUDA error → 进程干净退出）。禁止新增任何无界自旋。
+   CUDA error → 进程干净退出）；**可能由跨卡数据喂的 mbarrier/semaphore
+   （如 TMA pull 对端显存）用 `pcie_sync::guarded_wait` 代替裸 `wait()`**
+   （try_wait + clock64 超时，唤醒延迟与 wait 相同）。禁止新增任何无界
+   自旋或无界 mbarrier 等待。本地流水线 mbarrier（GEMM inputs/task 语义，
+   生产者在同 kernel 内且会被 trap 连带杀死）可以保留裸 wait。
 3. **新协议 kernel 首测必须单步隔离**：STEPS 只含该协议的正确性门一步，跑通后
    才允许进长矩阵；不允许把首测挂进多步骤批量运行。
-4. 挂死后的恢复与取证流程见 `docs/04_平台边界与负结果.md` 的坑索引。
+4. **worker 出错后必须硬退出**：分布式 worker 捕获异常（含 kernel trap 后的
+   CUDA error）后走 `os._exit`（distributed.py `_fail_fast_exit`），不做
+   synchronize / NCCL destroy / 逐个 IPC unmap——那些调用会排队在被卡住的
+   RM/uvm 锁后面。
+5. 挂死后的恢复与取证流程见 `docs/04_平台边界与负结果.md` 的坑索引。死锁兜底
+   的故障注入验证用 `tools/fault_inject_kill_rank.py`（杀一个 rank，验证其余
+   有界退出 + nvidia-smi 存活 + 卡可复用）。
 
 ## 代码版本控制与经验持久化
 

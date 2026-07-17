@@ -41,6 +41,20 @@ namespace pcie_sync {
 #define PCIE_SPIN_GUARD_DECL  long long _spin_guard = 0
 #define PCIE_SPIN_GUARD_TICK  do { if (++_spin_guard > 500000000LL) asm volatile("trap;"); } while (0)
 
+/* 有界 mbarrier 等待(红线第 2 条的 mbarrier 版): 跨卡 TMA pull 喂的
+ * semaphore 在对端 rank 崩溃/被 kill 时永不 arrive, 普通 wait() 无界挂死
+ * 且不经过任何自旋 guard(2026-07-17 审计缝隙: 所有 gate 已过、只剩尾部
+ * dispatch 块挂在对端 TMA 上时, 传染性 trap 覆盖失效)。try_wait 是硬件
+ * 挂起等待, 唤醒延迟与 wait() 相同, 就绪路径仅多一次 clock64 读; 超时按
+ * GPU 时钟 1e11 周期(2.5GHz 下 ~40s, 与自旋 guard 同数量级) trap 杀
+ * kernel -> CUDA error -> 进程干净退出。 */
+constexpr long long PCIE_GUARD_WAIT_CYCLES = 100000000000LL;
+__device__ static inline void guarded_wait(kittens::semaphore &sem, int phase) {
+    const long long start = clock64();
+    while (!kittens::try_wait(sem, phase))
+        if (clock64() - start > PCIE_GUARD_WAIT_CYCLES) asm volatile("trap;");
+}
+
 /**
  * Slot-based all-device barrier. Legal on PCIe because every slot has exactly
  * one writer (plain release store, no atomics) and every wait polls local

@@ -350,7 +350,7 @@ __device__ inline void dispatch(const globals &G, const int sm_idx) {
                 init_semaphore(token_arrived[lane_id], 0, 1);
                 tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
                 tma::load_async(token[lane_id], G.pre_tokens[src_dev_idx], {src_token_idx, 0}, token_arrived[lane_id]);
-                wait(token_arrived[lane_id], 0);
+                pcie_sync::guarded_wait(token_arrived[lane_id], 0);
                 tma::store_async(G.activations, token[lane_id], {token_idx, 0});
                 tma::store_async_wait();
             }
@@ -492,7 +492,7 @@ void pull_unique_kernel(const __grid_constant__ globals G) {
             init_semaphore(token_arrived[lane_id], 0, 1);
             tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
             tma::load_async(token[lane_id], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[lane_id]);
-            wait(token_arrived[lane_id], 0);
+            pcie_sync::guarded_wait(token_arrived[lane_id], 0);
             tma::store_async(G.staging, token[lane_id], {d, 0});
             tma::store_async_wait();  // staging row complete before kernel exit
         }
@@ -514,7 +514,7 @@ __device__ inline void scatter(const globals &G, const int sm_idx) {
                 init_semaphore(token_arrived[lane_id], 0, 1);
                 tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
                 tma::load_async(token[lane_id], G.staging, {s, 0}, token_arrived[lane_id]);
-                wait(token_arrived[lane_id], 0);
+                pcie_sync::guarded_wait(token_arrived[lane_id], 0);
                 tma::store_async(G.activations, token[lane_id], {token_idx, 0});
                 tma::store_async_wait();
             }
@@ -680,7 +680,7 @@ __device__ inline void dispatch(const globals &G, const int sm_idx) {
             init_semaphore(token_arrived[lane_id], 0, 1);
             tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
             tma::load_async(token[lane_id], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[lane_id]);
-            wait(token_arrived[lane_id], 0);
+            pcie_sync::guarded_wait(token_arrived[lane_id], 0);
             #pragma unroll
             for (int k = 0; k < globals::TOP_K; k++) {
                 const int slot = G.tp_slots[{d, k}];
@@ -827,7 +827,7 @@ __device__ inline void dispatch_persistent(const globals &G, const int cb_idx, c
             const int src_tok = d % G.num_tokens;
             tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
             tma::load_async(token[lane_id], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[lane_id]);
-            wait(token_arrived[lane_id], phase);
+            pcie_sync::guarded_wait(token_arrived[lane_id], phase);
             #pragma unroll
             for (int k = 0; k < globals::TOP_K; k++) {
                 const int slot = G.tp_slots[{d, k}];
@@ -1037,7 +1037,7 @@ __device__ inline void dispatch_persistent(const globals &G, const int *__restri
                 tma::load_async(token[lane_id], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[lane_id]);
                 tma::load_async(scales[lane_id], G.pre_scales[src_dev], {src_tok, 0}, token_arrived[lane_id]);
             }
-            wait(token_arrived[lane_id], phase);
+            pcie_sync::guarded_wait(token_arrived[lane_id], phase);
             #pragma unroll
             for (int k = 0; k < globals::TOP_K; k++) {
                 const int slot = G.tp_slots[{d, k}];
@@ -1127,7 +1127,7 @@ __device__ inline void dispatch_persistent_lane(const globals &G, const int *__r
             tma::load_async(token[slot], G.pre_tokens[src_dev], {src_tok, 0}, token_arrived[slot]);
             tma::load_async(scales[slot], G.pre_scales[src_dev], {src_tok, 0}, token_arrived[slot]);
         }
-        wait(token_arrived[slot], phase);
+        pcie_sync::guarded_wait(token_arrived[slot], phase);
         phase ^= 1;
         #pragma unroll
         for (int k = 0; k < globals::TOP_K; k++) {
@@ -1279,7 +1279,7 @@ __device__ inline void comm_lane_pull(const globals &G, int *__restrict__ pull_n
                                sizeof(typename globals::scale_vec));
         tma::load_async(token, G.pre_tokens[src_dev], {src_tok, 0}, sem);
         tma::load_async(scales, G.pre_scales[src_dev], {src_tok, 0}, sem);
-        wait(sem, phase);
+        pcie_sync::guarded_wait(sem, phase);
         phase ^= 1;
         #pragma unroll
         for (int k = 0; k < globals::TOP_K; k++) {
@@ -1608,7 +1608,7 @@ __device__ inline void push_lane(const pglobals &G, int *__restrict__ push_next,
                                sizeof(typename pglobals::scale_vec));
         tma::load_async(tok, G.pre_tokens[G.dev_idx], {t, 0}, sem);
         tma::load_async(sc, G.pre_scales[G.dev_idx], {t, 0}, sem);
-        wait(sem, phase);
+        pcie_sync::guarded_wait(sem, phase);
         phase ^= 1;
         const int d = G.dev_idx * G.num_tokens + t;
         #pragma unroll
@@ -1661,7 +1661,7 @@ __device__ inline void scatter_lane(const pglobals &G, int *__restrict__ pull_ne
             tma::load_async(tok, G.ag_staging[G.dev_idx], {d, 0}, sem);
             tma::load_async(sc, G.ag_sscales[G.dev_idx], {d, 0}, sem);
         }
-        wait(sem, phase);
+        pcie_sync::guarded_wait(sem, phase);
         phase ^= 1;
         #pragma unroll
         for (int k = 0; k < pglobals::TOP_K; k++) {
@@ -1953,7 +1953,7 @@ __device__ inline void push_role(const globals &G, const int pb_idx) {
         const int tok = G.push_order[{G.dev_idx, p}];
         tma::expect_bytes(token_arrived[lane_id], sizeof(typename globals::token_vec));
         tma::load_async(token[lane_id], G.pre_tokens[G.dev_idx], {tok, 0}, token_arrived[lane_id]);
-        wait(token_arrived[lane_id], phase);
+        pcie_sync::guarded_wait(token_arrived[lane_id], phase);
         phase ^= 1;
         const int dst_row = G.dev_idx * G.num_tokens + tok;
         #pragma unroll
@@ -2163,7 +2163,7 @@ __device__ inline void push(const globals &G, const int sm_idx) {
                 init_semaphore(token_arrived[lane_id], 0, 1);
                 tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
                 tma::load_async(token[lane_id], G.pre_tokens, {src_tok, 0}, token_arrived[lane_id]);
-                wait(token_arrived[lane_id], 0);
+                pcie_sync::guarded_wait(token_arrived[lane_id], 0);
                 tma::store_async(G.gathered[dst_dev], token[lane_id], {dst_slot, 0});
                 tma::store_async_wait();
                 // remote release-add on dst card's row-block counter (native atomics OK here)
@@ -2194,7 +2194,7 @@ __device__ inline void push_data(const globals &G, const int sm_idx) {
                 init_semaphore(token_arrived[lane_id], 0, 1);
                 tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
                 tma::load_async(token[lane_id], G.pre_tokens, {src_tok, 0}, token_arrived[lane_id]);
-                wait(token_arrived[lane_id], 0);
+                pcie_sync::guarded_wait(token_arrived[lane_id], 0);
                 tma::store_async(G.gathered[dst_dev], token[lane_id], {dst_slot, 0});
                 tma::store_async_wait();
             }
@@ -2408,7 +2408,7 @@ __device__ inline void push3(const globals &G, const int sm_idx) {
                 init_semaphore(token_arrived[lane_id], 0, 1);
                 tma::expect_bytes(token_arrived[lane_id], sizeof(globals::token_vec));
                 tma::load_async(token[lane_id], G.pre_tokens, {src_tok, 0}, token_arrived[lane_id]);
-                wait(token_arrived[lane_id], 0);
+                pcie_sync::guarded_wait(token_arrived[lane_id], 0);
                 tma::store_async(G.gathered[dst_dev], token[lane_id], {dst_slot, 0});
                 tma::store_async_wait();                    // my remote bulk write committed
                 // LOCAL count (gpu scope, legal on PCIe — no remote atomics)

@@ -20,6 +20,7 @@ import dataclasses
 import gc
 import os
 import statistics
+import sys
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -215,6 +216,21 @@ def _run_rank(
     return results
 
 
+def _fail_fast_exit() -> None:
+    """异常(含 kernel trap 后的 CUDA error)后的硬退出。
+
+    死锁红线: 出错后不再执行 torch.cuda.synchronize / destroy_process_group /
+    解释器正常退出 —— 这些路径要做 NCCL 跨 rank 握手和逐个 IPC unmap/context
+    销毁, 会排队在被卡住的 RM/uvm 锁后面(2026-07-16 wedge 取证: 受害 worker
+    卡在 uvm_map_external_allocation)。os._exit 让内核态驱动统一回收本进程
+    GPU 资源, 其余 rank 由 mp.spawn 按非零退出码收割。
+    """
+    traceback.print_exc()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
+
 def _worker(
     local_rank: int,
     world_size: int,
@@ -244,13 +260,11 @@ def _worker(
     )
     try:
         _run_rank(config, ctx, scheme_name)
-    except Exception:
-        traceback.print_exc()
-        raise
-    finally:
         torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    except Exception:
+        _fail_fast_exit()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def _worker_suite(
@@ -310,13 +324,11 @@ def _worker_suite(
                     golden_weights=golden_weights,
                 )
             dist.barrier()
-    except Exception:
-        traceback.print_exc()
-        raise
-    finally:
         torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    except Exception:
+        _fail_fast_exit()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def run_distributed(config: MoEBenchConfig, scheme_name: str = "serial") -> None:

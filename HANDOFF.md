@@ -1,5 +1,29 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-17：死锁兜底第二轮——mbarrier 有界化 + host fail-fast + 故障注入工具
+
+- 对 7-16"已无任何无界等待"结论的复审发现三处缝隙，本轮全部收口（体系与边界
+  见 **docs/06_死锁兜底体系.md**）：
+  1. **mbarrier 无界等待**：跨卡 TMA pull 喂的 semaphore 在对端 rank 死亡时永不
+     arrive，裸 `wait()` 不经过任何自旋 guard。新增 `pcie_sync::guarded_wait`
+     （try_wait + clock64 1e11 周期 ~40s 超时 trap，唤醒延迟与 wait 相同），
+     替换 tk_moe.cu 全部 14 处 + tileoverlap/02 一处。本地 GEMM 流水线 mbarrier
+     保留裸 wait（生产者同 kernel、gate trap 连带回收，且是最热路径）。
+  2. **tileoverlap/02 dispatch_gate 裸自旋**（7-16 审计只覆盖了 tk_moe +
+     sm120_common）：补 PCIE_SPIN_GUARD。tk_scheme.py（bf16 EP）仍加载该模块。
+  3. **host 侧 teardown 隐患**：worker 异常后原 finally 仍执行 synchronize +
+     destroy_process_group（NCCL 跨 rank 握手 + 逐个 IPC unmap，正是 7-16 取证
+     中排队在 RM/uvm 锁后面的调用类别）。distributed.py 新增 `_fail_fast_exit`：
+     异常 → traceback → `os._exit(1)`，用户态 teardown 全跳过。
+- **新工具 tools/fault_inject_kill_rank.py**（红线兜底的动态验证，GPU 机上跑）：
+  SIGKILL 一个 rank → 断言其余进程树限时退净 + nvidia-smi 存活 + 各卡能新建
+  context。用法见 docs/06 §2 第 4 层。**跑通之前，兜底只有静态审计背书**。
+- AGENTS.md 红线更新：第 2 条扩为"自旋 + mbarrier 都必须有界"，新增第 4 条
+  "worker 出错必须硬退出"，第 5 条挂故障注入工具。
+- **性能口径不变**：guard/guarded_wait 就绪路径零或一次 clock64 读；上机后先
+  `STEPS='^00_|^01_|^03f8_|^03p25_'` 单步验证编译+正确性，再跑 04 档对比确认
+  1629/2777 未回退，然后按红线第 3 条单独跑一次故障注入。
+
 ## 2026-07-16：wedge 事故定位收窄 + 全量自旋加固 + 死锁红线入 AGENTS.md
 
 - 现场收窄（tp_run_20260716_081949）：03p25 正确性/04p25/05p25 全套 sweep **全部
