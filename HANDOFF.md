@@ -1,5 +1,19 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-23：路由不均衡劣化归因 + RB64 负结果（docs/09）
+
+- uniform 路由 A/B（卡组 4-7）：我们 1618→1988（+22.9%），serial 2062→2167
+  （+5.1%）——劣化差 3.5 倍的根因 = **ROW_BLOCK=128 padding 税**（每 expert
+  256±16 行卡块边界，M 功 +25%，账与实测 +370µs 吻合）；serial 的 M 粒度
+  BLOCK_M=64 已从 NCU grid 反解实锤。uniform 下领先缩到 8.3%。
+- **RB64 判负**：`TK_ROW_BLOCK=64`（零代码，fp8 config 已吃宏）正确性同水位
+  过门，但 balanced +249µs = 纯 B tile 重载税（行块 ×2 → 权重流量 ×2），
+  uniform 2146 反而比 RB128 慢 158µs。padding 敏感度确实降（370→279）但
+  底座税吞掉全部收益。正解 = 两级 tile（主体 128 + 余数行 64 尾块，未立项）。
+- run_tktp 新增 `--skew-alpha`/`--active` 旋钮；build.py 修并发编译竞态
+  （冷缓存 4 worker 同时 nvcc → flock + 原子改名，2d66561）。
+- 建议后续报数用 balanced + uniform 双口径。verify FAIL 口径说明见 docs/09 §5。
+
 ## 2026-07-23：NCU 单 kernel 计算效率对比——GEMM 引擎与 triton 同档，e2e 领先全在重叠结构
 
 - 单卡 NCU（锁频横比）四方对比 gg8 vs triton fused_moe：L0 我们 60.9% vs
