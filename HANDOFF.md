@@ -1,5 +1,24 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-23：CUTLASS grouped GEMM 参照探针（待远端首编译/首跑）
+
+- 新增子模块 `cutlass/`（NVIDIA CUTLASS 4.6.1 main @e64a913，浅克隆；远端
+  `git submodule update --init --depth 1 cutlass`）。
+- 动机：给 gg8/gg 引擎立"厂商可达水位"参照。sm120 支持确认：
+  - fp8：`examples/87c` 即 sm120 blockwise **grouped** GEMM，口径与我们逐项
+    同构（A=act fp8 RowMajor scale 1×128，B=weight fp8 ColumnMajor scale
+    128×128，bf16 输出，fp32 累加，tile 128×128×128），原样编译即可；
+  - bf16：sm120 的 3.x array（grouped）builder 只收 F8F6F4，**bf16 无 3.x
+    grouped 路径**；用 2.x `GemmGrouped`+Sm80 mma.sync（16×8×16 bf16，与 TK
+    bf16 引擎同指令）编到 sm_120a（`tools/cutlass_probe/grouped_gemm_bf16.cu`，
+    example 24 拷贝改 bf16+TN layout，附带 batched GEMM 对照）。
+- 构建/运行：`bash tools/cutlass_probe/build.sh`（本地无 nvcc 未编译验证，
+  首编译在远端；两探针自带 CLI + 校验 + GFLOPS 输出）。形状口径：
+  L0 `--groups=64 --m=256 --n=1536 --k=4096`、L1 `--n=4096 --k=768`。
+- 对比时注意：CUTLASS 探针是纯 GEMM（无 GLU epilogue、无 scatter/gather、
+  无 topk 加权），与 gg8 探针（tools/verify_fp8_gemm.py）比要按 docs/08 的
+  口径扣除非 GEMM 成分；boost 频率下直接比,与 NCU 锁频数字不可混。
+
 ## 2026-07-23：路由不均衡劣化归因 + RB64 负结果（docs/09）
 
 - uniform 路由 A/B（卡组 4-7）：我们 1618→1988（+22.9%），serial 2062→2167
