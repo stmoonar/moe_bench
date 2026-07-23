@@ -1,5 +1,21 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-23：NCU 单 kernel 计算效率对比——GEMM 引擎与 triton 同档，e2e 领先全在重叠结构
+
+- 单卡 NCU（锁频横比）四方对比 gg8 vs triton fused_moe：L0 我们 60.9% vs
+  66.7% tensor 利用率（−10%，归因 per-2-step fp32 重标定 + dispenser 指令
+  +31% 抢发射槽）；L1 我们 53.9% vs 50.2%（+3.4%，短 K 下 triton 摊薄更差）。
+  两层合计 −5%，计入 GLU 融合/serial 额外 kernel 后基本平手——**e2e −21.5%
+  全部来自 AG 藏匿 + fp8 AG 字节减半 + 转岗，GEMM 引擎无翻盘空间也无欠账**。
+  双方指令选型相同（QMMA+fp32 累加），60-67% 即累加税下可达水位。
+  详见 `docs/08_NCU单kernel计算效率_gg8_vs_triton.md`（含复现命令与坑）。
+- 新增 `tools/ncu_serial_gemm_probe.py`：单卡复刻 serial 的 fused_experts
+  一步（无 NCCL），形状可参数化，供 ncu kernel replay 安全采样。
+- 坑（已入 docs/08 §4）：4 卡分布式下 NCU 采单 kernel 会让其余 rank 在 NCCL/
+  跨卡 flag 上自旋，kill 后残留无主自旋 kernel 占卡 100% util，需
+  `nvidia-smi -r` 复位；融合持久 kernel 结构性不可按 kernel 采。
+- 本轮只新增工具与文档，无 kernel/等待点改动。
+
 ## 2026-07-20：新增上一周实验总结简版
 
 - 新增 `docs/07_2026-07-13至2026-07-19实验总结_简版.md`，只保留细粒度通信计算
