@@ -565,24 +565,25 @@ public:
       int bits_input = cutlass::sizeof_bits<Element>::value;
       int bits_output = cutlass::sizeof_bits<typename Gemm::ElementC>::value;
 
+      // bfloat16_t 没有 operator=(int)（half_t 有），全部改显式构造
       if (bits_input == 1) {
-        scope_max = 2;
-        scope_min = 0;
+        scope_max = Element(2);
+        scope_min = Element(0);
       } else if (bits_input <= 8) {
-        scope_max = 2;
-        scope_min = -2;
+        scope_max = Element(2);
+        scope_min = Element(-2);
       } else if (bits_output == 16) {
         if (cutlass::sizeof_bits<ElementAccumulator>::value <= 16) {
-          scope_max = 5;
-          scope_min = -5;
+          scope_max = Element(5);
+          scope_min = Element(-5);
         }
         else {
-          scope_max = 8;
-          scope_min = -8;
+          scope_max = Element(8);
+          scope_min = Element(-8);
         }
       } else {
-        scope_max = 8;
-        scope_min = -8;
+        scope_max = Element(8);
+        scope_min = Element(-8);
       }
 
       cutlass::reference::device::BlockFillRandomUniform(
