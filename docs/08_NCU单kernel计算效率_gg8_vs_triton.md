@@ -62,8 +62,10 @@ CUDA_VISIBLE_DEVICES=<idle> ncu --replay-mode kernel --kernel-name-base demangle
 3. **短 K 形状两边都掉档，triton 掉得更狠**（66.7→50.2 vs 我们 60.9→53.9）：
    短主循环下固定开销摊薄差。定量支撑 e2e 上 L1 fp8 净赚 −129µs 的合理性。
 4. **指令选型无差异**：双方均为 QMMA + fp32 累加（tensor FP 子管道，
-   imma=0）。60-67% 即 sm120 fp32 累加税（docs/38）下的可达水位带，
-   指令级无翻盘空间。
+   imma=0）。~~60-67% 即 sm120 fp32 累加税（docs/38）下的可达水位带，
+   指令级无翻盘空间~~ **此条已被 §5 的 CUTLASS 参照推翻**：同指令
+   （SM120_16x8x32_TN fp8, fp32 acc）CUTLASS 在 L0 打到 84.9%，60-67%
+   不是硬件天花板，是软件流水/重标定摊薄的欠账。
 
 ## 4. 过程教训（坑）
 
@@ -80,3 +82,38 @@ CUDA_VISIBLE_DEVICES=<idle> ncu --replay-mode kernel --kernel-name-base demangle
   两层互为镜像（4096→1536，768→4096）。
 - 容器无真 init（entrypoint 为 `sleep infinity`）时，被 kill 的 worker 会留
   永久僵尸（无害，不占 GPU）；容器重建时加 `docker run --init` 根治。
+
+## 5. 2026-07-23 补充：CUTLASS 参照水位（同锁频口径）
+
+用 CUTLASS 4.6.1 官方 sm120 kernel 立厂商可达上限（`tools/cutlass_probe/`，
+fp8 = examples/87c blockwise grouped GEMM 原样编译，与我们量化口径逐项同构；
+bf16 = 2.x GemmGrouped+Sm80 mma.sync，皆纯 GEMM、无路由间接寻址）：
+
+| 锁频口径 | L0 | tensor | L1 | tensor |
+|---|---|---|---|---|
+| CUTLASS fp8 (87c) | **664µs** | **84.9%** | **453µs** | 63.3% |
+| triton fp8 | 834µs | 66.7% | 537µs | 50.2% |
+| gg8（我们） | 924µs | 60.9% | 519µs | 53.9% |
+| CUTLASS bf16 (2.x) | 1203µs | 92.3% | 708µs | 77.5% |
+| triton bf16 | 1382µs | 79.6% | 826µs | 66.2% |
+
+结论修正与新知：
+
+1. **"60-67% 是累加税天花板"被推翻**。CUTLASS 用完全相同的 MMA atom
+   （SM120_16x8x32_TN fp8，fp32 累加）在 L0 打到 84.9% tensor 占空比；
+   bf16 甚至 92.3%（还是走 2.x Sm80 老路径）。差距在软件结构：
+   （a）**scale 重标定摊薄**——CUTLASS blockwise 主循环每 128 深 K 块做一次
+   accum promotion（`MainloopSm120ArrayTmaWarpSpecializedBlockwiseScaling`），
+   我们每 2 个 MMA step 重标定一次 → +31% 指令抢发射槽；
+   （b）TMA warp-specialized 双 producer 流水 + LDSM/swizzle smem 供数。
+2. **相对位次**：L0 我们 = CUTLASS 的 72%、triton = 80%；L1 差距收窄
+   （我们 87%、triton 84%），短 K 下大家都被固定开销/访存压住（CUTLASS
+   L1 tensor 也只有 63.3%）。**主要欠账集中在 L0 长 K 形状**。
+3. 口径警告：CUTLASS 探针是纯 GEMM——没有 sorted_token_ids 间接寻址、
+   topk 加权、GLU epilogue。gg8 探针同样是纯 GEMM（可直接比），但 triton
+   的数字里带路由 gather（含真实 MoE 开销），所以"路由感知 kernel"的真实
+   可达上限略低于 664µs。即便如此，L0 的 260µs 锁频差距远超该扣减。
+4. 优化方向（按 ROI）：**per-K-block(128) 重标定摊薄**是头号项——数学上与
+   serial/triton 的 blockwise 逐块 promotion 等价（不是精度赌博），预期消掉
+   +31% 指令的大头；TMA 流水加深/warp specialization 属深改，视第一步
+   回收效果再定。

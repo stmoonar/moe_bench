@@ -1,6 +1,18 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
-## 2026-07-23：CUTLASS grouped GEMM 参照探针（待远端首编译/首跑）
+## 2026-07-23：CUTLASS 参照结果——"累加税天花板"被推翻，GEMM 引擎欠账 28%
+
+- NCU 锁频四方 + CUTLASS 参照（docs/08 §5）：**CUTLASS fp8 L0 664µs/84.9%
+  tensor vs 我们 924µs/60.9%（=72%）、triton 834µs（=80%）**；L1 差距小
+  （453 vs 我们 519=87%）。bf16 CUTLASS 92.3%（2.x Sm80 路径即可达）。
+- docs/08 §3.4 的"60-67% 是 fp32 累加税天花板、指令级无翻盘空间"**已修正**：
+  同 MMA atom 下差距在软件结构——头号项 = **per-K-block(128) 重标定摊薄**
+  （我们 per-2-step → +31% 指令；CUTLASS blockwise 主循环每 128 深 K 块
+  promotion 一次，数学与 serial/triton 等价，非精度赌博）。次项 = TMA
+  warp-specialized 流水（深改，视第一步回收再定）。
+- 注意：CUTLASS/gg8 探针均为纯 GEMM 可直比；triton 数字带路由 gather。
+
+## 2026-07-23：CUTLASS grouped GEMM 参照探针（已跑完，结果见上一条）
 
 - 新增子模块 `cutlass/`（NVIDIA CUTLASS 4.6.1 main @e64a913，浅克隆；远端
   `git submodule update --init --depth 1 cutlass`）。
