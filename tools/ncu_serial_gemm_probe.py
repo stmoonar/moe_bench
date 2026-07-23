@@ -8,9 +8,12 @@ w2 (64, 4096, 768), fp8 128x128 block 量化(data.make_weights 同一路径);
 输入 = 4 个 rank 各 512 token 按 rank-major 拼接的 2048 token 全批,
 routing 与分布式 serial 逐 bit 相同(同种子链)。
 
-  单卡运行(选一张空闲卡):
-    CUDA_VISIBLE_DEVICES=<n> python -m moe_bench.tools.ncu_serial_gemm_probe [iters]
+  单卡运行(选一张空闲卡), 形状与 run_tktp 同风格, 默认 = 主配置口径:
+    CUDA_VISIBLE_DEVICES=<n> python -m moe_bench.tools.ncu_serial_gemm_probe \
+        [num_experts] [--tokens T每rank] [--topk K] [--hidden H] [--inter I] \
+        [--world W] [--precision bf16|fp8] [--iters N]
 
+  注意: fp8 时 I/W(intermediate_shard)必须是 128 的倍数(block 量化对齐)。
   ncu 包法见 HANDOFF/对话记录: --replay-mode kernel + -k 'regex:fused_moe_kernel'。
 """
 from __future__ import annotations
@@ -20,18 +23,31 @@ import sys
 import torch
 
 
+def _arg(flag, default, cast=str):
+    if flag in sys.argv:
+        return cast(sys.argv[sys.argv.index(flag) + 1])
+    return default
+
+
 def main():
-    iters = int(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else 8
+    ne = int(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else 64
+    tokens = _arg("--tokens", 512, int)
+    topk = _arg("--topk", 8, int)
+    hidden = _arg("--hidden", 4096, int)
+    inter = _arg("--inter", 3072, int)
+    world = _arg("--world", 4, int)
+    iters = _arg("--iters", 8, int)
     from moe_bench.config import MoEBenchConfig, ParallelMode, Precision
     from moe_bench.data import make_problem, make_weights
 
     cfg = MoEBenchConfig(
-        hidden_size=4096, intermediate_size=3072, num_experts=64, topk=8,
-        parallel_mode=ParallelMode.TP, world_size=4, precision=Precision.FP8,
-        num_tokens=[512], distributed=False, seed=0, verify=False, device="cuda")
+        hidden_size=hidden, intermediate_size=inter, num_experts=ne, topk=topk,
+        parallel_mode=ParallelMode.TP, world_size=world,
+        precision=Precision(_arg("--precision", "fp8")),
+        num_tokens=[tokens], distributed=False, seed=0, verify=False, device="cuda")
 
     weights = make_weights(cfg, rank=0)
-    probs = [make_problem(cfg, 512, rank=r, weights=weights) for r in range(4)]
+    probs = [make_problem(cfg, tokens, rank=r, weights=weights) for r in range(world)]
     hidden_full = torch.cat([p.hidden_states for p in probs])
     topk_ids_full = torch.cat([p.topk_ids for p in probs])
     topk_weights_full = torch.cat([p.topk_weights for p in probs])
@@ -56,7 +72,8 @@ def main():
     end.record()
     torch.cuda.synchronize()
     us = start.elapsed_time(end) * 1000.0 / iters
-    print(f"serial fused_experts (single-GPU, M=2048, E=64, topk=8, fp8): {us:.1f} us/iter")
+    print(f"serial fused_experts (single-GPU, M={tokens * world}, E={ne}, topk={topk}, "
+          f"H={hidden}, I_shard={inter // world}, {cfg.precision.value}): {us:.1f} us/iter")
 
 
 if __name__ == "__main__":
