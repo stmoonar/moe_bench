@@ -545,7 +545,10 @@ struct gemm_config_fp8 {
  * 结果不正确,只用于测 fp8+fp32acc 的硬上限,裁决 "GeForce fp32 累加税"
  * 假说(mma.f32.e4m3 指令率 = f16 版的一半 → fp8 峰值 ≈ bf16 峰值)。 */
 template <bool COL_MAJOR = false, bool RESCALE = true, typename Globals, typename Gate, typename Epilogue, typename Store>
-__device__ inline void grouped_gemm_sm120_fp8_dispenser(
+// 必须 __forceinline__: 若 dispenser 以 ABI 调用形式存在, ptxas 会忽略
+// 函数体内的 setmaxnreg(C7506 'extern call', 2026-07-25 实测) → 寄存器
+// 分配退回 168 + acc spill。
+__device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
         const Globals &G, const Gate &gate, const Epilogue &epilogue, const Store &store,
         const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks) {
     using cfg = gemm_config_fp8;
