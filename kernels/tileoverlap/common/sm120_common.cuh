@@ -493,9 +493,9 @@ __device__ inline void grouped_gemm_sm120_dispenser(
  *  - **P1: K-tile = 128 == 量化块**(CUTLASS 87c blockwise 主循环同构,
  *    docs/08 §5): A/B tile 各 16KB, 3 stage 96KB ≤ 99KB; 每个 stage 一次
  *    fp32 重标定 acc += sub × (a_scale[row] × w_scale[kblk,cblk])。
- *    consumer 为 KK=4 步寄存器双缓冲主循环(kk+1 的 LDSM 先于 kk 的 QMMA
- *    发射, 下一 stage 的 wait/预取提到末尾 QMMA 之前), 重标定点与旧
- *    per-2-step 版一致 → 数值逐比特等价;
+ *    consumer 为 KK=4 步主循环(A 双缓冲, B 单缓冲 —— 全宽 B 双缓冲会
+ *    触发 ptxas spill acc/sub, 见 consumer 注释; 下一 stage 的 wait 提到
+ *    末尾 QMMA 之前), 重标定点与旧 per-2-step 版一致 → 数值逐比特等价;
  *  - scale 直接从 global 读(L2 广播,每 K 块每线程 3 个 float,不进
  *    smem,不动 TMA expect 字节数);
  *  - 行内 scale 映射:rt 行布局 data[偶] → 行 lane/4,data[奇] → +8
@@ -617,12 +617,12 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
     } else {
         // ---------------------------------------------------- consumer warps
         // P1 主循环(CUTLASS sm120 blockwise 同构, docs/08 §5): 每 stage 恰好一
-        // 个量化块(K=128 = RED_BLOCK), KK=4 个 MMA step 寄存器双缓冲 —— kk+1
-        // 的 LDSM 在 kk 的 QMMA 之前发射; 下一 stage 的 arrived wait + 首个
-        // 预取放在本 stage 最后一条 QMMA 之前(与末尾 QMMA 重叠); finished
-        // arrive 保持在最后一条 QMMA 之后(此时该 stage 的 LDSM 已全部被
-        // QMMA 消费完毕, smem 可读覆)。重标定点与旧 per-2-step 版完全相同
-        // (每 128 K), 块内 MMA 顺序一致(K 升序) → 数值逐比特等价。
+        // 个量化块(K=128 = RED_BLOCK), KK=4 个 MMA step; A 寄存器双缓冲、
+        // B 单缓冲(寄存器预算约束, 见下); 下一 stage 的 arrived wait 提前到
+        // 本 stage 最后一条 QMMA 之前(mbarrier 延迟全遮蔽); finished arrive
+        // 保持在最后一条 QMMA 之后(此时该 stage 的 LDSM 已全部被 QMMA 消费
+        // 完毕, smem 可读覆)。重标定点与旧 per-2-step 版完全相同(每 128 K),
+        // 块内 MMA 顺序一致(K 升序) → 数值逐比特等价。
         constexpr int KK = cfg::RED_BLOCK / cfg::MMA_K;   // 4
         int q = 0;
         while (true) {
@@ -645,38 +645,59 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
             // scale 预取(docs/38: 首测耗时降低 21.3%, 边界处的 3 个 global scale 读
             // 在关键路径上, 32 个边界 × L2 延迟 ≈ 40% 气泡)。边界只消费
             // 已在寄存器的值, 同时发起下一块的加载(1 个 stage 的着陆窗)。
-            float bsc_n = G.w_scales[{e, col_idx, 0}];
-            float s0_n = G.a_scales[{r0, 0}];
-            float s1_n = G.a_scales[{r0 + 8, 0}];
+            float bsc_n, s0_n, s1_n;
+            if constexpr (RESCALE) {
+                bsc_n = G.w_scales[{e, col_idx, 0}];
+                s0_n = G.a_scales[{r0, 0}];
+                s1_n = G.a_scales[{r0 + 8, 0}];
+            }
+            (void)e;
 
+            // 寄存器预算(sm120 @288 线程上限 224 regs): acc+sub 已占 128,
+            // B 全宽(rt<128,32>=32 regs)双缓冲会把峰值推过阈值, ptxas 转
+            // spill 模式把 acc/sub 扔进 local(2026-07-25 首测 STACK:520,
+            // 性能 4.7x 回退) → A 双缓冲(仅 8 regs), B 单缓冲: kk+1 的 B
+            // LDSM 紧跟 kk 的 16 条 QMMA 之后发射(WAR 由程序序保证安全,
+            // LDSM 延迟由 QMMA 群掩护); 下一 stage 的 arrived wait 仍提前
+            // 到末尾 QMMA 之前(CUTLASS 序, mbarrier 延迟全遮蔽)。
             rt_fp8e4m3<16, cfg::MMA_K> a_reg[2];
-            rt_fp8e4m3<cfg::COL_BLOCK, cfg::MMA_K> b_reg[2];
-            auto load_kk = [&](int buf, int st, int kk) {
+            rt_fp8e4m3<cfg::COL_BLOCK, cfg::MMA_K> b_reg;
+            auto load_a = [&](int buf, int st, int kk) {
                 auto a_sub = inputs[st].A.template subtile<16, cfg::MMA_K>({store_strip, kk});
                 warp::load(a_reg[buf], a_sub);
+            };
+            auto load_b = [&](int st, int kk) {
                 // B^T 行布局加载(ldmatrix 路径; col-layout fp8 加载在 TK
                 // 里没写完), mma_ABt 的 fp8 特化做 (M,K)x(N,K)^T
                 auto b_sub = inputs[st].B.template subtile<cfg::COL_BLOCK, cfg::MMA_K>({0, kk});
-                warp::load(b_reg[buf], b_sub);
+                warp::load(b_reg, b_sub);
             };
 
             wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
             update_phasebit<0>(phasebits, stage);
-            load_kk(0, stage, 0);
+            load_a(0, stage, 0);
+            load_b(stage, 0);
 
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                 const int nxt = (stage + 1) % cfg::PIPELINE_STAGES;
                 #pragma unroll
                 for (int kk = 0; kk < KK; kk++) {
                     if (kk + 1 < KK) {
-                        load_kk((kk + 1) & 1, stage, kk + 1);
-                    } else if (red_idx + 1 < num_iters) {
-                        // CUTLASS 序: 下一 stage 的 wait + 预取放在末尾 QMMA 前
-                        wait(inputs_arrived[nxt], get_phasebit<0>(phasebits, nxt));
-                        update_phasebit<0>(phasebits, nxt);
-                        load_kk(0, nxt, 0);
+                        load_a((kk + 1) & 1, stage, kk + 1);
+                        warp::mma_ABt(sub, a_reg[kk & 1], b_reg, sub);
+                        load_b(stage, kk + 1);
+                    } else {
+                        if (red_idx + 1 < num_iters) {
+                            // CUTLASS 序: 下一 stage 的 wait 提到末尾 QMMA 前
+                            wait(inputs_arrived[nxt], get_phasebit<0>(phasebits, nxt));
+                            update_phasebit<0>(phasebits, nxt);
+                        }
+                        warp::mma_ABt(sub, a_reg[kk & 1], b_reg, sub);
+                        if (red_idx + 1 < num_iters) {
+                            load_a(0, nxt, 0);
+                            load_b(nxt, 0);
+                        }
                     }
-                    warp::mma_ABt(sub, a_reg[kk & 1], b_reg[kk & 1], sub);
                 }
                 warp::arrive(inputs_finished[stage]);
                 stage = nxt;

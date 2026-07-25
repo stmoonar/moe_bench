@@ -11,19 +11,26 @@
   正解释 CUTLASS > triton > TK 排序。
 - 落码（`kernels/tileoverlap/common/sm120_common.cuh` 一处，全融合
   kernel 自动受益）：`gemm_config_fp8` RED_BLOCK 64→128（3 stage
-  96KB ≤ 99KB，加 static_assert）；consumer 改 KK=4 寄存器双缓冲，
-  下一 stage 的 wait+预取提到末尾 QMMA 前，finished arrive 保持在
+  96KB ≤ 99KB，加 static_assert）；consumer 改 KK=4 主循环，
+  下一 stage 的 wait 提到末尾 QMMA 前，finished arrive 保持在
   末尾 QMMA 后（LDSM 已被消费，smem 可读覆）。重标定点与 MMA 顺序
-  不变 → **数值逐比特等价**。
+  不变 → **数值逐比特等价**（首测 rel_err 1.68e-3 ✓）。
+- **首测事故与修复（详见 docs/10）**：全宽 B 双缓冲（b_reg[2]=64 regs）
+  把峰值推过 ptxas 舒适区 → spill 模式把 acc/sub 扔进 local
+  （STACK:520 信号），rescale 路径 4.7× 回退（69.5 vs raw 325 TFLOP/s，
+  NCU Memory 90%/DRAM 11%/IPC 0.42）。修复 = A 双缓冲（8 regs）、
+  B 单缓冲（kk+1 的 B LDSM 紧跟 kk 的 QMMA 群，WAR 程序序安全、
+  延迟被掩护），峰值回到 ~190 regs。识别信号与后续杠杆（4×2 几何 /
+  scale 走 smem）都写在 docs/10。
 - 代价：方案A warp 路径（tpdisp8::entry_warp/entry_warp_probe、
   tppr8::entry_warp，均已判负留档）smem 超 101376B，入口加
   TORCH_CHECK 禁用，复跑需检出本提交之前版本。
 - 死锁审计：等待点种类零新增（本地流水线 mbarrier 裸 wait 合规，
   producer 同 block 连带 trap）；arrived(s+1)←TMA←finished(s-2)
   依赖无环；无新 named barrier/跨卡等待。
-- **待上机**：见本提交信息末尾清单（verify_fp8_gemm 对拍 →
-  cuobjdump 看 spill → NCU 重采 vs 664µs/84.9% → 03f8/04f8 A/B）。
-  预期 L0 tensor 60.9% → 75%+；若 spill 明显，备选 = B frag 拆两半。
+- **待上机（修复版复测）**：rm -rf kernels/tk/build 后
+  verify_fp8_gemm 对拍 + cuobjdump（STACK 应回落 ≤128）+
+  NCU 重采 vs 664µs/84.9%（目标 L0 tensor ≥70%）→ 03f8/04f8 A/B。
 
 ## 2026-07-23：CUTLASS 参照结果——"累加税天花板"被推翻，GEMM 引擎欠账 28%
 
