@@ -126,3 +126,34 @@ COL=64 后 acc/sub 各 32，A/B 全双缓冲（b 16×2）总需求 ~135 ≤ 168�
 
 代价（记录在案）：任务数 ×2（L0 3072 个），epilogue 信号 ×2，TMA
 syscall 次数 ×2（每次 stage 2 个），A tile 的 L2 复用压力略增。
+
+## 8. P2 复测结果（2026-07-25，全部达标）
+
+| 指标 | P1v2(单缓冲) | **P2(COL=64)** | 旧版(pre-P1) | CUTLASS 参照 |
+|---|---|---|---|---|
+| spill | 216B | **0** | 0 | 0 |
+| 寄存器 | 168 | 156 | — | 168 |
+| NCU L0 Duration | 1.36ms | **789µs** | 924µs | 664µs |
+| NCU L0 tensor | 41.3% | **71.3%** | 60.9% | 84.9% |
+| IPC | 0.95 | **1.59** | 1.26 | — |
+| Memory(SOL) | 92.3% | **67.2%** | 46.8% | — |
+| verify fp8/raw | 1.94× | **1.09×** | ~1.2× | — |
+| e2e 04f8 T=512 | — | **1548µs** | 1629µs | — |
+
+e2e −5%（1629→1548）；纯 GEMM 引擎 −14.6%（924→789µs 锁频），站在
+CUTLASS 的 84% 水位。rel_err 探针 1.68e-3 不变（数值逐比特等价）。
+
+**03f8 门事件**：03f8 rel_err=4.28e-2 FAIL，但三次对拍（9a8beff 基线 /
+ac0543e / cad0037）rel_err **逐位完全一致**（0.042817506939172745）→
+我们的改动与基线 e2e 输出逐比特一致，FAIL 是**环境漂移**（venv 被
+动过：triton 导入失败为症状；疑似 torch matmul 精度默认值变化污染
+fp32 reference 或权重 RNG 变化），07-20 的 1.73e-2 基线在当前环境
+失效。处理：以当前 4.28e-2 为环境水位重定基线，不收归代码问题。
+
+剩余引擎差距（vs CUTLASS 664µs/84.9%）归因排序：
+1. **TMA syscall 开销 ×2**（COL=64 后每次 stage 2 个 call；CUTLASS 的
+   2D descriptor 疑似走原生路径）→ 杠杆：A/B 改 2D TMA descriptor；
+2. **1×8 warp 几何的 B 冗余**（LDSM 36 vs 24/warp/K-block）→ 4×2
+   几何 + smem GLU 配对（gate 半块经 smem 交换，~0.4% 开销）；
+3. scale 3 个分叉 LDG/K-block → producer cp.async 进 smem；
+4. 任务/epilogue 开销 ×2（COL=64 固有）。

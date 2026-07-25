@@ -14,10 +14,18 @@
   scale 块内置换，量化零改动）、w_scales 按 col_idx>>1 取块（三个
   entry 检查同步修正）、协议零改动（col_blocks kernel 内现算）。
   方案A warp 路径仍禁用。死锁审计沿用（无新等待点）。
-- **待上机**：rm -rf kernels/tk/build → verify_fp8_gemm 对拍（预期
-  fp8 ≈ raw×1.1-1.3，spill 0）→ NCU 重采 vs 旧 924µs / CUTLASS 664µs
-  （目标 Duration <924，tensor ≥65-70%）→ 03f8 + 04f8 A/B（基线
-  1629µs）。
+- **P2 复测结果（全部达标，docs/10 §8）**：spill 0、REG 156、NCU L0
+  **789µs / tensor 71.3%**（旧 924µs/60.9%，CUTLASS 664µs/84.9%）、
+  IPC 1.59、verify fp8 = raw×1.09、**04f8 e2e T=512 1548µs（−5%）**、
+  T=1024 3115µs。rel_err 探针 1.68e-3 不变。
+- **03f8 门事件结论**：rel_err 4.28e-2 FAIL 但在 9a8beff/ac0543e/
+  cad0037 三个 commit 上**逐位完全一致** → 我们的改动与基线输出逐
+  比特一致，FAIL 是环境漂移（venv 被改动，triton 导入失败为症状，
+  疑似 torch matmul 精度默认值/RNG 变化），以当前 4.28e-2 为水位
+  重定基线。
+- 下一步杠杆（docs/10 §8 末尾归因排序）：① A/B 改 2D TMA descriptor
+  绕开 4d/5d syscall；② 4×2 warp 几何 + smem GLU 配对（LDSM −33%）；
+  ③ scale 走 smem（cp.async 原生指令）；④ e2e 侧 comm 税继续。
 - 后续杠杆：A/B 改 2D TMA descriptor 绕开 4d/5d syscall；scale 走
   smem（cp.async 原生指令）。
 
