@@ -11,9 +11,10 @@ NCU 按 kernel 采，见 §4 教训）：
 
 - 我们：`tools/verify_fp8_gemm.py`（`gg8::kernel`，与融合 kernel 同一套
   `gemm_config_fp8` 引擎，无 comm 角色）；
-- baseline：`tools/ncu_serial_gemm_probe.py`（复刻 SerialNaive 的
+- baseline：一次性探针脚本 `ncu_serial_gemm_probe.py`（复刻 SerialNaive 的
   `fused_experts` 一步，无 NCCL；triton `fused_moe_kernel` 每迭代两颗，
-  launch-skip 6/7 分别采 w13/w2，grid 3828/10208 与 N=1536/4096 对应可验）。
+  launch-skip 6/7 分别采 w13/w2，grid 3828/10208 与 N=1536/4096 对应可验）——
+  该探针脚本已随 slim 分支移除，结论保留在本文，复现需检出 `fp8_tp` 分支历史提交。
 
 形状 = 主配置 rank 0 视角，routed 行数 16384（=2048 token × topk8 = 64
 expert × 256 行）：
@@ -62,7 +63,8 @@ CUDA_VISIBLE_DEVICES=<idle> ncu --replay-mode kernel --kernel-name-base demangle
 3. **短 K 形状两边都掉档，triton 掉得更狠**（66.7→50.2 vs 我们 60.9→53.9）：
    短主循环下固定开销摊薄差。定量支撑 e2e 上 L1 fp8 净赚 −129µs 的合理性。
 4. **指令选型无差异**：双方均为 QMMA + fp32 累加（tensor FP 子管道，
-   imma=0）。~~60-67% 即 sm120 fp32 累加税（docs/38）下的可达水位带，
+   imma=0）。~~60-67% 即 sm120 fp32 累加税（原归档 38，已随 slim 分支移除）下的
+   可达水位带，
    指令级无翻盘空间~~ **此条已被 §5 的 CUTLASS 参照推翻**：同指令
    （SM120_16x8x32_TN fp8, fp32 acc）CUTLASS 在 L0 打到 84.9%，60-67%
    不是硬件天花板，是软件流水/重标定摊薄的欠账。
@@ -85,9 +87,10 @@ CUDA_VISIBLE_DEVICES=<idle> ncu --replay-mode kernel --kernel-name-base demangle
 
 ## 5. 2026-07-23 补充：CUTLASS 参照水位（同锁频口径）
 
-用 CUTLASS 4.6.1 官方 sm120 kernel 立厂商可达上限（`tools/cutlass_probe/`，
-fp8 = examples/87c blockwise grouped GEMM 原样编译，与我们量化口径逐项同构；
-bf16 = 2.x GemmGrouped+Sm80 mma.sync，皆纯 GEMM、无路由间接寻址）：
+用 CUTLASS 4.6.1 官方 sm120 kernel 立厂商可达上限（探针脚本 `tools/cutlass_probe/`
+和 CUTLASS 子模块本身已随 slim 分支移除，结论保留在本文，复现需检出 `fp8_tp` 分支
+历史提交；fp8 = examples/87c blockwise grouped GEMM 原样编译，与我们量化口径逐项
+同构；bf16 = 2.x GemmGrouped+Sm80 mma.sync，皆纯 GEMM、无路由间接寻址）：
 
 | 锁频口径 | L0 | tensor | L1 | tensor |
 |---|---|---|---|---|

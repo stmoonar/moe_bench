@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """TP CPU preflight — runs ANYWHERE (no GPU, no vllm, no torch.distributed):
 
-  1. DEVICE GUARD (docs/21 §1): every tensor creation inside the TP schedule
+  1. DEVICE GUARD (docs/04): every tensor creation inside the TP schedule
      builders must carry an explicit device= — anything else is the
      set_default_device(cuda) bug class that killed rounds 1 and 3 on the
      machine. Enforced with a TorchFunctionMode, not grep discipline.
   2. host golden vs GPU-vectorized builder: element-for-element equality plus
-     the slot/slack/order invariants (subset of tools/verify_tp_schedule.py).
+     the slot/slack/order invariants — the schedule tables are adjudicated here,
+     nothing else re-checks them.
   3. end-to-end CPU dataflow simulation driven by the real tables vs a naive
      TP MoE reference (validates the semantics the CUDA kernels implement).
 
@@ -38,7 +39,6 @@ def _load_tk_tp_scheme():
         ("context", {"DistContext": object}),
         ("data", {"MoEProblem": object}),
         ("schemes", {"DistributedScheme": object}),
-        ("tk_scheme", {"ROW_BLOCK": 128}),
     ]:
         m = types.ModuleType(f"moe_bench.{name}")
         for k, v in attrs.items():
@@ -67,7 +67,7 @@ _CREATORS = {torch.zeros, torch.ones, torch.empty, torch.full, torch.arange,
 
 
 class RequireExplicitDevice(TorchFunctionMode):
-    """Fail any tensor creation without device= (docs/21 §1 bug class)."""
+    """Fail any tensor creation without device= (docs/04 的坑索引)。"""
 
     def __torch_function__(self, func, types_, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -106,13 +106,9 @@ def check_builders(mod, ROW_BLOCK=128):
                      blk_g, P) = mod._build_tp_schedules(all_ids[rank], all_w[rank],
                                                          T, world, ne, rank, "cpu")
                 N = world * T * topk
-                ar = torch.arange(N, device="cpu")
                 packed_all = torch.stack(
                     [all_ids, all_w.contiguous().view(torch.int32)], dim=-1).contiguous()
                 out = {
-                    "src_dev_grid": ar // (T * topk),
-                    "src_tok_grid": (ar // topk) % T,
-                    "kpos_grid": ar % topk,
                     "padded": torch.zeros(ne, dtype=torch.int32, device="cpu"),
                     "tp_slots": torch.full((world * T, topk), -1, dtype=torch.int32, device="cpu"),
                     "prered_w": torch.zeros(world * T, topk, dtype=torch.float32, device="cpu"),
@@ -135,7 +131,7 @@ def check_builders(mod, ROW_BLOCK=128):
                                        ("blk_expert", out["blk_expert"], blk_g)]:
                     if got.shape != ref.shape or not torch.equal(got, ref):
                         fails.append(f"[{tag}] {name} host/GPU MISMATCH")
-                # docs/30: blk_expert invariants (dispenser GEMM's B index)
+                # blk_expert invariants (dispenser GEMM 的 B tile 索引)
                 blkl = blk_g.long()
                 if not bool((blkl[1:] >= blkl[:-1]).all()):
                     fails.append(f"[{tag}] blk_expert not non-decreasing")

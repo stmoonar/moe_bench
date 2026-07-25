@@ -1,20 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TP driver: run the distributed tktp layer with verify, bypassing bench.py's
-argparse (vllm FlexibleArgumentParser mangles argv here). Mirror of run_tkfused.
+"""TP 驱动脚本:直接跑分布式 tktp / serial, 绕开 bench.py 的 argparse
+(vllm 的 FlexibleArgumentParser 在这里会吃掉参数)。
 
-  python -m moe_bench.tools.run_tktp  <num_experts>  [--no-verify] [--iters N]
+基准口径**从主配置读**(configs/tp_rtx_pro5000_4gpu_fp8.yaml), 命令行只覆盖
+本次实验需要的最小字段, 覆盖项会打印出来。
+
+  python -m moe_bench.tools.run_tktp [num_experts] [--scheme tktp|serial]
+      [--tokens T] [--iters N] [--no-verify] [--json out.json]
       [--dist balanced|uniform|skewed|single] [--skew-alpha A] [--active N]
-      [--tokens T] [--scheme tktp|serial]
-      [--precision bf16|fp8]   # fp8 = w8a8 block [128,128](docs/37, 分支 fp8_tp)
 
-Prints per-token latency + rel_err (harness verifies vs reference_moe through
-the full logical weight set automatically unless --no-verify).
+不带 --no-verify 时, harness 会用 reference_moe 对拍整层输出并打印 rel_err。
 """
 from __future__ import annotations
 
+import dataclasses
+import os
 import sys
 
-from moe_bench.config import Distribution, MoEBenchConfig, ParallelMode, Precision, RoutingConfig
+from moe_bench.config import Distribution, MoEBenchConfig, RoutingConfig
+
+CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "configs", "tp_rtx_pro5000_4gpu_fp8.yaml")
 
 
 def _arg(flag, default, cast=str):
@@ -24,24 +30,35 @@ def _arg(flag, default, cast=str):
 
 
 def main():
-    ne = int(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else 64
-    verify = "--no-verify" not in sys.argv
-    biter = _arg("--iters", 20, int)
-    dist = _arg("--dist", "balanced")
-    skew_alpha = _arg("--skew-alpha", 1.0, float)
-    active = _arg("--active", None, int)
-    tokens = _arg("--tokens", 512, int)
-    scheme = _arg("--scheme", "tktp")
+    cfg = MoEBenchConfig.from_file(CONFIG)
+    over = {}
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        over["num_experts"] = int(sys.argv[1])
+    tokens = _arg("--tokens", None, int)
+    if tokens is not None:
+        over["num_tokens"] = [tokens]
+    iters = _arg("--iters", None, int)
+    if iters is not None:
+        over["bench_iters"] = iters
+    if "--no-verify" in sys.argv:
+        over["verify"] = False
     json_out = _arg("--json", None)
-    precision = Precision(_arg("--precision", "bf16"))
-    cfg = MoEBenchConfig(
-        hidden_size=4096, intermediate_size=3072, num_experts=ne, topk=8,
-        parallel_mode=ParallelMode.TP, world_size=4, precision=precision,
-        num_tokens=[tokens], routing=RoutingConfig(
-            distribution=Distribution(dist), skew_alpha=skew_alpha,
-            num_active_experts=active),
-        distributed=True, warmup_iters=5, bench_iters=biter, use_cuda_graph=False,
-        seed=0, verify=verify, device="cuda", output_json=json_out)
+    if json_out is not None:
+        over["output_json"] = json_out
+    dist = _arg("--dist", None)
+    skew_alpha = _arg("--skew-alpha", None, float)
+    active = _arg("--active", None, int)
+    if dist is not None or skew_alpha is not None or active is not None:
+        over["routing"] = RoutingConfig(
+            distribution=Distribution(dist) if dist else cfg.routing.distribution,
+            skew_alpha=skew_alpha if skew_alpha is not None else cfg.routing.skew_alpha,
+            num_active_experts=active if active is not None
+            else cfg.routing.num_active_experts)
+    scheme = _arg("--scheme", "tktp")
+
+    if over:
+        print(f"[run_tktp] config={os.path.basename(CONFIG)} overrides={over}")
+    cfg = dataclasses.replace(cfg, **over) if over else cfg
     from moe_bench.distributed import run_distributed
     run_distributed(cfg, scheme)
 

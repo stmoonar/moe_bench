@@ -1,42 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TK fused MoE scheme (bf16, TP) for the distributed benchmark.
+"""TK 通算融合 MoE scheme(FP8, TP)—— `--scheme tktp`。
 
-TP shards the INTERMEDIATE dim (every card holds all E experts, thin), so the
-layer's cross-card traffic is dense and routing-independent:
+TP 把 intermediate 维切片(每张卡有全部 E 个 expert, 但每个 expert 更"瘦"),
+所以跨卡流量是稠密的、与路由无关的, 一层 MoE 只剩两次跨卡搬运, 各自被融进
+一个 persistent kernel:
 
-  1. AllGather ⊕ gate+up GEMM   (layer0 fused, moe_tp_dispatch_gemm)
-       every unique (src_dev, src_tok) row is pulled ONCE cross-card (ring
-       order, own shard first) and scattered to its TOP_K expert-sorted
-       gathered slots locally — the T7 dedup insight is the NATURAL TP form,
-       since all top-k experts of every token live on this card.
-  2. act = silu(gate) * up      (torch, on the [gate | up] halves)
-  3. W2 GEMM ⊕ prered-push      (layer1 fused, moe_tp_gemm_prered_push)
-       the top-k weighted combine is FULLY LOCAL in TP (T6 prered with all
-       TOP_K hits local); the cross-card step degenerates to a dense
-       ReduceScatter of (T, H) partial rows, done with the verified T6-v1
-       push + watermark protocol (edge-triggered, streams under the GEMM).
-  4. moe_final_reduce_push      (source card sums the world partial planes)
+  1. layer0  AllGather ⊕ gate+up GEMM ⊕ SwiGLU   (moe_tp_dispatch_gemm_fp8_push)
+       源卡按**消费序**把自己的 fp8 token 行 push 进 3 个 peer 的 staging,
+       收卡等 per-token 到达 flag 后从本地 staging 散到该 token 的 TOP_K 个
+       gathered slot; 行块计数满就放行对应 GEMM tile。TP 下每个 token 的全部
+       top-k expert 都在本卡, 所以"每行只跨卡搬一次"是天然形态。
+  2. layer1  W2 GEMM ⊕ 本地 top-k 预归约 ⊕ 稠密 ReduceScatter push
+                                                 (moe_tp_gemm_prered_push_fp8)
+       TP 下 top-k 加权合并**完全是本地的**, 跨卡步骤退化成 (T, H) 部分和的
+       稠密 ReduceScatter, 用边算边推 + 水位信号完成。
+  3. moe_final_reduce_push                        源卡把 world 个 partial plane 求和。
 
-All communication is PCIe-safe (experience/12): unicast pull/push, local
-red.release.gpu counters, st.release.sys slot signals — no remote atomics,
-no multimem. Kernels are shared with the EP scheme (tk_scheme.py); only the
-dispatch data plane (pull-once-scatter-TOP_K) and the entry geometry
-(expert_offset=0, all experts local) are TP-specific.
+所有通信都是 PCIe 安全的(单播 push、本地 red.release.gpu 计数、st.release.sys
+定值信号): 本平台既没有远端原子 RMW 也没有 multimem, 见 docs/04。
 
-bf16 only, TOP_K must equal the kernels' compile-time TOP_K (8).
+约束: FP8(w8a8, block [128,128])、TOP_K 必须等于 kernel 编译期的 8。
+其它已试过的数据面(peer pull / per-lane pull / 通信 warp 化 / copy engine /
+layer1 按 N 维分解)都已判负, 结论留在 docs/04, 代码不再保留。
 """
 from __future__ import annotations
 
 import os
 
 import torch
-import torch.nn.functional as F
 
 from .config import ParallelMode
 from .context import DistContext
 from .data import MoEProblem
 from .schemes import DistributedScheme
-from .tk_scheme import ROW_BLOCK
+
+# 每个 GEMM tile 的 token 行数, 同时是 expert 的 padding 单位。必须与
+# sm120_common.cuh 的 gemm_config_fp8::ROW_BLOCK 一致(build.py 用同一个值
+# 传 -DTK_ROW_BLOCK 并进 .so 文件名)。
+ROW_BLOCK = 128
 
 
 def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
@@ -51,20 +52,22 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
       - tp_w (world*T, TOP_K) float32: routing weight per assignment;
       - slack (nblk,) int32: ROW_BLOCK - real tokens per row block (counter seed);
       - pull_order (world*T,) int32: unique tokens sorted by MIN gathered slot
-        (expert-major; docs/20 — a ring-by-source order made every row block
+        (expert-major; docs/03 — a ring-by-source order made every row block
         wait for the LAST ring stage, stalling the GEMM behind the whole AG);
       - job_order (world*T,) int32: jobs sorted by MAX slot = readiness order
-        for the layer1 dispenser (docs/20);
+        for the layer1 dispenser;
       - push_order (world, T) int32: source s's tokens sorted by their MIN slot
-        — the order card s PUSHES its shard in TP-T1 (docs/23), which must be
+        — the order card s PUSHES its shard in layer0, which must be
         byte-identical on every rank (producer and consumers replay it for the
-        chunk-watermark position mapping);
+        arrival-flag position mapping);
+      - blk_expert (nblk,) int32: row block -> expert id (the dispenser GEMM's
+        B-tile index);
       - num_padded_total: gathered rows (= sum(padded)).
 
     Slot order within an expert is CANONICAL (src_dev, src_tok, kpos) —
-    identical on every rank. docs/23: the push dispatch requires a layout all
-    ranks agree on (the old per-rank ring made push_order rank-dependent), and
-    "own shard first" was already proven useless in docs/20.
+    identical on every rank. The push data plane requires a layout all ranks
+    agree on (a per-rank ring order would make push_order rank-dependent), and
+    "own shard first" was measured useless (docs/04).
     """
     top_k = topk_ids.shape[1]
     all_topk = torch.empty(world_size, num_tokens, top_k, device=device,
@@ -109,21 +112,21 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
             slack[blk] = ROW_BLOCK - real_in
             blk += 1
 
-    # docs/20 orders. min/max slots are already unique across tokens (slots are
-    # a bijection and each slot belongs to one token), so argsort needs no
+    # consumption orders. min/max slots are already unique across tokens (slots
+    # are a bijection and each slot belongs to one token), so argsort needs no
     # stability; the +index tie-break just keeps host/GPU byte-identical under
     # any future table change.
     mins = tp_slots.min(dim=1).values.long()
     pull_order = torch.argsort(mins * S + torch.arange(S, device="cpu")).to(torch.int32)
     maxs = tp_slots.max(dim=1).values.long()
     job_order = torch.argsort(maxs * S + torch.arange(S, device="cpu")).to(torch.int32)
-    # docs/23 TP-T1: per-source push order = that source's tokens by min slot.
-    # Canonical layout makes this identical on all ranks (min slots are unique
-    # within a row, argsort stability irrelevant).
+    # per-source push order = that source's tokens by min slot. The canonical
+    # layout makes this identical on all ranks (min slots are unique within a
+    # row, argsort stability irrelevant).
     push_order = torch.argsort(mins.view(world_size, num_tokens), dim=1).to(torch.int32)
 
-    # docs/30: row block -> expert id (drives the dispenser GEMM's B-tile index;
-    # first expert whose cumulative row-block end exceeds the block index).
+    # row block -> expert id: first expert whose cumulative row-block end
+    # exceeds the block index.
     rb_end = torch.cumsum(padded // ROW_BLOCK, dim=0)
     blk_expert = torch.searchsorted(
         rb_end, torch.arange(nblk, device="cpu"), right=True).to(torch.int32)
@@ -136,17 +139,16 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
 
 def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     """GPU-vectorized rebuild of the TP schedule tables, element-for-element
-    identical to the host `_build_tp_schedules` golden (tools/verify_tp_schedule
+    identical to the host `_build_tp_schedules` golden (tools/preflight_tp_cpu
     adjudicates). Called each run() and counted in timing — the fair analogue of
-    serial's per-run routing all_gathers + moe_align_block_size (docs/07 P1,
-    docs/14). Same single-argsort trick as the EP builder: slot = rank of the
-    assignment in the total order (eid, ring, src_tok, kpos), every key unique
-    (bijection over flattened all_topk) so stability is not required.
+    serial's per-run routing all_gathers + moe_align_block_size (docs/05 公平
+    口径). Single-argsort trick: slot = rank of the assignment in the total
+    order (eid, src_dev, src_tok, kpos), every key unique (bijection over
+    flattened all_topk) so stability is not required.
 
-    docs/30 sched-merge: the input is now ONE gathered tensor
-    `packed_all (world, T, TOP_K, 2) int32` — [..., 0] = topk ids,
-    [..., 1] = the float32 routing weights' BIT PATTERN (view(int32)); one
-    NCCL all_gather replaces the former two. Weights are bit-copied into
+    The input is ONE gathered tensor `packed_all (world, T, TOP_K, 2) int32` —
+    [..., 0] = topk ids, [..., 1] = the float32 routing weights' BIT PATTERN
+    (view(int32)); one NCCL all_gather carries both. Weights are bit-copied into
     prered_w through its int32 view (reinterpret, not a dtype cast).
 
     In TP every assignment is local, so there is no trash-row redirect; and the
@@ -163,9 +165,9 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
 
     eid = packed_all[..., 0].reshape(N).long()
     # canonical order within an expert = (src_dev, src_tok, kpos) = flat index n
-    # (docs/23: all ranks must build the SAME layout for the push dispatch).
-    # docs/44 sched 瘦身: key 用 int32(值域 E*N ≤ 256*131072 < 2^31, 排序
-    # 结果与 int64 逐元素相同, verify 对拍不变), argsort 提速 ~30-40%。
+    # (all ranks must build the SAME layout for the push dispatch).
+    # key 用 int32(值域 E*N ≤ 256*131072 < 2^31, 排序结果与 int64 逐元素
+    # 相同, host/GPU 对拍不变), argsort 提速 ~30-40%。
     key = (eid * N + torch.arange(N, device=device)).to(torch.int32)
     order = torch.argsort(key)
     eid_s = eid[order]
@@ -188,7 +190,7 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     slot_by_n.scatter_(0, order, slot_sorted.to(torch.int32))
     out["tp_slots"].copy_(slot_by_n.view(world_size * T, top_k))
     # weights: flat n already IS (j, kpos); bit-copy the float32 pattern
-    # through prered_w's int32 view (docs/30 sched-merge packing).
+    # through prered_w's int32 view.
     out["prered_w"].view(torch.int32).copy_(
         packed_all[..., 1].reshape(world_size * T, top_k))
 
@@ -202,49 +204,48 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     tmp.scatter_(0, idx, slackv)
     out["slack"].copy_(tmp[:nb_total])
 
-    # docs/20 + docs/23 orders (see host golden for rationale)
+    # consumption orders (see the host golden for the rationale)
     S = world_size * T
     tpl = out["tp_slots"].long()
     mins = tpl.min(dim=1).values
     out["pull_order"].copy_(
         torch.argsort((mins * S + torch.arange(S, device=device))
                       .to(torch.int32)).to(torch.int32))
-    # L1 v2(docs/32)不再消费 job_order(列扫聚合信号取代 max-slot 就绪序),
-    # 只有 v1 路径要求重建 —— 与 push_order 同款的按需策略(docs/26)。
-    if "job_order" in out:
-        out["job_order"].copy_(
-            torch.argsort((tpl.max(dim=1).values * S + torch.arange(S, device=device))
-                          .to(torch.int32)).to(torch.int32))
-    if "push_order" in out:
-        out["push_order"].copy_(
-            torch.argsort(mins.view(world_size, T), dim=1).to(torch.int32))
+    out["job_order"].copy_(
+        torch.argsort((tpl.max(dim=1).values * S + torch.arange(S, device=device))
+                      .to(torch.int32)).to(torch.int32))
+    out["push_order"].copy_(
+        torch.argsort(mins.view(world_size, T), dim=1).to(torch.int32))
 
-    # docs/30: row block -> expert (dispenser GEMM B-tile index). searchsorted
-    # keeps shapes fixed (capture-safe), mirrors the host golden formula.
-    if "blk_expert" in out:
-        nblk = out["blk_expert"].shape[0]
-        rb_end = torch.cumsum(padded // ROW_BLOCK, dim=0)
-        out["blk_expert"].copy_(torch.searchsorted(
-            rb_end, torch.arange(nblk, device=device), right=True).to(torch.int32))
+    # row block -> expert (dispenser GEMM B-tile index). searchsorted keeps
+    # shapes fixed (capture-safe), mirrors the host golden formula.
+    nblk = out["blk_expert"].shape[0]
+    rb_end = torch.cumsum(padded // ROW_BLOCK, dim=0)
+    out["blk_expert"].copy_(torch.searchsorted(
+        rb_end, torch.arange(nblk, device=device), right=True).to(torch.int32))
 
 
 class TKFusedTP(DistributedScheme):
+    """FP8 TP 通算融合层。环境旋钮(默认值即当前最好配置, 见 docs/05):
+
+    - ``TK_COMM_SMS``      layer0 通信块数, 默认 24(拐点实测值)
+    - ``TK_L0_PUSH_SMS``   其中做 push 的块数, 其余做本地 scatter, 默认 4
+    - ``TK_COMM_SMS_L1``   layer1 通信块数, 默认跟随 ``TK_COMM_SMS``
+    - ``TK_GPU_SCHED``     1(默认)= 调度表在 run() 内用 GPU 重建并计入耗时
+                           (与 serial 的每次路由 all_gather + align 同口径);
+                           0 = 只用 setup 的 host 表, 归因用, **不是公平口径**
+    """
+
     name = "tktp"
 
     def setup(self, problem: MoEProblem, ctx: DistContext) -> None:
         cfg = problem.config
         assert cfg.parallel_mode == ParallelMode.TP, "TKFusedTP is TP-only"
         assert cfg.topk == 8, "kernels compile TOP_K=8"
-        # docs/39 P2: fp8 = L0 走 fp8 AG + fp8 GEMM(GLU 融合), L1 保持 bf16
-        # (act/push/combine 精度不变, 阶段边界干净)。
-        self.fp8 = problem.quant_config is not None
-        self.l1_fp8 = False  # fp8 分支里按 TK_L1_FP8 重置(docs/42)
-        self.l0_warp = False  # 方案A 通信 warp 化, fp8 分支里按 TK_L0_WARP 重置
-        self.l1_warp = False
-        self.l0_lane = False  # P1 per-lane comm 块, fp8 分支里按 TK_L0_LANE 重置
-        self.l0_push = False  # P2 push 强路径, fp8 分支里按 TK_L0_PUSH 重置
-        if self.fp8:
-            assert cfg.block_shape == [128, 128], "fp8 kernels assume [128,128] blocks"
+        assert problem.quant_config is not None, (
+            "TKFusedTP 只有 FP8 路径(主配置 configs/tp_rtx_pro5000_4gpu_fp8.yaml);"
+            " BF16 的融合 kernel 已在 slim 分支移除, 需要时检出历史提交")
+        assert cfg.block_shape == [128, 128], "fp8 kernels assume [128,128] blocks"
         self.ctx = ctx
         self.problem = problem
         H = cfg.hidden_size
@@ -255,9 +256,9 @@ class TKFusedTP(DistributedScheme):
         device = problem.hidden_states.device
         self.H, self.inter, self.num_tokens, self.top_k = H, inter, num_tokens, cfg.topk
         # GEMM template constraints (sm120_common.cuh)
-        assert H % 64 == 0 and H % 128 == 0, "hidden must be tile-aligned"
+        assert H % 128 == 0, "hidden must be tile-aligned"
         assert (2 * inter) % 64 == 0, "gate_up shard % COL_BLOCK(64)"
-        assert inter % 64 == 0, "intermediate shard % RED_BLOCK"
+        assert inter % 128 == 0, "intermediate shard % RED_BLOCK(128)"
 
         from importlib.util import spec_from_file_location, module_from_spec
         _build_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -282,37 +283,12 @@ class TKFusedTP(DistributedScheme):
         self.blk_expert = blk_expert.contiguous()
         self.num_padded_total = num_padded_total
         self.num_jobs = world * num_tokens
-        # layer1 dispenser counter (docs/20), zeroed each iter (same-stream)
-        self.job_next = torch.zeros(1, dtype=torch.int32, device=device)
-        # docs/30: layer0 v2 = dispenser GEMM (comm blocks join after the AG)
-        # + fused SwiGLU store (weights column-interleaved). Independent
-        # rollback switches: TK_L0=v1 restores the static-walk kernel wholesale,
-        # TK_L0_GLU=0 keeps the dispenser but stores gateup_out + torch silu.
-        self.l0_mode = os.environ.get("TK_L0", "v2")
-        self.l0_glu = (os.environ.get("TK_L0_GLU", "1") == "1"
-                       and self.l0_mode == "v2") or self.fp8  # fp8 kernel 自带 GLU
-        # layer0 dispenser task counter, zeroed each iter (same-stream)
-        self.gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
-        # 方案A: comm lane 的 token 领取计数器(warp 版专用), 每迭代清零
-        self.pull_next = torch.zeros(1, dtype=torch.int32, device=device)
-        # docs/32~35: layer1 v2 = N 维分解 combine(Comet layer1-N)。三轮实测
-        # 后**默认回 v1**(docs/35 负结果):GRP=16 修复粒度病后 v2 仍 786 vs
-        # v1 691,小预算 sweep 单调反向 —— 本机 L1 GEMM 是 SM-bound + 后排空
-        # 全员并行已近最优,N 维分解买不回调度成本(与 Comet 的 NVLink 结论
-        # 是平台差异)。TK_L1=v2 保留可复现。
-        self.l1_mode = os.environ.get("TK_L1", "v1")
-        self.l1_gemm_next = torch.zeros(1, dtype=torch.int32, device=device)
-        # TP-T1 (docs/23): dispatch data plane. "pull" = tpdisp (weak path,
-        # 23.5GB/s under 4-way concurrency, 16 comm SMs); "push" = tppdisp
-        # (strong path 50.9GB/s, 4 SMs saturate, chunk watermarks). Default
-        # pull until push wins all tiers (rollback policy docs/23).
-        self.dispatch_mode = os.environ.get("TK_TP_DISPATCH", "pull")
-        # per-(dst, chunk) election counters, zeroed each iter; CHUNK=64 must
-        # match tppdisp::globals::CHUNK.
-        self._nchunks = (num_tokens + 63) // 64
-        self.l0_push_cnt = torch.zeros(world * self._nchunks, dtype=torch.int32,
-                                       device=device)
-        self.num_push_sms = int(os.environ.get("TK_TP_PUSH_SMS", "4"))
+        # 每迭代清零的计数器(同 stream, 无需额外同步)
+        self.job_next = torch.zeros(1, dtype=torch.int32, device=device)     # L1 job dispenser
+        self.gemm_next = torch.zeros(1, dtype=torch.int32, device=device)    # L0 GEMM task dispenser
+        self.l1_gemm_next = torch.zeros(1, dtype=torch.int32, device=device)  # L1 GEMM task dispenser
+        self.push_next = torch.zeros(1, dtype=torch.int32, device=device)    # L0 push 领取
+        self.pull_next = torch.zeros(1, dtype=torch.int32, device=device)    # L0 scatter 领取
 
         # ---- layer1 constants (routing-independent in TP) ----
         # prered_dst: job j -> (src_dev, src_tok) of the dense job space.
@@ -329,13 +305,11 @@ class TKFusedTP(DistributedScheme):
                                         dtype=torch.int32, device=device)
         self.combine_local_cnt = torch.zeros(world, dtype=torch.int32, device=device)
 
-        # ---- GPU schedule rebuild (T3 fairness: counted in run()) ----
+        # ---- GPU schedule rebuild (fairness: counted in run()) ----
         self.gpu_schedule = os.environ.get("TK_GPU_SCHED", "1") == "1"
         if self.gpu_schedule:
-            N = world * num_tokens * self.top_k
-            ar = torch.arange(N, device=device)
-            # docs/30 sched-merge: ids + weight bits ride ONE all_gather.
-            # packed[..., 0] = topk ids, packed[..., 1] = float32 bit pattern.
+            # packed[..., 0] = topk ids, packed[..., 1] = float32 bit pattern —
+            # ids + weights ride ONE all_gather.
             self._packed_local = torch.empty(num_tokens, self.top_k, 2,
                                              device=device, dtype=torch.int32)
             self._packed_all = torch.empty(world, num_tokens, self.top_k, 2,
@@ -345,146 +319,64 @@ class TKFusedTP(DistributedScheme):
             self._topk_w_bits = self._topk_w_local.view(torch.int32)
             self._num_experts = num_experts
             self._sched_out = {
-                "src_dev_grid": ar // (num_tokens * self.top_k),
-                "src_tok_grid": (ar // self.top_k) % num_tokens,
-                "kpos_grid": ar % self.top_k,
                 "padded": self.padded, "tp_slots": self.tp_slots,
                 "prered_w": self.prered_w, "slack": self.slack,
                 "pull_order": self.pull_order,
+                "job_order": self.job_order,
+                "push_order": self.push_order,
                 "blk_expert": self.blk_expert,
             }
-            # job_order 只有 L1 v1 消费(v2 的列扫信号取代就绪序, docs/32),
-            # 不进 v2 的计时重建 —— 同 push_order 的按需策略。
-            if self.l1_mode != "v2":
-                self._sched_out["job_order"] = self.job_order
-            # push_order is only consumed by the (frozen) push dispatch — keep
-            # it out of the timed per-iter rebuild on the pull path (docs/26:
-            # sched is the largest single compressible slice, 277µs @ 12%).
-            # P2(fp8 push 强路径)同样消费 push_order。
-            if self.dispatch_mode == "push" or self.l0_push:
-                self._sched_out["push_order"] = self.push_order
             self._sched_graph = None  # captured lazily on first run()
 
         # ---- weights ----
-        if self.fp8:
-            # docs/39: fp8 权重先反量化(setup 一次), L1 用 bf16; L0 在 GLU
-            # 列交织后的布局上重量化(scale 块与 GEMM tile 对齐, docs/37 §2)。
-            qc = problem.quant_config
-            FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-            # docs/42 P3: L1 fp8(默认)—— w2 (E,H,inter) 就是 B^T 布局,
-            # qc.w2_scale (E,H/128,inter/128) 原样可用, 零转置零重量化。
-            self.l1_fp8 = os.environ.get("TK_L1_FP8", "1") == "1"
-            # docs/43: 线上字节改走 copy engine(0 SM, 打破 SM 零和);
-            # TK 抽象 = TKParallelTensor.raw_ptrs_ + side streams(ce:: 编排)。
-            self.l0_ce = os.environ.get("TK_L0_CE", "0") == "1"
-            self.l1_ce = os.environ.get("TK_L1_CE", "0") == "1"
-            # 方案A(2026-07-16): 通信 warp 化 —— comm 角色降为 GEMM 块内
-            # producer warp 的闲置 lane, GEMM 拿满全部 SM(回收让渡税)。
-            # 已判负(per-SM TMA 队列共存税, 归档 2026-07-16 方案A 文档),
-            # 默认关留档。与 CE 互斥。
-            self.l0_warp = os.environ.get("TK_L0_WARP", "0") == "1"
-            self.l1_warp = os.environ.get("TK_L1_WARP", "0") == "1"
-            assert not (self.l0_warp and self.l0_ce), "TK_L0_WARP 与 TK_L0_CE 互斥"
-            assert not (self.l1_warp and self.l1_ce), "TK_L1_WARP 与 TK_L1_CE 互斥"
-            assert not (self.l1_warp and not self.l1_fp8), \
-                "TK_L1_WARP 需要 TK_L1_FP8=1(warp kernel 只有 fp8 版)"
-            # P1(PK 路线重估 2026-07-16): comm 块 per-lane 自由化 —— 保持
-            # inter-SM 几何(comm 块+转岗), 把波同步拉取(20 lane 等最慢者)
-            # 换成 per-lane 独立领取。实测(tp_run_20260716_073019)全档赢:
-            # T=512 1681(-28)/T=1024 2831(-104), 每个 comm_sms 档位都优于
-            # 波同步 -> 默认开(TK_L0_LANE=0 回滚)。注意拐点未左移(16 SM 即
-            # 回升): pull 是 RTT 受限, ~480 在飞并发是真实需求, 压 SM 数
-            # 走 P2 push 化。
-            self.l0_lane = os.environ.get("TK_L0_LANE", "1") == "1"
-            assert not (self.l0_lane and (self.l0_warp or self.l0_ce)), \
-                "TK_L0_LANE 与 TK_L0_WARP/TK_L0_CE 互斥"
-            # P2(PK 路线重估): L0 push 强路径 —— posted write 无 RTT 往返,
-            # 收侧只剩本地 staging 读。实测(tp_run_20260716_075314)双档全赢:
-            # T=512 1629(-53 vs lane)/T=1024 2777(-53) -> 默认开。
-            # 拐点仍 24(瓶颈已转移到收侧 scatter 的 per-token TMA 串行等待,
-            # P2.5 warp 协作式 scatter 待做); push 2 个 SM 即饱和(psms sweep),
-            # 最好实测配置 = comm24+psms4, psms 默认保持 4(psms2 仅在 comm8
-            # 档验证过更优)。TK_L0_PUSH_SMS = 源侧 push 块数(其余 scatter)。
-            self.l0_push = os.environ.get("TK_L0_PUSH", "1") == "1"
-            self.l0_push_sms = int(os.environ.get("TK_L0_PUSH_SMS", "4"))
-            # P2.5: warp 协作式 scatter(每 warp 一 token, 32 lane 分工搬
-            # 128B 段, 纯 LSU 全流水, 无 TMA/mbarrier/per-token wait)。
-            # 攻收侧 scatter 的 per-token 串行等待(P2 首测的新瓶颈)。
-            # 默认关, A/B 后定默认。
-            self.l0_scat_warp = os.environ.get("TK_L0_SCAT_WARP", "0") == "1"
-            assert not (self.l0_push and (self.l0_warp or self.l0_ce)), \
-                "TK_L0_PUSH 与 TK_L0_WARP/TK_L0_CE 互斥"
-            s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
-            w1_bf = (problem.w1.float() * s1.repeat_interleave(128, 1)
-                                            .repeat_interleave(128, 2))
-            if self.l1_fp8:
-                self.w2_fp8 = problem.w2.contiguous()        # (E, H, inter) fp8
-                self.w2_scales = qc.w2_scale.float().contiguous()
-            else:
-                s2 = qc.w2_scale.float()                     # (E, H/128, I/128)
-                w2_bf = (problem.w2.float() * s2.repeat_interleave(128, 1)
-                                                .repeat_interleave(128, 2))
-                self.w2 = w2_bf.to(torch.bfloat16).transpose(1, 2).contiguous()
-                del w2_bf
-            # GLU 列交织(按 N 行, 单位 32): [gate32 | up32] per 64-N block
-            # (fp8 GEMM COL_BLOCK=64, docs/10 §7; 同一 128 列 scale 块内置换)
-            E = w1_bf.shape[0]
-            gate = w1_bf[:, :inter].view(E, inter // 32, 32, H)
-            up = w1_bf[:, inter:].view(E, inter // 32, 32, H)
-            w1_il = torch.stack([gate, up], dim=2).view(E, 2 * inter, H)
-            # 交织后 128(N)×128(K) 重量化 -> scale 块与 B tile 天然对齐
-            v = w1_il.view(E, 2 * inter // 128, 128, H // 128, 128)
-            amax = v.abs().amax(dim=(2, 4), keepdim=True).clamp_min(1e-8)
-            self.w1_il_scales = (amax / FP8_MAX).view(
-                E, 2 * inter // 128, H // 128).contiguous()
-            self.w_gateup_fp8 = (v / (amax / FP8_MAX)).to(torch.float8_e4m3fn) \
-                                                      .view(E, 2 * inter, H).contiguous()
-            del w1_bf, w1_il, v
-        else:
-            w1 = problem.w1                                     # (E, 2*inter, H), [gate; up]
-            self.w_gateup = w1.transpose(1, 2).contiguous()     # (E, H, 2*inter), [gate | up]
-            self.w2 = problem.w2.transpose(1, 2).contiguous()   # (E, inter, H)
-        if self.l0_glu and not self.fp8:
-            # docs/30: column-interleave so every 128-col GEMM tile is
-            # [gate64 | up64] of the SAME intermediate columns — the SwiGLU
-            # epilogue pairs the halves inside the accumulator. Setup-time
-            # permutation, run-time free.
-            E = self.w_gateup.shape[0]
-            gate = self.w_gateup[:, :, :inter].reshape(E, H, inter // 64, 64)
-            up = self.w_gateup[:, :, inter:].reshape(E, H, inter // 64, 64)
-            self.w_gateup_il = torch.stack([gate, up], dim=3) \
-                                    .reshape(E, H, 2 * inter).contiguous()
+        # w1: fp8 权重先反量化(setup 一次), 按 GLU 列交织后重量化 —— scale 块
+        # 与 GEMM 的 B tile 天然对齐; w2 直接用原布局(见下)。
+        qc = problem.quant_config
+        FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+        # w2 (E, H, inter) 就是 B^T 布局, qc.w2_scale (E, H/128, inter/128)
+        # 原样可用 —— 零转置、零重量化、零二次量化误差。
+        self.w2_fp8 = problem.w2.contiguous()
+        self.w2_scales = qc.w2_scale.float().contiguous()
+        s1 = qc.w1_scale.float()                         # (E, 2I/128, H/128)
+        w1_bf = (problem.w1.float() * s1.repeat_interleave(128, 1)
+                                        .repeat_interleave(128, 2))
+        # GLU 列交织(按 N 行, 单位 32): [gate32 | up32] per 64-N block
+        # (fp8 GEMM COL_BLOCK=64, docs/10; 同一 128 列 scale 块内置换)
+        E = w1_bf.shape[0]
+        gate = w1_bf[:, :inter].view(E, inter // 32, 32, H)
+        up = w1_bf[:, inter:].view(E, inter // 32, 32, H)
+        w1_il = torch.stack([gate, up], dim=2).view(E, 2 * inter, H)
+        # 交织后 128(N)×128(K) 重量化 -> scale 块与 B tile 天然对齐
+        v = w1_il.view(E, 2 * inter // 128, 128, H // 128, 128)
+        amax = v.abs().amax(dim=(2, 4), keepdim=True).clamp_min(1e-8)
+        self.w1_il_scales = (amax / FP8_MAX).view(
+            E, 2 * inter // 128, H // 128).contiguous()
+        self.w_gateup_fp8 = (v / (amax / FP8_MAX)).to(torch.float8_e4m3fn) \
+                                                  .view(E, 2 * inter, H).contiguous()
+        del w1_bf, w1_il, v
 
         # ---- buffers ----
         TK = self.tk.TKParallelTensor
         lr, lws = ctx.local_rank, world
         P = num_padded_total
-        # peer-readable token shard (dispatch pull source)
-        if self.fp8:
-            # fp8 AG(docs/39): 源端量化后 4KB/token + 128B scales, AG 字节减半
-            self.pre_tokens = TK((num_tokens, H), dtype=torch.float8_e4m3fn,
-                                 local_rank=lr, local_world_size=lws, multicast=False)
-            self.pre_scales = TK((num_tokens, H // 128), dtype=torch.float32,
-                                 local_rank=lr, local_world_size=lws, multicast=False)
-            if self.l0_push:
-                # P2 push 缓冲: plane s = 源 s 单写者; flags 值 = 到达 seq
-                # (单调, 免清零)。staging 覆盖安全由双 pcie_device_barrier
-                # 保证(等价于 pre_tokens 的保护)。
-                S_ag = world * num_tokens
-                self.ag_staging_fp8 = TK((S_ag, H), dtype=torch.float8_e4m3fn,
-                                         local_rank=lr, local_world_size=lws,
-                                         multicast=False)
-                self.ag_sscales = TK((S_ag, H // 128), dtype=torch.float32,
-                                     local_rank=lr, local_world_size=lws,
-                                     multicast=False)
-                self.ag_flags = TK((1, S_ag), dtype=torch.int,
-                                   local_rank=lr, local_world_size=lws,
-                                   multicast=False)
-                self.ag_flags.data_.zero_()
-                self.push_next = torch.zeros(1, dtype=torch.int32, device=device)
-        else:
-            self.pre_tokens = TK((num_tokens, H), dtype=torch.bfloat16, local_rank=lr,
-                                 local_world_size=lws, multicast=False)
+        S_ag = world * num_tokens
+        # 源端量化后的 token 分片: 4KB/token + 128B scales(fp8 AG 字节减半)
+        self.pre_tokens = TK((num_tokens, H), dtype=torch.float8_e4m3fn,
+                             local_rank=lr, local_world_size=lws, multicast=False)
+        self.pre_scales = TK((num_tokens, H // 128), dtype=torch.float32,
+                             local_rank=lr, local_world_size=lws, multicast=False)
+        # push 落点: plane s 只由源卡 s 写(单写者, 无需原子); flags 值 = 到达
+        # seq(单调, 免清零)。staging 的覆写安全由 run() 里的双 barrier 保证。
+        self.ag_staging_fp8 = TK((S_ag, H), dtype=torch.float8_e4m3fn,
+                                 local_rank=lr, local_world_size=lws,
+                                 multicast=False)
+        self.ag_sscales = TK((S_ag, H // 128), dtype=torch.float32,
+                             local_rank=lr, local_world_size=lws,
+                             multicast=False)
+        self.ag_flags = TK((1, S_ag), dtype=torch.int,
+                           local_rank=lr, local_world_size=lws, multicast=False)
+        self.ag_flags.data_.zero_()
+
         bar_cols = max(P // ROW_BLOCK + 1, 32)
         # barrier_l0: row 0 = dispatch row-block counters (slack-seeded), row 1 =
         # pcie_barrier_all slots. barrier_l1: row 0 = W2 col-block counters,
@@ -501,54 +393,29 @@ class TKFusedTP(DistributedScheme):
         self.barrier_l0.data_[0, :nblk].copy_(self.slack)
 
         # LOCAL workspaces (TP: peers never touch gathered / expert_out).
-        # zeros so never-written padding rows stay clean bf16.
-        if self.fp8:
-            self.gathered = torch.zeros(P, H, device=device, dtype=torch.float8_e4m3fn)
-            # padding 行 scale=0 -> 反量化恒 0, GEMM 对 padding 行为与 bf16 一致
-            self.gathered_scales = torch.zeros(P, H // 128, device=device,
-                                               dtype=torch.float32)
-            if self.l1_fp8:  # docs/42 P3: act 量化缓冲(复用 rowgroup kernel)
-                self.act_fp8 = torch.zeros(P, inter, device=device,
-                                           dtype=torch.float8_e4m3fn)
-                self.act_scales = torch.zeros(P, inter // 128, device=device,
-                                              dtype=torch.float32)
-            # docs/43 CE 缓冲(kernel 入口需要实参, 常驻分配; CE 关闭时不访问)
-            S = world * num_tokens
-            self.ag_tokens = torch.zeros(S, H, device=device,
-                                         dtype=torch.float8_e4m3fn)
-            self.ag_scales = torch.zeros(S, H // 128, device=device,
-                                         dtype=torch.float32)
-            self.ce_flags = torch.zeros(world, dtype=torch.int32, device=device)
-            self.out_planes = torch.zeros(S, H, device=device, dtype=torch.bfloat16)
-            self.seq_buf = torch.zeros(1, dtype=torch.int32, device=device)
-        else:
-            self.gathered = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
-        self.gateup_out = torch.zeros(P, 2 * inter, device=device, dtype=torch.bfloat16)
+        # padding 行 scale=0 -> 反量化恒 0, GEMM 对 padding 行的结果是干净的 0。
+        self.gathered = torch.zeros(P, H, device=device, dtype=torch.float8_e4m3fn)
+        self.gathered_scales = torch.zeros(P, H // 128, device=device,
+                                           dtype=torch.float32)
         self.act = torch.zeros(P, inter, device=device, dtype=torch.bfloat16)
+        self.act_fp8 = torch.zeros(P, inter, device=device,
+                                   dtype=torch.float8_e4m3fn)
+        self.act_scales = torch.zeros(P, inter // 128, device=device,
+                                      dtype=torch.float32)
         self.expert_out = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
         # peer-writable combine staging: plane d (rows [d*T, d*T+T)) is written
         # only by card d (single writer, no atomics).
         self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
                                   local_rank=lr, local_world_size=lws, multicast=False)
         self.combine_staging.data_.zero_()
-        # TP-T1 push dispatch staging: peer-writable (world*T, H); plane s is
-        # written only by source card s (own plane unused — own shard is read
-        # straight from pre_tokens, which also breaks any self-dependency).
-        if self.dispatch_mode == "push":
-            self.ag_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
-                                 local_rank=lr, local_world_size=lws, multicast=False)
-            self.ag_staging.data_.zero_()
         self.combine_out = torch.zeros(num_tokens, H, device=device, dtype=torch.bfloat16)
 
-        # docs/25: pull path e2e improves through 24 comm SMs (2366@16 ->
-        # 2290@24, round 5) — TP is GEMM-bound but the L0 dispatch queue AND
-        # the L1 dispenser both live on comm blocks; 24 is the measured best
-        # so far (32/40 swept next round for the knee).
-        # docs/30: with v2 the L0 comm blocks convert to GEMM workers after the
-        # AG, so L0's knee may move; L1 gets its own budget (TK_COMM_SMS_L1) —
-        # its comm blocks stream pushes but never help the GEMM before it ends,
-        # so a SMALLER L1 budget may win (push saturates at ~4 SMs, docs/22).
+        # comm SM 预算(docs/03 的 sweep 结论): L0 拐点 24 —— push 本身 2~4 个
+        # 块就饱和, 但收侧 scatter 还需要并发; comm 块推完会转岗领 GEMM task,
+        # 所以给多了也不是纯浪费。L1 单独给预算(它的通信块不会在 GEMM 结束前
+        # 帮上忙, 可以更小)。
         self.num_comm_sms = int(os.environ.get("TK_COMM_SMS", "24"))
+        self.l0_push_sms = int(os.environ.get("TK_L0_PUSH_SMS", "4"))
         self.num_comm_sms_l1 = int(os.environ.get("TK_COMM_SMS_L1",
                                                   str(self.num_comm_sms)))
         self._l0_seq = 0
@@ -556,14 +423,12 @@ class TKFusedTP(DistributedScheme):
 
     def run(self) -> torch.Tensor:
         tk = self.tk
-        # T3 fairness: rebuild the schedule tables on GPU inside the timed
-        # region (serial pays its routing all_gathers + alignment per run).
-        # Table shapes/addresses are fixed (routing invariant per problem);
-        # the pure-compute builder is CUDA-graph captured after first use.
+        # 公平口径: 调度表在计时区内用 GPU 重建(serial 每次也要付路由
+        # all_gather + moe_align_block_size)。表的形状/地址是固定的(路由在一个
+        # problem 内不变), 纯计算部分首次用后被 CUDA graph 捕获。
         if self.gpu_schedule:
-            # docs/30 sched-merge: pack ids + weight bits, ONE all_gather
-            # (saves an NCCL launch ~40us; pack copies are ~5us device kernels
-            # and stay inside the timed region for fairness).
+            # ids + weight bits 打包进一次 all_gather(省一次 NCCL 启动 ~40µs;
+            # 打包 copy 是 ~5µs 的设备 kernel, 按公平口径留在计时区内)。
             self._packed_local[..., 0].copy_(self._topk_ids_local)
             self._packed_local[..., 1].copy_(self._topk_w_bits)
             torch.distributed.all_gather_into_tensor(
@@ -582,173 +447,47 @@ class TKFusedTP(DistributedScheme):
             else:
                 self._sched_graph.replay()
 
-        # barrier BEFORE overwriting pre_tokens (no peer still pulling last
-        # iter's tokens) and AFTER (my tokens visible before peers pull).
+        # barrier BEFORE overwriting pre_tokens (no peer still reading last
+        # iter's tokens) and AFTER (my tokens visible before peers are pushed).
         self._l0_seq += 1
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
-        if self.fp8:
-            # 源端 1×128 group 量化(docs/41: 单 kernel 版, torch 链 ~80µs → ~15µs)
-            tk.rowgroup_quant_fp8(self.problem.hidden_states,
-                                  self.pre_tokens.data_, self.pre_scales.data_)
-        else:
-            self.pre_tokens.data_.copy_(self.problem.hidden_states)
+        # 源端 1×128 group 量化(单 kernel, torch 链 ~80µs → ~15µs)
+        tk.rowgroup_quant_fp8(self.problem.hidden_states,
+                              self.pre_tokens.data_, self.pre_scales.data_)
         self._l0_seq += 1
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
 
-        # layer0: AllGather-dedup dispatch ⊕ gate+up GEMM (one launch)
-        if self.fp8 and self.l0_warp:
-            # 方案A: comm 角色寄生在 producer warp 的闲置 lane, GEMM 满 SM;
-            # 协议(pull_order/行块计数/gate)与 tpdisp8 非 warp 版逐字节同构。
-            self.gemm_next.zero_()
-            self.pull_next.zero_()
-            self.tk.moe_tp_dispatch_gemm_fp8_warp(
-                self.pre_tokens, self.pre_scales, self.ag_tokens,
-                self.ag_scales, self.gathered, self.gathered_scales,
-                self.w_gateup_fp8, self.w1_il_scales, self.act, self.padded,
-                self.tp_slots, self.slack, self.pull_order, self.blk_expert,
-                self.gemm_next, self.pull_next, self.barrier_l0,
-                self.num_padded_total, self.num_tokens)
-        elif self.fp8 and self.l0_push:
-            # P2: push 强路径(源侧按消费序推 3 个 peer + per-token seq flag,
-            # 收侧本地 scatter); seq 用 _l0_seq 当前值(每迭代单调 +2)。
-            self.gemm_next.zero_()
-            self.push_next.zero_()
-            self.pull_next.zero_()
-            self.tk.moe_tp_dispatch_gemm_fp8_push(
-                self.pre_tokens, self.pre_scales, self.ag_staging_fp8,
-                self.ag_sscales, self.ag_flags, self.gathered,
-                self.gathered_scales, self.w_gateup_fp8, self.w1_il_scales,
-                self.act, self.padded, self.tp_slots, self.slack,
-                self.pull_order, self.push_order, self.blk_expert,
-                self.gemm_next, self.push_next, self.pull_next,
-                self.barrier_l0, self.num_comm_sms, self.l0_push_sms,
-                self.num_padded_total, self.num_tokens, self._l0_seq,
-                self.l0_scat_warp)
-        elif self.fp8 and self.l0_lane:
-            # P1: per-lane 自由化的 comm 块拉取(inter-SM 几何不变, 只换
-            # 拉取组织方式); 配 TK_COMM_SMS sweep 找新拐点。
-            self.gemm_next.zero_()
-            self.pull_next.zero_()
-            self.tk.moe_tp_dispatch_gemm_fp8_lane(
-                self.pre_tokens, self.pre_scales, self.ag_tokens,
-                self.ag_scales, self.gathered, self.gathered_scales,
-                self.w_gateup_fp8, self.w1_il_scales, self.act, self.padded,
-                self.tp_slots, self.slack, self.pull_order, self.blk_expert,
-                self.gemm_next, self.pull_next, self.barrier_l0,
-                self.num_comm_sms, self.num_padded_total, self.num_tokens)
-        elif self.fp8:
-            # docs/39 P2: fp8 AG(token 4KB + scales 128B)⊕ fp8 dispenser GEMM
-            # ⊕ GLU epilogue(fp32 上 silu*up 直存 bf16 act); L1 保持 bf16。
-            # docs/43: TK_L0_CE=1 时线上字节由 copy engine 拉进本地 ag 缓冲
-            # (0 SM), comm 块只做本地 scatter(按分片 flag 放行)。
-            if self.l0_ce:
-                self.ce_flags.zero_()
-                tk.ce_ag_pull(self.pre_tokens, self.pre_scales,
-                              self.ag_tokens, self.ag_scales, self.ce_flags)
-            self.gemm_next.zero_()
-            tk.moe_tp_dispatch_gemm_fp8(
-                self.pre_tokens, self.pre_scales, self.ag_tokens,
-                self.ag_scales, self.ce_flags, self.gathered,
-                self.gathered_scales, self.w_gateup_fp8, self.w1_il_scales,
-                self.act, self.padded, self.tp_slots, self.slack,
-                self.pull_order, self.blk_expert, self.gemm_next,
-                self.barrier_l0, self.num_comm_sms, self.num_padded_total,
-                self.num_tokens, self.l0_ce)
-        elif self.dispatch_mode == "push":
-            # TP-T1 (docs/23): strong-path push + chunk watermarks + resident
-            # scatter. seq gates the watermark slots (monotonic, no reset).
-            self._l0_seq += 1
-            self.l0_push_cnt.zero_()
-            tk.moe_tp_dispatch_push_gemm(
-                self.pre_tokens, self.ag_staging, self.gathered, self.w_gateup,
-                self.gateup_out, self.padded, self.tp_slots, self.slack,
-                self.push_order, self.l0_push_cnt, self.barrier_l0,
-                self.num_push_sms, max(self.num_comm_sms - self.num_push_sms, 1),
-                self.num_padded_total, self.num_tokens, self._l0_seq)
-        elif self.l0_mode == "v2":
-            # docs/30: dispenser GEMM (comm blocks join after the AG drains) +
-            # fused SwiGLU store (GLU) or plain store + torch silu (rollback).
-            self.gemm_next.zero_()
-            l0_out = self.act if self.l0_glu else self.gateup_out
-            l0_w = self.w_gateup_il if self.l0_glu else self.w_gateup
-            tk.moe_tp_dispatch_gemm_v2(self.pre_tokens, self.gathered, l0_w,
-                                       l0_out, self.padded, self.tp_slots,
-                                       self.slack, self.pull_order,
-                                       self.blk_expert, self.gemm_next,
-                                       self.barrier_l0, self.num_comm_sms,
-                                       self.num_padded_total, self.num_tokens,
-                                       self.l0_glu)
-        else:
-            tk.moe_tp_dispatch_gemm(self.pre_tokens, self.gathered, self.w_gateup,
-                                    self.gateup_out, self.padded, self.tp_slots,
-                                    self.slack, self.pull_order, self.barrier_l0,
-                                    self.num_comm_sms, self.num_padded_total,
-                                    self.num_tokens)
+        # layer0: fp8 AllGather(push)⊕ dispenser GEMM ⊕ SwiGLU epilogue。
+        # seq 用 _l0_seq 当前值(每迭代单调 +2), 到达 flag 因此免清零。
+        self.gemm_next.zero_()
+        self.push_next.zero_()
+        self.pull_next.zero_()
+        tk.moe_tp_dispatch_gemm_fp8_push(
+            self.pre_tokens, self.pre_scales, self.ag_staging_fp8,
+            self.ag_sscales, self.ag_flags, self.gathered,
+            self.gathered_scales, self.w_gateup_fp8, self.w1_il_scales,
+            self.act, self.padded, self.tp_slots, self.slack,
+            self.pull_order, self.push_order, self.blk_expert,
+            self.gemm_next, self.push_next, self.pull_next,
+            self.barrier_l0, self.num_comm_sms, self.l0_push_sms,
+            self.num_padded_total, self.num_tokens, self._l0_seq)
 
-        # silu(gate) * up on the halves — skipped when the GLU store already
-        # produced act inside the L0 GEMM epilogue (docs/30).
-        if not self.l0_glu:
-            inter = self.inter
-            torch.mul(F.silu(self.gateup_out[:, :inter]),
-                      self.gateup_out[:, inter:], out=self.act)
-
-        # layer1: W2 GEMM ⊕ local top-k prered ⊕ push (dense ReduceScatter),
-        # then the source-side reduce over the world partial planes.
+        # layer1: act 量化 -> W2 GEMM ⊕ 本地预归约 ⊕ push(稠密 ReduceScatter),
+        # 然后源卡侧对 world 个 partial plane 做最终归约。
         self._l1_seq += 1
         self.combine_local_cnt.zero_()
         self.job_next.zero_()
-        if self.fp8 and self.l1_fp8 and self.l1_warp:
-            # 方案A: W2 GEMM 满 SM, push 由 producer warp 闲置 lane 流推 +
-            # consumer 团队排空; 信号/选举/watermark 协议与 v1 逐字节同构。
-            tk.rowgroup_quant_fp8(self.act, self.act_fp8, self.act_scales)
-            self.l1_gemm_next.zero_()
-            tk.moe_tp_gemm_prered_push_fp8_warp(
-                self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
-                self.expert_out, self.out_planes, self.padded,
-                self.combine_staging, self.prered_dst, self.tp_slots,
-                self.prered_w, self.combine_local_cnt, self.push_expected_l1,
-                self.blk_expert, self.l1_gemm_next, self.job_order,
-                self.job_next, self.barrier_l1, self.num_padded_total,
-                self.num_tokens, self.num_jobs, self._l1_seq)
-        elif self.fp8 and self.l1_fp8:
-            # docs/42 P3: act 量化(单 kernel)+ fp8 W2 GEMM ⊕ v1 push/排空。
-            # docs/43: TK_L1_CE=1 时归约直写本地 out_planes, 线上搬运与
-            # watermark 由 ce::rs_push(copy engine)完成, final_red 零改动。
-            tk.rowgroup_quant_fp8(self.act, self.act_fp8, self.act_scales)
-            if self.l1_ce:
-                tk.ce_rs_fence()  # 等上一迭代 CE 读完 out_planes(docs/43)
-            self.l1_gemm_next.zero_()
-            tk.moe_tp_gemm_prered_push_fp8(
-                self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
-                self.expert_out, self.out_planes, self.padded,
-                self.combine_staging, self.prered_dst, self.tp_slots,
-                self.prered_w, self.combine_local_cnt, self.push_expected_l1,
-                self.blk_expert, self.l1_gemm_next, self.job_order,
-                self.job_next, self.barrier_l1, self.num_comm_sms_l1,
-                self.num_padded_total, self.num_tokens, self.num_jobs,
-                self._l1_seq, self.l1_ce)
-            if self.l1_ce:
-                self.seq_buf.fill_(self._l1_seq)
-                tk.ce_rs_push(self.out_planes, self.combine_staging,
-                              self.barrier_l1, self.seq_buf, self.num_tokens)
-        elif self.l1_mode == "v2":
-            self.l1_gemm_next.zero_()
-            tk.moe_tp_gemm_prered_push_v2(
-                self.act, self.w2, self.expert_out, self.padded,
-                self.combine_staging, self.prered_dst, self.tp_slots,
-                self.prered_w, self.combine_local_cnt, self.push_expected_l1,
-                self.blk_expert, self.l1_gemm_next, self.job_next,
-                self.barrier_l1, self.num_comm_sms_l1, self.num_padded_total,
-                self.num_tokens, self.num_jobs, self._l1_seq)
-        else:
-            tk.moe_tp_gemm_prered_push(self.act, self.w2, self.expert_out, self.padded,
-                                       self.combine_staging, self.prered_dst,
-                                       self.tp_slots, self.prered_w,
-                                       self.combine_local_cnt, self.push_expected_l1,
-                                       self.job_order, self.job_next,
-                                       self.barrier_l1, self.num_comm_sms_l1,
-                                       self.num_padded_total, self.num_tokens,
-                                       self.num_jobs, self._l1_seq)
+        self.l1_gemm_next.zero_()
+        tk.rowgroup_quant_fp8(self.act, self.act_fp8, self.act_scales)
+        tk.moe_tp_gemm_prered_push_fp8(
+            self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
+            self.expert_out, self.padded,
+            self.combine_staging, self.prered_dst, self.tp_slots,
+            self.prered_w, self.combine_local_cnt, self.push_expected_l1,
+            self.blk_expert, self.l1_gemm_next, self.job_order,
+            self.job_next, self.barrier_l1, self.num_comm_sms_l1,
+            self.num_padded_total, self.num_tokens, self.num_jobs,
+            self._l1_seq)
         tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
                                  self.recv_from, self.combine_out, self.barrier_l1,
                                  self.num_tokens, self._l1_seq)

@@ -22,7 +22,7 @@ python环境(conda)：`/root/miniconda3/envs/vllm-td/bin/python`。
 
 每次开始测试时，先使用 `configs/tp_rtx_pro5000_4gpu_fp8.yaml` 作为主配置和唯一的默认口径。能够通过通用 benchmark 入口执行的测试，命令中必须显式传入 `--config moe_bench/configs/tp_rtx_pro5000_4gpu_fp8.yaml`。
 
-专用测试脚本如果暂时不能直接读取该 YAML，运行前必须逐项核对其模型形状、并行方式、精度、每 rank token 数、warmup、迭代次数和正确性设置与主配置一致。A/B 实验需要覆盖配置时，只覆盖实验所需的最小字段，并把所有覆盖项记录到对应的 run manifest、结果目录和 `HANDOFF.md`，不能静默改变默认测试口径。
+`tools/run_tktp.py` 和 `tools/time_tp_stages.py` 已经直接读这份 YAML，命令行只做最小覆盖并把覆盖项打印出来。新增的专用脚本一律照此办理；确实不能读 YAML 时，运行前必须逐项核对其模型形状、并行方式、精度、每 rank token 数、warmup、迭代次数和正确性设置与主配置一致。A/B 实验需要覆盖配置时，只覆盖实验所需的最小字段，并把所有覆盖项记录到结果目录（`tp_test_results/tp_run_<时间戳>/`）和 `HANDOFF.md`，不能静默改变默认测试口径。
 
 ## 新增MoE实现
 

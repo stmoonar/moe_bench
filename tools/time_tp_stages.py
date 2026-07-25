@@ -1,27 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TP stage attribution (docs/09 methodology): time each stage of the tktp
-run() in lockstep across ranks, plus GEMM-alone references, so the exposed
-comm / drain cost of each fused stage is directly readable:
+"""TP 分阶段归因(方法论见 docs/03):在各 rank 上同步地给 tktp run() 的每个
+阶段计时, 并给出"同 GEMM 纯算"对照, 于是每个融合阶段暴露出来的通信/排空
+成本可以直接读出来:
 
-  L0 exposure = t(L0 fused) - t(L0 GEMM alone)     (AG + gate stalls)
-  L1 exposure = t(L1 fused) - t(L1 GEMM alone)     (prered/push drain)
+  L0 exposure = t(L0 fused) - t(L0 GEMM alone)     (AG + gate 等待)
+  L1 exposure = t(L1 fused) - t(L1 GEMM alone)     (预归约/push 排空)
 
   python -m moe_bench.tools.time_tp_stages [ne] [iters] [tokens_per_rank]
 
-Per-stage numbers are the MAX across ranks (slowest gates), mean over iters.
-cuda.synchronize between stages perturbs overlap slightly but the fused
-kernels themselves run unmodified.
+形状/精度取自主配置 configs/tp_rtx_pro5000_4gpu_fp8.yaml, 只覆盖 CLI 给的
+num_experts / num_tokens / 迭代数。每阶段取**各 rank 的最大值**(最慢者定门),
+再对迭代取均值。阶段间的 cuda.synchronize 会轻微扰动重叠, 但融合 kernel
+本身是原样跑的。
 """
 from __future__ import annotations
 
+import dataclasses
+import os
 import sys
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "configs", "tp_rtx_pro5000_4gpu_fp8.yaml")
 
-def _worker(rank, world, init_method, ne, iters, tokens, fp8):
+
+def _worker(rank, world, init_method, ne, iters, tokens):
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     torch.set_default_device(device)
@@ -29,18 +35,14 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
                             rank=rank, world_size=world, device_id=device)
     dist.all_reduce(torch.tensor([rank], device=device))
 
-    from moe_bench.config import Distribution, MoEBenchConfig, ParallelMode, Precision, RoutingConfig
+    from moe_bench.config import MoEBenchConfig
     from moe_bench.context import DistContext
     from moe_bench.data import make_problem, make_weights
     from moe_bench.tk_tp_scheme import TKFusedTP
-    import torch.nn.functional as F
 
-    cfg = MoEBenchConfig(
-        hidden_size=4096, intermediate_size=3072, num_experts=ne, topk=8,
-        parallel_mode=ParallelMode.TP, world_size=world,
-        precision=Precision.FP8 if fp8 else Precision.BF16,
-        num_tokens=[tokens], routing=RoutingConfig(distribution=Distribution.BALANCED),
-        distributed=True, verify=False, device="cuda")
+    cfg = MoEBenchConfig.from_file(CONFIG)
+    cfg = dataclasses.replace(cfg, num_experts=ne, num_tokens=[tokens],
+                              world_size=world, verify=False)
     ctx = DistContext(rank=rank, world_size=world, local_rank=rank,
                       device=device, group=None)
     weights = make_weights(cfg, rank)
@@ -49,19 +51,14 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
     s.setup(problem, ctx)
 
     # scratch for GEMM-alone references (same shapes as the fused calls)
-    ref_gateup = torch.empty_like(s.gateup_out)
+    ref_gateup = torch.empty(s.num_padded_total, 2 * s.inter, device=device,
+                             dtype=torch.bfloat16)
     ref_expout = torch.empty_like(s.expert_out)
-    ref_act = torch.empty_like(s.act)
     ref_task_next = torch.zeros(1, dtype=torch.int32, device=device)
 
-    stages = ["sched", "tok_copy", "L0_fused", "silu", "L1_fused", "final_red",
-              "L0_gemm_alone", "L1_gemm_alone", "L1_gemm_cm", "L1_gemm_nb",
-              "full_run"]
+    stages = ["sched", "tok_copy", "L0_fused", "L1_fused", "final_red",
+              "L0_gemm_alone", "L1_gemm_alone", "full_run"]
     acc = {k: 0.0 for k in stages}
-    # L1 GEMM 在 "让出 comm 块后的块数" 下的纯算参考(docs/35): 把 L1_fused
-    # 分解为 "GEMM@(sm-comm) + 真实排空尾", 裁决 L1 还有没有肉。
-    nb_blocks = torch.cuda.get_device_properties(device).multi_processor_count \
-        - s.num_comm_sms_l1
 
     def timed(key, fn):
         dist.barrier()
@@ -88,209 +85,91 @@ def _worker(rank, world, init_method, ne, iters, tokens, fp8):
         def st_copy():
             s._l0_seq += 1
             s.tk.pcie_device_barrier(s.barrier_l0, s._l0_seq)
-            if s.fp8:  # 源端 1×128 量化(docs/41: 单 kernel, 与 scheme.run 相同)
-                s.tk.rowgroup_quant_fp8(s.problem.hidden_states,
-                                        s.pre_tokens.data_, s.pre_scales.data_)
-            else:
-                s.pre_tokens.data_.copy_(s.problem.hidden_states)
+            s.tk.rowgroup_quant_fp8(s.problem.hidden_states,
+                                    s.pre_tokens.data_, s.pre_scales.data_)
             s._l0_seq += 1
             s.tk.pcie_device_barrier(s.barrier_l0, s._l0_seq)
         timed("tok_copy", st_copy)
 
         def st_l0():
-            if s.fp8 and getattr(s, "l0_push", False):
-                # P2: push 强路径(TK_L0_PUSH=1), 与 scheme.run 相同
-                s.gemm_next.zero_()
-                s.push_next.zero_()
-                s.pull_next.zero_()
-                s.tk.moe_tp_dispatch_gemm_fp8_push(
-                    s.pre_tokens, s.pre_scales, s.ag_staging_fp8,
-                    s.ag_sscales, s.ag_flags, s.gathered, s.gathered_scales,
-                    s.w_gateup_fp8, s.w1_il_scales, s.act, s.padded,
-                    s.tp_slots, s.slack, s.pull_order, s.push_order,
-                    s.blk_expert, s.gemm_next, s.push_next, s.pull_next,
-                    s.barrier_l0, s.num_comm_sms, s.l0_push_sms,
-                    s.num_padded_total, s.num_tokens, s._l0_seq,
-                    getattr(s, "l0_scat_warp", False))
-            elif s.fp8 and getattr(s, "l0_lane", False):
-                # P1: per-lane comm 块(TK_L0_LANE=1), 与 scheme.run 相同
-                s.gemm_next.zero_()
-                s.pull_next.zero_()
-                s.tk.moe_tp_dispatch_gemm_fp8_lane(
-                    s.pre_tokens, s.pre_scales, s.ag_tokens, s.ag_scales,
-                    s.gathered, s.gathered_scales, s.w_gateup_fp8,
-                    s.w1_il_scales, s.act, s.padded, s.tp_slots, s.slack,
-                    s.pull_order, s.blk_expert, s.gemm_next, s.pull_next,
-                    s.barrier_l0, s.num_comm_sms, s.num_padded_total,
-                    s.num_tokens)
-            elif s.fp8:
-                if s.l0_ce:
-                    s.ce_flags.zero_()
-                    s.tk.ce_ag_pull(s.pre_tokens, s.pre_scales,
-                                    s.ag_tokens, s.ag_scales, s.ce_flags)
-                s.gemm_next.zero_()
-                s.tk.moe_tp_dispatch_gemm_fp8(
-                    s.pre_tokens, s.pre_scales, s.ag_tokens, s.ag_scales,
-                    s.ce_flags, s.gathered, s.gathered_scales,
-                    s.w_gateup_fp8, s.w1_il_scales, s.act, s.padded,
-                    s.tp_slots, s.slack, s.pull_order, s.blk_expert,
-                    s.gemm_next, s.barrier_l0, s.num_comm_sms,
-                    s.num_padded_total, s.num_tokens, s.l0_ce)
-            elif s.dispatch_mode == "push":
-                s._l0_seq += 1
-                s.l0_push_cnt.zero_()
-                s.tk.moe_tp_dispatch_push_gemm(
-                    s.pre_tokens, s.ag_staging, s.gathered, s.w_gateup,
-                    s.gateup_out, s.padded, s.tp_slots, s.slack, s.push_order,
-                    s.l0_push_cnt, s.barrier_l0, s.num_push_sms,
-                    max(s.num_comm_sms - s.num_push_sms, 1),
-                    s.num_padded_total, s.num_tokens, s._l0_seq)
-            elif s.l0_mode == "v2":
-                s.gemm_next.zero_()
-                l0_out = s.act if s.l0_glu else s.gateup_out
-                l0_w = s.w_gateup_il if s.l0_glu else s.w_gateup
-                s.tk.moe_tp_dispatch_gemm_v2(
-                    s.pre_tokens, s.gathered, l0_w, l0_out, s.padded,
-                    s.tp_slots, s.slack, s.pull_order, s.blk_expert,
-                    s.gemm_next, s.barrier_l0, s.num_comm_sms,
-                    s.num_padded_total, s.num_tokens, s.l0_glu)
-            else:
-                s.tk.moe_tp_dispatch_gemm(
-                    s.pre_tokens, s.gathered, s.w_gateup, s.gateup_out, s.padded,
-                    s.tp_slots, s.slack, s.pull_order, s.barrier_l0,
-                    s.num_comm_sms, s.num_padded_total, s.num_tokens)
+            s.gemm_next.zero_()
+            s.push_next.zero_()
+            s.pull_next.zero_()
+            s.tk.moe_tp_dispatch_gemm_fp8_push(
+                s.pre_tokens, s.pre_scales, s.ag_staging_fp8,
+                s.ag_sscales, s.ag_flags, s.gathered, s.gathered_scales,
+                s.w_gateup_fp8, s.w1_il_scales, s.act, s.padded,
+                s.tp_slots, s.slack, s.pull_order, s.push_order,
+                s.blk_expert, s.gemm_next, s.push_next, s.pull_next,
+                s.barrier_l0, s.num_comm_sms, s.l0_push_sms,
+                s.num_padded_total, s.num_tokens, s._l0_seq)
         timed("L0_fused", st_l0)
-
-        # GLU 路径下 silu 已并入 L0 GEMM epilogue,此阶段为 0(docs/30)
-        if s.l0_glu:
-            timed("silu", lambda: None)
-        else:
-            timed("silu", lambda: torch.mul(
-                F.silu(s.gateup_out[:, :s.inter]), s.gateup_out[:, s.inter:], out=s.act))
 
         def st_l1():
             s._l1_seq += 1
             s.combine_local_cnt.zero_()
             s.job_next.zero_()
-            if s.fp8 and s.l1_fp8:
-                s.tk.rowgroup_quant_fp8(s.act, s.act_fp8, s.act_scales)
-                if s.l1_ce:
-                    s.tk.ce_rs_fence()
-                s.l1_gemm_next.zero_()
-                s.tk.moe_tp_gemm_prered_push_fp8(
-                    s.act_fp8, s.act_scales, s.w2_fp8, s.w2_scales,
-                    s.expert_out, s.out_planes, s.padded, s.combine_staging,
-                    s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
-                    s.push_expected_l1, s.blk_expert, s.l1_gemm_next,
-                    s.job_order, s.job_next, s.barrier_l1, s.num_comm_sms_l1,
-                    s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq,
-                    s.l1_ce)
-                if s.l1_ce:
-                    s.seq_buf.fill_(s._l1_seq)
-                    s.tk.ce_rs_push(s.out_planes, s.combine_staging,
-                                    s.barrier_l1, s.seq_buf, s.num_tokens)
-            elif s.l1_mode == "v2":
-                s.l1_gemm_next.zero_()
-                s.tk.moe_tp_gemm_prered_push_v2(
-                    s.act, s.w2, s.expert_out, s.padded, s.combine_staging,
-                    s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
-                    s.push_expected_l1, s.blk_expert, s.l1_gemm_next, s.job_next,
-                    s.barrier_l1, s.num_comm_sms_l1, s.num_padded_total,
-                    s.num_tokens, s.num_jobs, s._l1_seq)
-            else:
-                s.tk.moe_tp_gemm_prered_push(
-                    s.act, s.w2, s.expert_out, s.padded, s.combine_staging,
-                    s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
-                    s.push_expected_l1, s.job_order, s.job_next, s.barrier_l1,
-                    s.num_comm_sms_l1, s.num_padded_total, s.num_tokens, s.num_jobs,
-                    s._l1_seq)
+            s.l1_gemm_next.zero_()
+            s.tk.rowgroup_quant_fp8(s.act, s.act_fp8, s.act_scales)
+            s.tk.moe_tp_gemm_prered_push_fp8(
+                s.act_fp8, s.act_scales, s.w2_fp8, s.w2_scales,
+                s.expert_out, s.padded, s.combine_staging,
+                s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
+                s.push_expected_l1, s.blk_expert, s.l1_gemm_next,
+                s.job_order, s.job_next, s.barrier_l1, s.num_comm_sms_l1,
+                s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq)
         timed("L1_fused", st_l1)
 
         timed("final_red", lambda: s.tk.moe_final_reduce_push(
             s.combine_staging, s.final_contrib, s.recv_from, s.combine_out,
             s.barrier_l1, s.num_tokens, s._l1_seq))
 
-        # references: same GEMMs, no comm/prered (gathered/act already populated).
-        # GLU 路径的 L0 参考 = 同款 dispenser+GLU store 的纯算版(苹果对苹果:
-        # L0_fused 里已含 silu,参考也得含),否则退回 plain grouped_gemm。
-        if s.fp8:
-            # gg8 是 plain store(输出 (P, 2I)), 少了 GLU epilogue —— bf16 实测
-            # GLU 在 GEMM 级零开销(969 vs 978), 参考仍然苹果对苹果。
-            def st_l0_alone_fp8():
-                ref_task_next.zero_()
-                s.tk.grouped_gemm_fp8(s.gathered, s.gathered_scales,
-                                      s.w_gateup_fp8, s.w1_il_scales, ref_gateup,
-                                      s.padded, s.blk_expert, ref_task_next, 0, False)
-            timed("L0_gemm_alone", st_l0_alone_fp8)
-        elif s.l0_glu:
-            def st_l0_alone():
-                ref_task_next.zero_()
-                s.tk.grouped_gemm_glu(s.gathered, s.w_gateup_il, ref_act,
-                                      s.padded, s.blk_expert, ref_task_next, 0)
-            timed("L0_gemm_alone", st_l0_alone)
-        else:
-            timed("L0_gemm_alone", lambda: s.tk.grouped_gemm(
-                s.gathered, s.w_gateup, ref_gateup, s.padded, 0))
-        if s.fp8 and s.l1_fp8:
-            def st_l1_alone_fp8():
-                ref_task_next.zero_()
-                s.tk.grouped_gemm_fp8(s.act_fp8, s.act_scales, s.w2_fp8,
-                                      s.w2_scales, ref_expout, s.padded,
-                                      s.blk_expert, ref_task_next, 0, False)
-            timed("L1_gemm_alone", st_l1_alone_fp8)
-        else:
-            timed("L1_gemm_alone", lambda: s.tk.grouped_gemm(
-                s.act, s.w2, ref_expout, s.padded, 0))
+        # 参考: 同样的 GEMM, 没有通信/预归约(gathered / act 已经是填好的)。
+        # gg8 是 plain store(输出 (P, 2I)), 少了 GLU epilogue —— 实测 GLU 在
+        # GEMM 级零开销, 参考仍然苹果对苹果。
+        def st_l0_alone():
+            ref_task_next.zero_()
+            s.tk.grouped_gemm_fp8(s.gathered, s.gathered_scales,
+                                  s.w_gateup_fp8, s.w1_il_scales, ref_gateup,
+                                  s.padded, s.blk_expert, ref_task_next, 0, False)
+        timed("L0_gemm_alone", st_l0_alone)
 
-        # 列外层换序的纯算对照(docs/33)与 nb 让渡对照(docs/35)——
-        # bf16 专用参考(L1 fp8 模式下 bf16 w2 不存在, 置 0 跳过)。
-        if s.fp8 and s.l1_fp8:
-            timed("L1_gemm_cm", lambda: None)
-            timed("L1_gemm_nb", lambda: None)
-        else:
-            def st_l1_cm():
-                ref_task_next.zero_()
-                s.tk.grouped_gemm_cm(s.act, s.w2, ref_expout, s.padded,
-                                     s.blk_expert, ref_task_next, 0)
-            timed("L1_gemm_cm", st_l1_cm)
-            timed("L1_gemm_nb", lambda: s.tk.grouped_gemm_nb(
-                s.act, s.w2, ref_expout, s.padded, 0, nb_blocks))
+        def st_l1_alone():
+            ref_task_next.zero_()
+            s.tk.grouped_gemm_fp8(s.act_fp8, s.act_scales, s.w2_fp8,
+                                  s.w2_scales, ref_expout, s.padded,
+                                  s.blk_expert, ref_task_next, 0, False)
+        timed("L1_gemm_alone", st_l1_alone)
 
         timed("full_run", s.run)
 
     t = torch.tensor([acc[k] / iters for k in stages], device=device)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     if rank == 0:
-        print(f"\n== tktp stage attribution (NE={ne}, T={tokens}, iters={iters}, "
-              f"{'fp8, ' if s.fp8 else ''}dispatch={s.dispatch_mode}, l0={s.l0_mode}"
-              f"{'+glu' if s.l0_glu else ''}, l1={s.l1_mode}, "
-              f"comm_sms={s.num_comm_sms}, "
-              f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.num_push_sms}, "
+        print(f"\n== tktp stage attribution (fp8, NE={ne}, T={tokens}, "
+              f"iters={iters}, comm_sms={s.num_comm_sms}, "
+              f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.l0_push_sms}, "
               f"max over ranks, us) ==")
         for k, v in zip(stages, t.tolist()):
             print(f"  {k:14} {v:10.1f}")
-        l0 = dict(zip(stages, t.tolist()))
-        print(f"  -> L0 exposure {l0['L0_fused'] - l0['L0_gemm_alone']:10.1f}")
-        print(f"  -> L1 exposure {l0['L1_fused'] - l0['L1_gemm_alone']:10.1f}")
-        print(f"  -> L1 exp(vs cm){l0['L1_fused'] - l0['L1_gemm_cm']:9.1f}"
-              f"  (cm-rm delta {l0['L1_gemm_cm'] - l0['L1_gemm_alone']:+.1f})")
-        print(f"  -> L1 tail(vs nb@{nb_blocks}){l0['L1_fused'] - l0['L1_gemm_nb']:6.1f}"
-              f"  (SM-yield {l0['L1_gemm_nb'] - l0['L1_gemm_alone']:+.1f})")
-        print(f"  -> stage sum   {sum(l0[k] for k in stages[:6]):10.1f} "
-              f"(vs full_run {l0['full_run']:.1f})")
+        r = dict(zip(stages, t.tolist()))
+        print(f"  -> L0 exposure {r['L0_fused'] - r['L0_gemm_alone']:10.1f}")
+        print(f"  -> L1 exposure {r['L1_fused'] - r['L1_gemm_alone']:10.1f}")
+        print(f"  -> stage sum   {sum(r[k] for k in stages[:5]):10.1f} "
+              f"(vs full_run {r['full_run']:.1f})")
     dist.destroy_process_group()
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "fp8"]
-    fp8 = "fp8" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
     ne = int(args[0]) if len(args) > 0 else 64
     iters = int(args[1]) if len(args) > 1 else 20
     tokens = int(args[2]) if len(args) > 2 else 512
-    world = 4
+    from moe_bench.config import MoEBenchConfig
+    world = MoEBenchConfig.from_file(CONFIG).world_size
     from vllm.utils.network_utils import get_open_port
     init_method = f"tcp://localhost:{get_open_port()}"
-    mp.spawn(_worker, args=(world, init_method, ne, iters, tokens, fp8),
+    mp.spawn(_worker, args=(world, init_method, ne, iters, tokens),
              nprocs=world, join=True)
 
 

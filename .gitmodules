@@ -1,6 +1,3 @@
 [submodule "ThunderKittens"]
 	path = ThunderKittens
 	url = https://github.com/HazyResearch/ThunderKittens.git
-[submodule "cutlass"]
-	path = cutlass
-	url = https://github.com/NVIDIA/cutlass.git

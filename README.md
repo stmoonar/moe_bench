@@ -3,12 +3,33 @@
 A config-driven micro-benchmark for vLLM's MoE (Mixture-of-Experts) layer.
 
 The **baseline** is vLLM's *naive* fused-MoE — the same Triton `fused_experts`
-path the unquantized/native MoE method dispatches to. Future efficient
-implementations plug into the same harness (identical inputs, identical output
-contract) so their numbers are directly comparable.
+path the unquantized/native MoE method dispatches to. Efficient implementations
+plug into the same harness (identical inputs, identical output contract) so
+their numbers are directly comparable.
 
 Defaults match **DeepSeek V3.2** (`hidden=7168`, `intermediate=2048`,
 `experts=256`, `topk=8`).
+
+## 本仓库的被测实现：`tktp`
+
+除了 serial baseline，这里有一个 **通信/计算融合** 的 MoE 层实现
+[`tk_tp_scheme.py`](tk_tp_scheme.py)（scheme 名 `tktp`，kernel 在
+[`kernels/tk/tk_moe.cu`](kernels/tk/tk_moe.cu)）：AllGather 与 gate+up GEMM
+融进一个 persistent kernel，W2 GEMM 与 ReduceScatter 融进另一个，通信以
+token / row block / GEMM tile 为粒度推进，而不是把 GEMM 切 chunk 放到别的
+stream 上做粗粒度 overlap。目标平台是 **RTX PRO 5000（SM120）PCIe 四卡**，
+精度 FP8（w8a8，block `[128,128]`）。
+
+唯一默认口径是 [`configs/tp_rtx_pro5000_4gpu_fp8.yaml`](configs/tp_rtx_pro5000_4gpu_fp8.yaml)：
+
+```bash
+# 从 moe_bench 的上一级目录运行
+python -m moe_bench.bench --config moe_bench/configs/tp_rtx_pro5000_4gpu_fp8.yaml \
+    --distributed --scheme tktp
+```
+
+设计、性能账、平台边界和测试流程见 [`docs/`](docs/README.md)，当前进度见
+[`HANDOFF.md`](HANDOFF.md)。
 
 ## Two modes
 
@@ -144,8 +165,9 @@ python -m moe_bench.bench --config moe_bench/configs/deepseek_v32.yaml \
 # 8-GPU TP layer benchmark (bf16):
 python -m moe_bench.bench --distributed --mode tp --world-size 8
 
-# your own overlap / fused-layer scheme:
-python -m moe_bench.bench --distributed --mode ep --world-size 8 --scheme overlap
+# the fused TP scheme in this repo (FP8, 4 GPUs — see the main config):
+python -m moe_bench.bench --config moe_bench/configs/tp_rtx_pro5000_4gpu_fp8.yaml \
+    --distributed --scheme tktp
 ```
 
 The harness launches the processes itself (via `torch.multiprocessing.spawn`),
@@ -217,5 +239,12 @@ distributed path.
 | `schemes.py` | `DistributedScheme` interface + serial full-layer baseline (comm + compute) |
 | `distributed.py` | Multi-GPU harness: spawns ranks, runs a scheme, times + verifies full layer |
 | `report.py` | Shared table/JSON reporting for both modes |
-| `configs/deepseek_v32.yaml` | Default config (DeepSeek V3.2) |
+| `tk_tp_scheme.py` | 融合实现 `tktp`：host/GPU 调度表 + 两个融合 kernel 的编排 |
+| `kernels/tk/tk_moe.cu` | 融合 kernel（L0 AG⊕GEMM⊕SwiGLU、L1 GEMM⊕预归约⊕push、最终归约） |
+| `kernels/tileoverlap/common/sm120_common.cuh` | PCIe 同步原语 + FP8 grouped GEMM 引擎（**改这份，不要改 build 时拷过去的副本**） |
+| `kernels/tk/build.py` | 按 world size / hidden / row block 编译并加载扩展 |
+| `tools/` | 预检、驱动、分阶段归因、GEMM 裁决、故障注入、一键回归 |
+| `configs/deepseek_v32.yaml` | Harness 通用默认配置（DeepSeek V3.2） |
+| `configs/tp_rtx_pro5000_4gpu_fp8.yaml` | **本仓库唯一默认测试口径**（TP/FP8/4 卡/512 token per rank） |
+| `docs/` | 现状、架构、优化方法论、平台边界与负结果、测试指南、死锁兜底 |
 | `ADDING_IMPLEMENTATIONS.md` | How to plug in and correctness-check a new MoE kernel |

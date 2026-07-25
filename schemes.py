@@ -155,12 +155,6 @@ def _register_optional_schemes() -> None:
     import sys as _sys
     import traceback as _tb
     try:
-        from .tk_scheme import TKFusedEP
-        SCHEMES[TKFusedEP.name] = TKFusedEP
-    except Exception:
-        print("[schemes] tkfused unavailable:", file=_sys.stderr)
-        _tb.print_exc()
-    try:
         from .tk_tp_scheme import TKFusedTP
         SCHEMES[TKFusedTP.name] = TKFusedTP
     except Exception:

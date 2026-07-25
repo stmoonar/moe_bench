@@ -157,6 +157,13 @@ Output must be this rank's `num_tokens` rows after combine.
 It uses plain `torch.distributed` collectives and vLLM's `fused_experts` — no
 modular-kernel machinery — so the layer is transparent and easy to fork.
 
+### A worked example
+
+[`tk_tp_scheme.py`](tk_tp_scheme.py)（`--scheme tktp`）是本仓库里真正做通算融合的
+scheme：`setup` 里建调度表、编译加载 CUDA 扩展、分配 IPC 对称缓冲，`run` 里只发
+三个 kernel（L0 融合、L1 融合、最终归约）。写自己的 scheme 时可以照它的分工：
+**所有一次性准备放 setup（不计时），run 必须无分配、可重复调用**。
+
 ### Correctness
 
 Distributed schemes are verified too (unless `--no-verify`): each rank's combined

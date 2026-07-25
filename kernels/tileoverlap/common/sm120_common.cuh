@@ -6,14 +6,15 @@
  *   1. pcie_sync — cross-device synchronization that is legal on PCIe:
  *      plain st.release.sys writes into per-writer slots + local polling.
  *      NO remote atomics, NO multimem (neither exists on this platform).
- *   2. grouped_gemm_sm120 — a persistent grouped-GEMM device function built
- *      on warp-level mma.sync (SM120 has no wgmma/tcgen05), TMA loads and a
- *      3-stage smem pipeline sized for the 99KB smem budget. The producer
+ *   2. grouped_gemm_sm120_fp8_dispenser — the persistent FP8 grouped-GEMM
+ *      device function every fused kernel is built on: warp-level mma.sync
+ *      (SM120 has no wgmma/tcgen05), TMA loads, a 4-stage smem pipeline
+ *      inside the 99KB budget, and an atomic task dispenser. The producer
  *      warp calls a caller-supplied Gate before touching each row block,
  *      which is where communication readiness gets fused in.
  *
- * Design references: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
- * (structure) and experience/12_SM120与PCIe拓扑适配.md (platform constraints).
+ * 平台约束(无远端原子/无 multimem/TMA 是驱动 syscall)见 docs/04;
+ * GEMM 主循环与寄存器预算的推导见 docs/03。
  */
 
 #pragma once
@@ -112,389 +113,23 @@ __device__ static inline void wait_slot(const BAR &bar, const int my_dev, const 
 
 } // namespace pcie_sync
 
-/* ==========================================================================
- * 2. SM120 grouped GEMM (persistent, TMA + warp-level mma.sync)
- * ======================================================================== */
+struct noop_epilogue { __device__ inline void operator()(int, int) const {} };
 
-struct gemm_config {
-    // ROW_BLOCK is the tokens-per-tile AND the expert padding unit. Compile-time
-    // switchable via -DTK_ROW_BLOCK (T5, docs/16): 128 (default) or 64. At 64 the
-    // per-expert padding halves (NE=256: 64 real tokens no longer pad to 128), so
-    // both GEMM layers compute ~half the rows. CONSUMER_WARPS = ROW_BLOCK/16 keeps
-    // each warp on one 16-row strip (rt_fl<16,COL_BLOCK> accumulator). Note WG=4
-    // (ROW_BLOCK=64) makes group::store's warpgroup-interleave map to identity
-    // (w/4 + (w%4)*(WG/4) == w), unlike WG=8; the consumer load uses the same
-    // store_strip formula so it stays correct either way (docs/05).
+/* ROW_BLOCK = 每个 tile 的 token 行数, 同时是 expert 的 padding 单位。
+ * 编译期开关 -DTK_ROW_BLOCK: 128(默认)或 64。64 时每 expert 的 padding
+ * 减半, 但 B tile 重载翻倍 —— 实测净负(docs/09), 保留开关只为复现。
+ * CONSUMER_WARPS = ROW_BLOCK/16 让每个 warp 固定负责一条 16 行带。 */
 #ifndef TK_ROW_BLOCK
 #define TK_ROW_BLOCK 128
 #endif
-    static constexpr int ROW_BLOCK = TK_ROW_BLOCK;
-    static constexpr int COL_BLOCK = 128;  // output columns per tile
-    static constexpr int RED_BLOCK = 64;   // K-dim chunk per pipeline stage
-    static constexpr int PIPELINE_STAGES = 3; // 3 x 32KB = 96KB <= 99KB smem
-
-    static constexpr int CONSUMER_WARPS = ROW_BLOCK / 16; // each owns a 16-row strip
-    static constexpr int NUM_WARPS = CONSUMER_WARPS + 1; // +1 producer warp
-    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS; // 288 (WG=8) / 160 (WG=4)
-
-    static constexpr int MAX_LOCAL_EXPERTS = 256;
-
-    using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>; // 16 KB (WG=8) / 8 KB (WG=4)
-    using B_tile = st_bf<RED_BLOCK, COL_BLOCK>; // 16 KB
-
-    struct pipeline_inputs {
-        A_tile A;
-        B_tile B;
-    };
-
-    static constexpr int DYNAMIC_SHARED_MEMORY = PIPELINE_STAGES * sizeof(pipeline_inputs);
-};
-
-/**
- * Grouped GEMM over the local experts:
- *   outputs[row_range(e), :] = activations[row_range(e), :] @ weights[e, :, :]
- * where row ranges come from the (128-aligned) padded_tokens_per_expert prefix sums.
- *
- * Globals requirements (duck-typed):
- *   G.activations : gl<bf16, 1, 1, -1(tokens), -1(H), ..., gemm_config::A_tile>
- *   G.weights     : gl<bf16, 1, -1(E), -1(H), -1(I), gemm_config::B_tile>
- *   G.outputs     : gl<bf16, 1, 1, -1(tokens), -1(I)>   (register-path store, no TMA type needed)
- *   G.padded_tokens_per_expert : gl<int, 1, 1, 1, -1>   (global expert ids)
- *   G.num_local_experts, G.expert_offset : int
- *
- * Gate: `__device__ void operator()(int row_idx) const` — called by the
- * producer warp once per (row block, col block) task BEFORE issuing any load
- * for that task. Spin here until the 128-token row block `row_idx` is ready.
- * Pass a no-op for the compute-only baseline.
- *
- * Assumptions: H % (PIPELINE_STAGES * RED_BLOCK) == 0 is NOT required, but
- * H % RED_BLOCK == 0, I % COL_BLOCK == 0, and per-expert padding to
- * ROW_BLOCK are.
- */
-template <typename Globals, typename Gate>
-__device__ inline void grouped_gemm_sm120(const Globals &G, const Gate &gate, const int sm_idx, const int num_sms) {
-    struct no_epilogue { __device__ inline void operator()(int, int) const {} };
-    grouped_gemm_sm120(G, gate, no_epilogue{}, sm_idx, num_sms);
-}
-
-/* ---- output store policies (docs/30) -------------------------------------
- * The consumer group's register->global store is a policy so layer0 can fuse
- * the SwiGLU activation into the GEMM epilogue instead of a separate torch
- * silu pass over 75MB of HBM traffic. Called by EVERY consumer warp with its
- * own accumulator (group<CONSUMER_WARPS>::store composes the full tile). */
-
-/** Default: store the full COL_BLOCK-wide fp32 accumulator as bf16.
- *  COL 模板化: bf16 128 / fp8 64(docs/10 §7) 共用; group::store 的 tile
- *  坐标随 rt 宽度自动缩放。 */
-template <typename OutGL>
-struct plain_store_policy {
-    const OutGL &out;
-    template <int COL = gemm_config::COL_BLOCK>
-    __device__ inline void operator()(rt_fl<16, COL> &acc,
-                                      int row_idx, int col_idx) const {
-        kittens::group<gemm_config::CONSUMER_WARPS>::store(out, acc, {row_idx, col_idx});
-    }
-};
-
-/** SwiGLU store: weights are column-INTERLEAVED so each output tile holds
- * [gate | up] halves of the SAME intermediate columns ([gate64|up64] per
- * 128-col block for bf16; [gate32|up32] per 64-col block for fp8, docs/10 §7).
- * Compute act = silu(gate) * up in fp32 registers and store the half-width
- * act tile at the same tile coordinate (tile units follow rt width).
- * More accurate than the old path (silu on fp32 accs, not on rounded bf16).
- * NOTE: the A-load strip permutation (store_strip, docs/05) depends only on
- * CONSUMER_WARPS, not tile width, so acc rows line up for the half-width
- * store exactly as for the full-width one. */
-template <typename OutGL>
-struct glu_store_policy {
-    const OutGL &out;
-    template <int COL = gemm_config::COL_BLOCK>
-    __device__ inline void operator()(rt_fl<16, COL> &acc,
-                                      int row_idx, int col_idx) const {
-        constexpr int HW = COL / 32;  // half-width in 16-col base tiles
-        rt_fl<16, COL / 2> act;
-        #pragma unroll
-        for (int j = 0; j < HW; j++) {
-            #pragma unroll
-            for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
-                const float2 g = acc.tiles[0][j].data[k];
-                const float2 u = acc.tiles[0][j + HW].data[k];
-                float2 r;
-                r.x = (g.x / (1.0f + __expf(-g.x))) * u.x;
-                r.y = (g.y / (1.0f + __expf(-g.y))) * u.y;
-                act.tiles[0][j].data[k] = r;
-            }
-        }
-        kittens::group<gemm_config::CONSUMER_WARPS>::store(out, act, {row_idx, col_idx});
-    }
-};
-
-/**
- * Same as above, plus an output Epilogue functor called by the consumer group
- * right after each (row_idx, col_idx) tile is stored to G.outputs. Signature:
- *   `__device__ void operator()(int row_idx, int col_idx) const`
- * All consumer threads reach it; the functor guards to a single thread as
- * needed. This is where layer1 fuses in the "tile written -> signal source
- * cards" step. Pass no_epilogue (default overload above) for plain GEMM.
- */
-template <typename Globals, typename Gate, typename Epilogue>
-__device__ inline void grouped_gemm_sm120(const Globals &G, const Gate &gate, const Epilogue &epilogue, const int sm_idx, const int num_sms) {
-    using cfg = gemm_config;
-    using consumers = kittens::group<cfg::CONSUMER_WARPS>;
-
-    // Shared memory
-    extern __shared__ int __shm[];
-    tma_swizzle_allocator allocator((int*)&__shm[0]);
-    typename cfg::pipeline_inputs (&inputs)[cfg::PIPELINE_STAGES] =
-        allocator.allocate<typename cfg::pipeline_inputs, cfg::PIPELINE_STAGES>();
-
-    // Per-expert padded token counts (small, cached in smem)
-    __shared__ int padded_tokens_smem[cfg::MAX_LOCAL_EXPERTS];
-    for (int i = threadIdx.x; i < G.num_local_experts; i += blockDim.x)
-        padded_tokens_smem[i] = G.padded_tokens_per_expert[{G.expert_offset + i}];
-
-    // Pipeline mbarriers
-    __shared__ semaphore inputs_arrived[cfg::PIPELINE_STAGES];
-    __shared__ semaphore inputs_finished[cfg::PIPELINE_STAGES];
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < cfg::PIPELINE_STAGES; ++i) {
-            init_semaphore(inputs_arrived[i], 0, 1);                   // TMA transaction count
-            init_semaphore(inputs_finished[i], 0, cfg::CONSUMER_WARPS); // one arrive per consumer warp
-        }
-    }
-    __syncthreads();
-
-    // Common variables
-    const int warp_id = kittens::warpid();
-    const int lane_id = kittens::laneid();
-    const int num_iters = static_cast<int>(G.activations.cols()) / cfg::RED_BLOCK;
-    const int col_blocks = static_cast<int>(G.weights.cols()) / cfg::COL_BLOCK;
-    int stage = 0;
-    uint32_t phasebits = 0xFFFF0000;
-
-    if (warp_id == cfg::CONSUMER_WARPS) {
-        // ------------------------------------------------------ producer warp
-        if (lane_id == 0) {
-            for (int task_id = sm_idx, cum = 0, e = 0; e < G.num_local_experts; e++) {
-                const int row_block_start = cum / cfg::ROW_BLOCK;
-                cum += padded_tokens_smem[e];
-                const int row_block_end = (cum + cfg::ROW_BLOCK - 1) / cfg::ROW_BLOCK;
-                const int num_blocks = (row_block_end - row_block_start) * col_blocks;
-
-                for (; task_id < num_blocks; task_id += num_sms) {
-                    const int row_idx = task_id / col_blocks + row_block_start;
-                    const int col_idx = task_id % col_blocks;
-
-                    gate(row_idx); // <-- communication readiness fuses in here
-
-                    for (int red_idx = 0; red_idx < num_iters; red_idx++) {
-                        wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                        update_phasebit<1>(phasebits, stage);
-                        tma::expect_bytes(inputs_arrived[stage], sizeof(typename cfg::pipeline_inputs));
-                        tma::load_async(inputs[stage].A, G.activations, {row_idx, red_idx}, inputs_arrived[stage]);
-                        tma::load_async(inputs[stage].B, G.weights, {e, red_idx, col_idx}, inputs_arrived[stage]);
-                        stage = (stage + 1) % cfg::PIPELINE_STAGES;
-                    }
-                }
-                task_id -= num_blocks;
-            }
-        }
-    } else {
-        // ---------------------------------------------------- consumer warps
-        for (int task_id = sm_idx, cum = 0, e = 0; e < G.num_local_experts; e++) {
-            const int row_block_start = cum / cfg::ROW_BLOCK;
-            cum += padded_tokens_smem[e];
-            const int row_block_end = (cum + cfg::ROW_BLOCK - 1) / cfg::ROW_BLOCK;
-            const int num_blocks = (row_block_end - row_block_start) * col_blocks;
-
-            for (; task_id < num_blocks; task_id += num_sms) {
-                const int row_idx = task_id / col_blocks + row_block_start;
-                const int col_idx = task_id % col_blocks;
-
-                rt_fl<16, cfg::COL_BLOCK> acc;
-                warp::zero(acc);
-
-                // group<8>::store permutes the row strip a warp writes to:
-                // local_warpid = w/4 + (w%4)*(WARPS/4) (warpgroup interleave, since
-                // CONSUMER_WARPS%4==0). We must therefore COMPUTE the rows we will
-                // STORE, i.e. load A from the same permuted 16-row strip — otherwise
-                // every warp but 0 lands in the wrong rows.
-                constexpr int WG = cfg::CONSUMER_WARPS;
-                const int store_strip = (WG % 4 == 0) ? (warp_id / 4 + (warp_id % 4) * (WG / 4)) : warp_id;
-
-                for (int red_idx = 0; red_idx < num_iters; red_idx++) {
-                    wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
-                    update_phasebit<0>(phasebits, stage);
-                    #pragma unroll
-                    for (int kk = 0; kk < cfg::RED_BLOCK / 16; kk++) {
-                        rt_bf<16, 16> a_reg;
-                        auto a_sub = inputs[stage].A.template subtile<16, 16>({store_strip, kk});
-                        warp::load(a_reg, a_sub);
-                        rt_bf<16, cfg::COL_BLOCK, ducks::rt_layout::col> b_reg;
-                        auto b_sub = inputs[stage].B.template subtile<16, cfg::COL_BLOCK>({kk, 0});
-                        warp::load(b_reg, b_sub);
-                        warp::mma_AB(acc, a_reg, b_reg, acc);
-                    }
-                    warp::arrive(inputs_finished[stage]);
-                    stage = (stage + 1) % cfg::PIPELINE_STAGES;
-                }
-
-                // Register -> global store (float->bf16 conversion happens inside).
-                // Each consumer warp writes its own 16-row strip; group<8> composes 128x128.
-                consumers::store(G.outputs, acc, {row_idx, col_idx});
-                consumers::sync(0); // all strips of this tile are in global before we signal
-                epilogue(row_idx, col_idx);
-            }
-            task_id -= num_blocks;
-        }
-    }
-}
-
-/**
- * Dispenser-fed grouped GEMM (docs/30). Same math/pipeline as the static-walk
- * grouped_gemm_sm120, but tasks come from a GLOBAL atomic counter so blocks
- * can join LATE: layer0's comm blocks finish the AllGather pulls and then
- * take GEMM tasks instead of idling (the static walk pre-assigns tasks by
- * sm_idx, which is why the 24 comm SMs used to sit dead for the L0 tail).
- *
- * Task space is flat: task t -> row block t/col_blocks, col block t%col_blocks;
- * the row block's expert comes from the blk_expert table (rebuilt with the
- * schedule, host-golden adjudicated). Claim order == the static walk's
- * expert-major order, so the readiness pipelining vs pull_order is unchanged.
- *
- * The producer streams claimed tasks to the consumer warps through a small
- * smem descriptor ring (TASK_Q=2, mbarrier handshake, same phasebit pattern
- * as the stage pipeline) — the 3-stage input pipeline runs CONTINUOUSLY
- * across task boundaries, exactly like the static walk (no per-task block
- * barrier, no pipeline drain). Sentinel row=-1 terminates the consumers.
- *
- * Store is a policy (plain_store_policy / glu_store_policy above); the
- * Globals only need .activations and .weights here.
- */
-struct noop_epilogue { __device__ inline void operator()(int, int) const {} };
-
-/* COL_MAJOR (docs/32, the Comet layer1-N lesson): task t sweeps COLUMN-outer
- * (all row blocks at col 0, then col 1, ...) so complete OUTPUT COLUMN SLICES
- * materialize early — the N-decomposed combine can start after ~1/col_blocks
- * of the GEMM instead of waiting for row blocks that finish last. Claim order
- * == completion order either way; only the t -> (row, col) map changes. */
-template <bool COL_MAJOR = false, typename Globals, typename Gate, typename Epilogue, typename Store>
-__device__ inline void grouped_gemm_sm120_dispenser(
-        const Globals &G, const Gate &gate, const Epilogue &epilogue, const Store &store,
-        const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks) {
-    using cfg = gemm_config;
-    using consumers = kittens::group<cfg::CONSUMER_WARPS>;
-
-    extern __shared__ int __shm[];
-    tma_swizzle_allocator allocator((int*)&__shm[0]);
-    typename cfg::pipeline_inputs (&inputs)[cfg::PIPELINE_STAGES] =
-        allocator.allocate<typename cfg::pipeline_inputs, cfg::PIPELINE_STAGES>();
-
-    static constexpr int TASK_Q = 2;
-    __shared__ semaphore inputs_arrived[cfg::PIPELINE_STAGES];
-    __shared__ semaphore inputs_finished[cfg::PIPELINE_STAGES];
-    __shared__ semaphore task_ready[TASK_Q];   // producer -> consumers
-    __shared__ semaphore task_done[TASK_Q];    // consumers -> producer (slot free)
-    __shared__ int2 task_desc[TASK_Q];         // (row_idx, col_idx); row -1 = exit
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < cfg::PIPELINE_STAGES; ++i) {
-            init_semaphore(inputs_arrived[i], 0, 1);
-            init_semaphore(inputs_finished[i], 0, cfg::CONSUMER_WARPS);
-        }
-        for (int q = 0; q < TASK_Q; ++q) {
-            init_semaphore(task_ready[q], 0, 1);
-            init_semaphore(task_done[q], 0, cfg::CONSUMER_WARPS);
-        }
-    }
-    __syncthreads();
-
-    const int warp_id = kittens::warpid();
-    const int lane_id = kittens::laneid();
-    const int num_iters = static_cast<int>(G.activations.cols()) / cfg::RED_BLOCK;
-    const int col_blocks = static_cast<int>(G.weights.cols()) / cfg::COL_BLOCK;
-    int stage = 0;
-    uint32_t phasebits = 0xFFFF0000;   // stage pipeline (low: arrived, high: finished)
-    uint32_t qphase    = 0xFFFF0000;   // task ring (low: ready, high: done-free)
-
-    if (warp_id == cfg::CONSUMER_WARPS) {
-        // ------------------------------------------------------ producer warp
-        if (lane_id == 0) {
-            const int nblk = num_tasks / col_blocks;
-            int q = 0;
-            while (true) {
-                const int t = atomicAdd(task_next, 1);
-                int row_idx = -1, col_idx = -1;
-                if (t < num_tasks) {
-                    if constexpr (COL_MAJOR) { row_idx = t % nblk; col_idx = t / nblk; }
-                    else { row_idx = t / col_blocks; col_idx = t - (t / col_blocks) * col_blocks; }
-                }
-                // slot q free? (consumers finished the task TASK_Q rounds ago)
-                wait(task_done[q], get_phasebit<1>(qphase, q));
-                update_phasebit<1>(qphase, q);
-                task_desc[q] = make_int2(row_idx, col_idx);
-                warp::arrive(task_ready[q]);   // publish (mbarrier orders the smem write)
-                if (row_idx < 0) break;
-                gate(row_idx); // <-- communication readiness fuses in here
-                const int e = blk_expert[row_idx];
-                for (int red_idx = 0; red_idx < num_iters; red_idx++) {
-                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                    update_phasebit<1>(phasebits, stage);
-                    tma::expect_bytes(inputs_arrived[stage], sizeof(typename cfg::pipeline_inputs));
-                    tma::load_async(inputs[stage].A, G.activations, {row_idx, red_idx}, inputs_arrived[stage]);
-                    tma::load_async(inputs[stage].B, G.weights, {e, red_idx, col_idx}, inputs_arrived[stage]);
-                    stage = (stage + 1) % cfg::PIPELINE_STAGES;
-                }
-                q = (q + 1) % TASK_Q;
-            }
-        }
-    } else {
-        // ---------------------------------------------------- consumer warps
-        int q = 0;
-        while (true) {
-            wait(task_ready[q], get_phasebit<0>(qphase, q));
-            update_phasebit<0>(qphase, q);
-            const int row_idx = task_desc[q].x;
-            const int col_idx = task_desc[q].y;
-            if (row_idx < 0) break;
-
-            rt_fl<16, cfg::COL_BLOCK> acc;
-            warp::zero(acc);
-            constexpr int WG = cfg::CONSUMER_WARPS;
-            const int store_strip = (WG % 4 == 0) ? (warp_id / 4 + (warp_id % 4) * (WG / 4)) : warp_id;
-
-            for (int red_idx = 0; red_idx < num_iters; red_idx++) {
-                wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
-                update_phasebit<0>(phasebits, stage);
-                #pragma unroll
-                for (int kk = 0; kk < cfg::RED_BLOCK / 16; kk++) {
-                    rt_bf<16, 16> a_reg;
-                    auto a_sub = inputs[stage].A.template subtile<16, 16>({store_strip, kk});
-                    warp::load(a_reg, a_sub);
-                    rt_bf<16, cfg::COL_BLOCK, ducks::rt_layout::col> b_reg;
-                    auto b_sub = inputs[stage].B.template subtile<16, cfg::COL_BLOCK>({kk, 0});
-                    warp::load(b_reg, b_sub);
-                    warp::mma_AB(acc, a_reg, b_reg, acc);
-                }
-                warp::arrive(inputs_finished[stage]);
-                stage = (stage + 1) % cfg::PIPELINE_STAGES;
-            }
-
-            store(acc, row_idx, col_idx);
-            consumers::sync(0); // full tile in global before the epilogue signal
-            epilogue(row_idx, col_idx);
-            warp::arrive(task_done[q]); // slot free for the producer
-            q = (q + 1) % TASK_Q;
-        }
-    }
-}
 
 /* ==========================================================================
- * 3. SM120 FP8 grouped GEMM(docs/37 P1,分支 fp8_tp)
+ * 2. SM120 FP8 grouped GEMM(docs/10;本仓库唯一在用的 GEMM 引擎)
  *
  * 量化方案(DeepSeek 式):A 按 1×128 group(每行每 128 个 K 一个 fp32
- * scale),W 按 128×128 block。mma.sync m16n8k32 e4m3(experience/12)。
+ * scale),W 按 128×128 block。mma.sync m16n8k32 e4m3(SM120 无 wgmma)。
  *
- * 结构 = grouped_gemm_sm120_dispenser 的 fp8 变体:
+ * 结构 = 原子 dispenser 发任务的持久 kernel:
  *  - **P1: K-tile = 128 == 量化块**(CUTLASS 87c blockwise 主循环同构,
  *    docs/08 §5): 每个 stage 一次 fp32 重标定 acc += sub × (a_scale[row]
  *    × w_scale[kblk,cblk]); 下一 stage 的 wait 提到末尾 QMMA 之前,
@@ -547,18 +182,79 @@ struct gemm_config_fp8 {
                   "fp8 pipeline 4x24KB=96KB, 须给静态 smem 留余量(sm120 上限 101376)");
 };
 
+/* ---- output store policies -----------------------------------------------
+ * The consumer group's register->global store is a policy so layer0 can fuse
+ * the SwiGLU activation into the GEMM epilogue instead of a separate torch
+ * silu pass over 75MB of HBM traffic. Called by EVERY consumer warp with its
+ * own accumulator (group<CONSUMER_WARPS>::store composes the full tile). */
+
+/** Default: store the full COL_BLOCK-wide fp32 accumulator as bf16.
+ *  COL 由实参 rt 宽度推导(fp8 tile = 64, docs/10), 默认值只作占位。 */
+template <typename OutGL>
+struct plain_store_policy {
+    const OutGL &out;
+    template <int COL = gemm_config_fp8::COL_BLOCK>
+    __device__ inline void operator()(rt_fl<16, COL> &acc,
+                                      int row_idx, int col_idx) const {
+        kittens::group<gemm_config_fp8::CONSUMER_WARPS>::store(out, acc, {row_idx, col_idx});
+    }
+};
+
+/** SwiGLU store: weights are column-INTERLEAVED so each output tile holds
+ * [gate | up] halves of the SAME intermediate columns ([gate32|up32] per
+ * 64-col fp8 block, docs/10 §7). Compute act = silu(gate) * up in fp32
+ * registers and store the half-width act tile at the same tile coordinate
+ * (tile units follow rt width). More accurate than the old path (silu on
+ * fp32 accs, not on rounded bf16).
+ * NOTE: the A-load strip permutation (store_strip, docs/05) depends only on
+ * CONSUMER_WARPS, not tile width, so acc rows line up for the half-width
+ * store exactly as for the full-width one. */
+template <typename OutGL>
+struct glu_store_policy {
+    const OutGL &out;
+    template <int COL = gemm_config_fp8::COL_BLOCK>
+    __device__ inline void operator()(rt_fl<16, COL> &acc,
+                                      int row_idx, int col_idx) const {
+        constexpr int HW = COL / 32;  // half-width in 16-col base tiles
+        rt_fl<16, COL / 2> act;
+        #pragma unroll
+        for (int j = 0; j < HW; j++) {
+            #pragma unroll
+            for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
+                const float2 g = acc.tiles[0][j].data[k];
+                const float2 u = acc.tiles[0][j + HW].data[k];
+                float2 r;
+                r.x = (g.x / (1.0f + __expf(-g.x))) * u.x;
+                r.y = (g.y / (1.0f + __expf(-g.y))) * u.y;
+                act.tiles[0][j].data[k] = r;
+            }
+        }
+        kittens::group<gemm_config_fp8::CONSUMER_WARPS>::store(out, act, {row_idx, col_idx});
+    }
+};
+
 /**
- * FP8 dispenser grouped GEMM。Globals 额外要求(duck-typed):
+ * FP8 dispenser grouped GEMM。任务空间是扁平的: task t -> 行块 t/col_blocks、
+ * 列块 t%col_blocks, 行块所属 expert 从 blk_expert 表查(与调度表一起重建,
+ * 有 host golden 对拍)。任务由**全局原子 dispenser** 发放, 所以块可以迟到:
+ * layer0 的 comm 块推完 AllGather 后转岗领 GEMM task, 而不是空转(docs/02)。
+ * producer 通过小的 smem 描述符环(TASK_Q=2, mbarrier 握手)把领到的 task 交给
+ * consumer warp, 输入流水线跨 task 边界连续推进(无 per-task 块内 barrier、
+ * 无流水排空); row=-1 的哨兵终止 consumer。
+ *
+ * Globals 额外要求(duck-typed):
  *   G.activations : gl<fp8e4m3, 1, 1, -1(rows), -1(K), cfg8::A_tile>
  *   G.weights     : gl<fp8e4m3, 1, -1(E), -1(N), -1(K), cfg8::B_tile>  (B^T)
  *   G.a_scales    : gl<float, 1, 1, -1(rows), -1(K/128)>
  *   G.w_scales    : gl<float, 1, -1(E), -1(N/128), -1(K/128)>
- * 其余(gate/epilogue/store/blk_expert/task_next)与 bf16 dispenser 相同。
+ * Gate: `__device__ void operator()(int row_idx) const`, producer 在为该行块
+ * 发起任何加载前调用 —— 通信就绪性就是在这里融进 GEMM 的(纯计算传 no_gate)。
+ * Epilogue: tile 存完后由 consumer 组调用, layer1 在这里发"行块已写"信号。
+ * Store: plain_store_policy / glu_store_policy。
  */
-/* RESCALE=false = 裸 mma 吞吐探针(docs/38):跳过重标定 FFMA 与 scale 读,
- * 结果不正确,只用于测 fp8+fp32acc 的硬上限,裁决 "GeForce fp32 累加税"
- * 假说(mma.f32.e4m3 指令率 = f16 版的一半 → fp8 峰值 ≈ bf16 峰值)。 */
-template <bool COL_MAJOR = false, bool RESCALE = true, typename Globals, typename Gate, typename Epilogue, typename Store>
+/* RESCALE=false = 裸 mma 吞吐探针(docs/03):跳过重标定 FFMA 与 scale 读,
+ * 结果不正确,只用于测 fp8+fp32acc 的硬上限(tools/verify_fp8_gemm.py --raw)。 */
+template <bool RESCALE = true, typename Globals, typename Gate, typename Epilogue, typename Store>
 // 必须 __forceinline__: 若 dispenser 以 ABI 调用形式存在, ptxas 会忽略
 // 函数体内的 setmaxnreg(C7506 'extern call', 2026-07-25 实测) → 寄存器
 // 分配退回 168 + acc spill。
@@ -603,14 +299,13 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
     if (warp_id == cfg::CONSUMER_WARPS) {
         // ------------------------------------------------------ producer warp
         if (lane_id == 0) {
-            const int nblk = num_tasks / col_blocks;
             int q = 0;
             while (true) {
                 const int t = atomicAdd(task_next, 1);
                 int row_idx = -1, col_idx = -1;
                 if (t < num_tasks) {
-                    if constexpr (COL_MAJOR) { row_idx = t % nblk; col_idx = t / nblk; }
-                    else { row_idx = t / col_blocks; col_idx = t - (t / col_blocks) * col_blocks; }
+                    row_idx = t / col_blocks;
+                    col_idx = t - row_idx * col_blocks;
                 }
                 wait(task_done[q], get_phasebit<1>(qphase, q));
                 update_phasebit<1>(qphase, q);
@@ -661,7 +356,7 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
             // rt 行布局: data[偶] → 行 r0, data[奇] → r0+8(global_to_register)
             const int r0 = row_idx * cfg::ROW_BLOCK + store_strip * 16 + (lane_id >> 2);
 
-            // scale 预取(docs/38: 首测耗时降低 21.3%, 边界处的 3 个 global scale 读
+            // scale 预取(docs/03: 首测耗时降低 21.3%, 边界处的 3 个 global scale 读
             // 在关键路径上, 32 个边界 × L2 延迟 ≈ 40% 气泡)。边界只消费
             // 已在寄存器的值, 同时发起下一块的加载(1 个 stage 的着陆窗)。
             // w_scales 块 = 128 列: 每个 128 列 scale 块含两个 64 列 GEMM tile

@@ -1,12 +1,13 @@
-# RTX PRO 5000 四卡 TP FP8 主测试配置。
+# RTX PRO 5000 四卡 TP FP8 主测试配置 —— 本仓库唯一默认口径。
 #
-# 对应 tp_run_20260715_124912 的主工作负载。该轮完整 A/B 矩阵（BF16、
-# copy-engine、COMM SM sweep、正确性和分阶段计时）记录在：
-#   configs/runs/tp_run_20260715_124912.yaml
-#
-# 可从 moe_bench 上一级目录直接加载：
+# 从 moe_bench 上一级目录加载：
 #   python -m moe_bench.bench \
-#     --config moe_bench/configs/tp_rtx_pro5000_4gpu_fp8.yaml
+#     --config moe_bench/configs/tp_rtx_pro5000_4gpu_fp8.yaml \
+#     --distributed --scheme tktp
+#
+# tools/ 下的专用脚本（run_tktp.py / time_tp_stages.py）直接读这份配置，
+# 命令行只做最小覆盖并把覆盖项打印出来。A/B 实验的覆盖项必须同时记录到
+# 结果目录和 HANDOFF.md，不要静默改动这份文件。
 
 # ---- Model / weight shape ----
 hidden_size: 4096
@@ -38,8 +39,8 @@ all2all_backend: allgather_reducescatter
 
 # ---- Timing ----
 warmup_iters: 20
-# 历史 run 使用 warmup=5，并额外测了 T=1024/30 iters；主配置采用正式
-# T=512 口径和更充分的 warmup=20，历史参数精确值见 run manifest。
+# 历史轮多用 warmup=5 并额外测 T=1024/30 iters；主配置采用正式 T=512 口径
+# 和更充分的 warmup=20，因此历史数字与这份配置的结果不可直接对比。
 bench_iters: 50
 use_cuda_graph: false
 seed: 0

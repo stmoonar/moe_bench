@@ -16,7 +16,7 @@ kernel 等待其信号/经 IPC 访问其显存), 验证兜底后的预期行为:
   python moe_bench/tools/fault_inject_kill_rank.py \\
       --kill-rank 2 --delay 10 --timeout 120 --gpus 0,1,2,3 -- \\
       python -m moe_bench.bench --config moe_bench/configs/tp_rtx_pro5000_4gpu_fp8.yaml \\
-      --distributed --scheme tk_tp
+      --distributed --scheme tktp
 
 注意: 该测试本身就是在人为制造一次故障, 只允许在确认所有测试卡空闲、且
 接受"失败时可能需要按 docs/04 流程恢复"的前提下运行。
