@@ -62,6 +62,7 @@ def _build_so(so_path: str, world_size: int, hidden: int, mod: str, row_block: i
                 "--expt-extended-lambda", "--expt-relaxed-constexpr",
                 "-forward-unknown-to-host-compiler", "-Xcompiler=-Wno-psabi",
                 "-Xcompiler=-fno-strict-aliasing", "-DNDEBUG", "-lineinfo",
+                "--ptxas-options=-v",
                 "-shared", "-fPIC", "-diag-suppress", "3189",
                 "-D__CUDA_NO_HALF_OPERATORS__", "-D__CUDA_NO_HALF_CONVERSIONS__",
                 "-D__CUDA_NO_BFLOAT16_CONVERSIONS__", "-D__CUDA_NO_HALF2_OPERATORS__",
