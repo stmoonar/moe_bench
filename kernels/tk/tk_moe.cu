@@ -1423,6 +1423,9 @@ void entry_warp(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
            kittens::py::TKParallelTensor &barrier,
            const int num_padded_local_tokens, const int num_tokens) {
     using cfg = gemm_config_fp8;
+    TORCH_CHECK(WARP_SMEM <= 101376,
+                "P1(K-tile 128)后 GEMM 流水区 96KB, 方案A warp 路径 smem 超 sm120 上限;"
+                "该路径已判负留档(docs/04), 复跑请检出 P1 之前的提交");
     TORCH_CHECK(gemm_next.numel() == 1 && pull_next.numel() == 1, "counters");
     const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
     TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
@@ -1452,6 +1455,9 @@ void entry_warp_probe(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TK
            const int num_padded_local_tokens, const int num_tokens,
            const bool gate_off, const int num_slots) {
     using cfg = gemm_config_fp8;
+    TORCH_CHECK(WARP_SMEM <= 101376,
+                "P1(K-tile 128)后 GEMM 流水区 96KB, 方案A warp 探针 smem 超 sm120 上限;"
+                "该路径已判负留档(docs/04), 复跑请检出 P1 之前的提交");
     TORCH_CHECK(gemm_next.numel() == 1 && pull_next.numel() == 1, "counters");
     TORCH_CHECK(num_slots >= 0 && num_slots <= WARP_SLOTS, "num_slots in [0, WARP_SLOTS]");
     const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
@@ -3976,6 +3982,9 @@ void entry_warp(at::Tensor &act_fp8, at::Tensor &act_scales,
            const int num_padded_local_tokens, const int num_source_tokens,
            const int num_jobs, const int seq) {
     using cfg = gemm_config_fp8;
+    TORCH_CHECK(cfg::DYNAMIC_SHARED_MEMORY + sizeof(globals::row_vec) + 2048 <= 101376,
+                "P1(K-tile 128)后 GEMM 流水区 96KB, L1 warp 路径 smem 超 sm120 上限;"
+                "该路径已判负留档(docs/04), 复跑请检出 P1 之前的提交");
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
     TORCH_CHECK(weights.size(0) == num_local_experts, "w2 (E,H,inter) E mismatch");

@@ -1,5 +1,30 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
+## 2026-07-25：P1 落码——fp8 GEMM 主循环改 CUTLASS 式 K-tile 128 + 寄存器双缓冲（待上机）
+
+- 对比结论（CUTLASS 87c sm120 blockwise 源码精读，同 MMA atom）：
+  差距不在重标定**频率**（两边都是每 128 K 一次），在**流水结构**：
+  我们 K-tile 64 → mbarrier 事件 2 倍、LDSM 36 vs 24/warp/K-block、
+  load→use 串行被每 64-K 的 stage wait 打断；CUTLASS K-tile 128 +
+  寄存器双缓冲（kk+1 的 LDSM 先于 kk 的 QMMA）+ consumer_wait 放在
+  末尾 QMMA 之前。triton 结构同侧（BLOCK_K=128 + 编译器软流水），
+  正解释 CUTLASS > triton > TK 排序。
+- 落码（`kernels/tileoverlap/common/sm120_common.cuh` 一处，全融合
+  kernel 自动受益）：`gemm_config_fp8` RED_BLOCK 64→128（3 stage
+  96KB ≤ 99KB，加 static_assert）；consumer 改 KK=4 寄存器双缓冲，
+  下一 stage 的 wait+预取提到末尾 QMMA 前，finished arrive 保持在
+  末尾 QMMA 后（LDSM 已被消费，smem 可读覆）。重标定点与 MMA 顺序
+  不变 → **数值逐比特等价**。
+- 代价：方案A warp 路径（tpdisp8::entry_warp/entry_warp_probe、
+  tppr8::entry_warp，均已判负留档）smem 超 101376B，入口加
+  TORCH_CHECK 禁用，复跑需检出本提交之前版本。
+- 死锁审计：等待点种类零新增（本地流水线 mbarrier 裸 wait 合规，
+  producer 同 block 连带 trap）；arrived(s+1)←TMA←finished(s-2)
+  依赖无环；无新 named barrier/跨卡等待。
+- **待上机**：见本提交信息末尾清单（verify_fp8_gemm 对拍 →
+  cuobjdump 看 spill → NCU 重采 vs 664µs/84.9% → 03f8/04f8 A/B）。
+  预期 L0 tensor 60.9% → 75%+；若 spill 明显，备选 = B frag 拆两半。
+
 ## 2026-07-23：CUTLASS 参照结果——"累加税天花板"被推翻，GEMM 引擎欠账 28%
 
 - NCU 锁频四方 + CUTLASS 参照（docs/08 §5）：**CUTLASS fp8 L0 664µs/84.9%

@@ -490,9 +490,12 @@ __device__ inline void grouped_gemm_sm120_dispenser(
  * scale),W 按 128×128 block。mma.sync m16n8k32 e4m3(experience/12)。
  *
  * 结构 = grouped_gemm_sm120_dispenser 的 fp8 变体:
- *  - RED_BLOCK 仍 64(A tile 128×64 fp8 = 8KB,B 64×128 = 8KB,3 stage
- *    48KB,smem 富余),量化块 K=128 = 2 个 red step:子累加器每 2 step
- *    做一次 fp32 重标定 acc += sub × (a_scale[row] × w_scale[kblk,cblk]);
+ *  - **P1: K-tile = 128 == 量化块**(CUTLASS 87c blockwise 主循环同构,
+ *    docs/08 §5): A/B tile 各 16KB, 3 stage 96KB ≤ 99KB; 每个 stage 一次
+ *    fp32 重标定 acc += sub × (a_scale[row] × w_scale[kblk,cblk])。
+ *    consumer 为 KK=4 步寄存器双缓冲主循环(kk+1 的 LDSM 先于 kk 的 QMMA
+ *    发射, 下一 stage 的 wait/预取提到末尾 QMMA 之前), 重标定点与旧
+ *    per-2-step 版一致 → 数值逐比特等价;
  *  - scale 直接从 global 读(L2 广播,每 K 块每线程 3 个 float,不进
  *    smem,不动 TMA expect 字节数);
  *  - 行内 scale 映射:rt 行布局 data[偶] → 行 lane/4,data[奇] → +8
@@ -507,17 +510,17 @@ __device__ inline void grouped_gemm_sm120_dispenser(
 struct gemm_config_fp8 {
     static constexpr int ROW_BLOCK = TK_ROW_BLOCK;
     static constexpr int COL_BLOCK = 128;
-    static constexpr int RED_BLOCK = 64;
-    static constexpr int SCALE_K = 128;              // 量化块 K 宽 = 2 个 red step
-    static constexpr int PIPELINE_STAGES = 3;        // 3 × 16KB = 48KB
+    static constexpr int RED_BLOCK = 128;            // K-tile == 量化块(P1)
+    static constexpr int SCALE_K = 128;              // 量化块 K 宽
+    static constexpr int PIPELINE_STAGES = 3;        // 3 × 32KB = 96KB ≤ 99KB
     static constexpr int MMA_K = 32;                 // m16n8k32
 
     static constexpr int CONSUMER_WARPS = ROW_BLOCK / 16;
     static constexpr int NUM_WARPS = CONSUMER_WARPS + 1;
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
-    using A_tile = st_fp8e4m3<ROW_BLOCK, RED_BLOCK>; // 8KB (RB=128)
-    using B_tile = st_fp8e4m3<COL_BLOCK, RED_BLOCK>; // 8KB, B^T (N-major)
+    using A_tile = st_fp8e4m3<ROW_BLOCK, RED_BLOCK>; // 16KB (RB=128)
+    using B_tile = st_fp8e4m3<COL_BLOCK, RED_BLOCK>; // 16KB, B^T (N-major)
 
     struct pipeline_inputs {
         A_tile A;
@@ -525,6 +528,9 @@ struct gemm_config_fp8 {
     };
 
     static constexpr int DYNAMIC_SHARED_MEMORY = PIPELINE_STAGES * sizeof(pipeline_inputs);
+    static_assert(SCALE_K == RED_BLOCK, "P1: K-tile == 量化块, 每 stage 重标定一次");
+    static_assert(PIPELINE_STAGES * ROW_BLOCK * RED_BLOCK * 2 <= 101376 - 2048,
+                  "fp8 pipeline 3x32KB=96KB, 须给静态 smem 留余量(sm120 上限 101376)");
 };
 
 /**
@@ -573,7 +579,6 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
     const int num_iters = static_cast<int>(G.activations.cols()) / cfg::RED_BLOCK;
     // B^T 布局: weights (E, N, K) -> N 在 rows 维
     const int col_blocks = static_cast<int>(G.weights.rows()) / cfg::COL_BLOCK;
-    constexpr int STEPS_PER_SCALE = cfg::SCALE_K / cfg::RED_BLOCK;  // 2
     int stage = 0;
     uint32_t phasebits = 0xFFFF0000;
     uint32_t qphase    = 0xFFFF0000;
@@ -611,6 +616,14 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
         }
     } else {
         // ---------------------------------------------------- consumer warps
+        // P1 主循环(CUTLASS sm120 blockwise 同构, docs/08 §5): 每 stage 恰好一
+        // 个量化块(K=128 = RED_BLOCK), KK=4 个 MMA step 寄存器双缓冲 —— kk+1
+        // 的 LDSM 在 kk 的 QMMA 之前发射; 下一 stage 的 arrived wait + 首个
+        // 预取放在本 stage 最后一条 QMMA 之前(与末尾 QMMA 重叠); finished
+        // arrive 保持在最后一条 QMMA 之后(此时该 stage 的 LDSM 已全部被
+        // QMMA 消费完毕, smem 可读覆)。重标定点与旧 per-2-step 版完全相同
+        // (每 128 K), 块内 MMA 顺序一致(K 升序) → 数值逐比特等价。
+        constexpr int KK = cfg::RED_BLOCK / cfg::MMA_K;   // 4
         int q = 0;
         while (true) {
             wait(task_ready[q], get_phasebit<0>(qphase, q));
@@ -631,35 +644,49 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
 
             // scale 预取(docs/38: 首测耗时降低 21.3%, 边界处的 3 个 global scale 读
             // 在关键路径上, 32 个边界 × L2 延迟 ≈ 40% 气泡)。边界只消费
-            // 已在寄存器的值, 同时发起下一块的加载(2 个 red step 的着陆窗)。
+            // 已在寄存器的值, 同时发起下一块的加载(1 个 stage 的着陆窗)。
             float bsc_n = G.w_scales[{e, col_idx, 0}];
             float s0_n = G.a_scales[{r0, 0}];
             float s1_n = G.a_scales[{r0 + 8, 0}];
 
+            rt_fp8e4m3<16, cfg::MMA_K> a_reg[2];
+            rt_fp8e4m3<cfg::COL_BLOCK, cfg::MMA_K> b_reg[2];
+            auto load_kk = [&](int buf, int st, int kk) {
+                auto a_sub = inputs[st].A.template subtile<16, cfg::MMA_K>({store_strip, kk});
+                warp::load(a_reg[buf], a_sub);
+                // B^T 行布局加载(ldmatrix 路径; col-layout fp8 加载在 TK
+                // 里没写完), mma_ABt 的 fp8 特化做 (M,K)x(N,K)^T
+                auto b_sub = inputs[st].B.template subtile<cfg::COL_BLOCK, cfg::MMA_K>({0, kk});
+                warp::load(b_reg[buf], b_sub);
+            };
+
+            wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+            update_phasebit<0>(phasebits, stage);
+            load_kk(0, stage, 0);
+
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
-                wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
-                update_phasebit<0>(phasebits, stage);
+                const int nxt = (stage + 1) % cfg::PIPELINE_STAGES;
                 #pragma unroll
-                for (int kk = 0; kk < cfg::RED_BLOCK / cfg::MMA_K; kk++) {
-                    rt_fp8e4m3<16, cfg::MMA_K> a_reg;
-                    auto a_sub = inputs[stage].A.template subtile<16, cfg::MMA_K>({store_strip, kk});
-                    warp::load(a_reg, a_sub);
-                    // B^T 行布局加载(ldmatrix 路径; col-layout fp8 加载在 TK
-                    // 里没写完), mma_ABt 的 fp8 特化做 (M,K)x(N,K)^T
-                    rt_fp8e4m3<cfg::COL_BLOCK, cfg::MMA_K> b_reg;
-                    auto b_sub = inputs[stage].B.template subtile<cfg::COL_BLOCK, cfg::MMA_K>({0, kk});
-                    warp::load(b_reg, b_sub);
-                    warp::mma_ABt(sub, a_reg, b_reg, sub);
+                for (int kk = 0; kk < KK; kk++) {
+                    if (kk + 1 < KK) {
+                        load_kk((kk + 1) & 1, stage, kk + 1);
+                    } else if (red_idx + 1 < num_iters) {
+                        // CUTLASS 序: 下一 stage 的 wait + 预取放在末尾 QMMA 前
+                        wait(inputs_arrived[nxt], get_phasebit<0>(phasebits, nxt));
+                        update_phasebit<0>(phasebits, nxt);
+                        load_kk(0, nxt, 0);
+                    }
+                    warp::mma_ABt(sub, a_reg[kk & 1], b_reg[kk & 1], sub);
                 }
                 warp::arrive(inputs_finished[stage]);
-                stage = (stage + 1) % cfg::PIPELINE_STAGES;
+                stage = nxt;
 
-                // 量化块(K=128)边界: fp32 重标定并入主累加器(scale 用预取值)
-                if (RESCALE && (red_idx % STEPS_PER_SCALE) == STEPS_PER_SCALE - 1) {
+                // 每 stage = 一个量化块(K=128): fp32 重标定并入主累加器
+                if constexpr (RESCALE) {
                     const float s0 = s0_n * bsc_n;
                     const float s1 = s1_n * bsc_n;
-                    const int kblk1 = red_idx / STEPS_PER_SCALE + 1;
-                    if (kblk1 * STEPS_PER_SCALE < num_iters) {  // 预取下一块
+                    const int kblk1 = red_idx + 1;
+                    if (kblk1 < num_iters) {  // 预取下一块
                         bsc_n = G.w_scales[{e, col_idx, kblk1}];
                         s0_n = G.a_scales[{r0, kblk1}];
                         s1_n = G.a_scales[{r0 + 8, kblk1}];
