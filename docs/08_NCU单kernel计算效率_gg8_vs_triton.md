@@ -120,3 +120,53 @@ CUDA_VISIBLE_DEVICES=<idle> ncu --replay-mode kernel --kernel-name-base demangle
    serial/triton 的 blockwise 逐块 promotion 等价（不是精度赌博），预期消掉
    +31% 指令的大头；TMA 流水加深/warp specialization 属深改，视第一步
    回收效果再定。
+
+## 6. 2026-07-26 口径限定：triton 侧一直跑的是**未调优兜底 config**
+
+上面所有 triton 数字（含 e2e 的 serial 2074µs）都不是 triton 的调优水位，是
+vLLM 查表落空后的兜底值。机制在 `fused_moe.py`：
+
+1. `try_get_optimal_moe_config` 用 `E, _, N = w2.shape` 取 key——我们的 w2 是
+   `(64, 4096, 768)`，所以 **E=64、N=768**；
+2. 去 `fused_moe/configs/` 找
+   `E=64,N=768,device_name=<设备名>,dtype=fp8_w8a8,block_shape=[128,128].json`；
+3. 该目录 308 个文件里 Blackwell 只有 `RTX_PRO_6000_*`，**没有 5000**，于是落
+   `get_default_config` 的 blockwise 分支：`BLOCK_N/BLOCK_K` 直接抄
+   `block_shape`，与硬件无关。
+
+得到 `BM=64, BN=128, BK=128, GROUP_M=32, warps=4, stages=3`——**与 docs/09 §2 从
+NCU grid 反解出的 `BM=64/BN=128` 完全吻合**，两条独立证据实锤。
+
+调优接口与空间：
+
+- 加载优先级：`VLLM_TUNED_CONFIG_FOLDER`（自建目录，不动 site-packages）>
+  内置 `configs/` > 兜底。另有 `fused_moe.override_config()` contextmanager 可
+  在进程内直接顶掉查表，用于 A/B。
+- JSON 是 `{M: config}` 映射，lookup 取最接近的 key；我们的 M=2048（AllGather
+  后的 token 数）。
+- 有效搜索空间 **320 个**，不是 vLLM tuner 名义上的 640：blockwise 下
+  `invoke_fused_moe_kernel` 有一句
+  `BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape))`，把 `BLOCK_SIZE_K` 静默
+  压回 128，扫 256 是纯重复计时。`BLOCK_SIZE_N` 则必须是 `block_shape[0]` 的
+  整数倍（kernel 用 `offs_bsn = offs_bn // group_n` 向量化取 scale，跨多个
+  scale 块合法、切碎一个不合法），32/64 被剪掉。
+- 工具：`tools/tune_triton_moe.py`（读主配置，被测对象就是 baseline 的
+  `NaiveFusedExperts`，输入按 `SerialNaive` 的 AllGather 语义复刻）。
+
+**config 调不动的两个结构性上限**：
+
+1. **两颗 GEMM 共用一个 config**。`fused_experts_impl` 只算一次
+   `config = get_config_func(M)`，w13（N=1536, K=4096）和 w2（N=4096, K=768）
+   被迫同 tile——这正是 §2 里 triton 从 L0 的 66.7% 掉到 L1 的 50.2% 的结构
+   原因（我们 60.9→53.9 掉得少）。要突破得手工拆两次调用，但那就不再是 vLLM
+   默认路径，会破坏 baseline 作为对照组的定义。
+2. **sm120 每 SM smem 只有 ~100KB**（H100 是 227KB），深 `num_stages` 上不去，
+   这也是 §5 里 CUTLASS 能靠 TMA warp-specialized 拉到 84.9% 而 triton 不行的
+   底层约束之一。
+
+**对结论的影响（重要）**：调优大概率把 `BLOCK_SIZE_M` 从 64 抬到 128/256，而按
+docs/09 的粒度税模型，balanced 下每 expert 恰好 256 行、抬大 BM 的 padding 税
+为零——**baseline 会净变快，当前 21.5% 的领先要重新报数**。反过来 uniform 下
+baseline 的不均衡敏感度会从 +5.1% 涨向我们的水平。因此：balanced / uniform
+各调一份 config 并各自记录，正式报数注明 serial 用的是哪一份（docs/05 §4 早
+就要求"注明 serial 是否使用调优配置"，此前一直是"否"）。

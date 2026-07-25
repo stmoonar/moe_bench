@@ -3,6 +3,24 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
+## 最新（2026-07-26）：baseline 的 triton 一直跑未调优兜底 config
+
+查 vLLM 源码确认：本机（RTX PRO 5000 / sm120）在 `fused_moe/configs/` 里没有任何
+条目，`try_get_optimal_moe_config` 查 `E=64,N=768,...` 落空后走 `get_default_config`
+的 blockwise 兜底分支，得到 `BM=64/BN=128/BK=128/GROUP_M=32/warps=4/stages=3`
+——与 docs/09 §2 从 NCU grid 反解出的值完全吻合。**即历史所有 serial 数字
+（含 e2e 2074µs、tensor 66.7%）都不是 triton 的调优水位。**
+
+- 新增 `tools/tune_triton_moe.py`：读主配置，单卡扫 320 个候选（blockwise 下
+  `BLOCK_SIZE_K` 会被 kernel 静默 clamp 回 128，名义 640 里一半是重复），
+  两阶段计时 + 逐候选正确性门，产出 vLLM 能直接查表命中的 JSON。
+  接回方式 `VLLM_TUNED_CONFIG_FOLDER=<结果目录>`，不动 site-packages。
+- 机制、结构性上限（两颗 GEMM 共用一个 config、sm120 smem ~100KB）和对报数的
+  影响写在 [`docs/08 §6`](docs/08_NCU单kernel计算效率_gg8_vs_triton.md)。
+- **⚠️ 脚本尚未在 GPU 机器上跑过**（开发机无 CUDA），先 `--dry-run` 再实跑。
+- 预期：调优后 baseline 会净变快（balanced 下抬大 `BLOCK_SIZE_M` 的 padding 税
+  为零，见 docs/09），当前 21.5% 领先需重新报数；balanced / uniform 要各调一份。
+
 ## 0. 分支状态：`slim`（2026-07-25）
 
 `slim` 从 `fp8_tp` 清理而来，**只保留当前性能最好的那一条实现路径**和长期维护的
@@ -123,7 +141,11 @@ T=1024 3115µs，NCU 下 L0 789µs / tensor 71.3%（CUTLASS 参照 664µs / 84.9
    把性能结果称作完整的正确性闭环。
 3. **换机器的重新定标**：`comm_sms` / `push_sms` sweep、P2P 带宽与 RTT、单卡 GEMM
    天花板都要重测，理由见 [`docs/04_平台边界与负结果.md`](docs/04_平台边界与负结果.md) §1。
-4. 剩余优化杠杆（按归因排序）：A/B 改 2D TMA descriptor 绕开 4d/5d 的驱动 syscall；
+4. **baseline 调优未落地**：`tools/tune_triton_moe.py` 已写好但没上机跑过。跑完
+   要（a）balanced / uniform 各出一份 JSON，（b）用
+   `VLLM_TUNED_CONFIG_FOLDER` 复测 serial e2e，（c）按新 baseline 重报领先幅度，
+   （d）把 docs/08 §2 的 triton 锁频数字标注为"未调优"或用调优 config 重采。
+5. 剩余优化杠杆（按归因排序）：A/B 改 2D TMA descriptor 绕开 4d/5d 的驱动 syscall；
    4×2 warp 几何 + smem GLU 配对减 LDSM；scale 走 smem；e2e 侧继续压未隐藏通信。
 
 ## 6. 红线（写/改 kernel 前必读）
