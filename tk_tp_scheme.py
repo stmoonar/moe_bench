@@ -256,7 +256,7 @@ class TKFusedTP(DistributedScheme):
         self.H, self.inter, self.num_tokens, self.top_k = H, inter, num_tokens, cfg.topk
         # GEMM template constraints (sm120_common.cuh)
         assert H % 64 == 0 and H % 128 == 0, "hidden must be tile-aligned"
-        assert (2 * inter) % 128 == 0, "gate_up shard % COL_BLOCK"
+        assert (2 * inter) % 64 == 0, "gate_up shard % COL_BLOCK(64)"
         assert inter % 64 == 0, "intermediate shard % RED_BLOCK"
 
         from importlib.util import spec_from_file_location, module_from_spec
@@ -426,10 +426,11 @@ class TKFusedTP(DistributedScheme):
                                                 .repeat_interleave(128, 2))
                 self.w2 = w2_bf.to(torch.bfloat16).transpose(1, 2).contiguous()
                 del w2_bf
-            # GLU 列交织(按 N 行, 单位 64): [gate64 | up64] per 128-N block
+            # GLU 列交织(按 N 行, 单位 32): [gate32 | up32] per 64-N block
+            # (fp8 GEMM COL_BLOCK=64, docs/10 §7; 同一 128 列 scale 块内置换)
             E = w1_bf.shape[0]
-            gate = w1_bf[:, :inter].view(E, inter // 64, 64, H)
-            up = w1_bf[:, inter:].view(E, inter // 64, 64, H)
+            gate = w1_bf[:, :inter].view(E, inter // 32, 32, H)
+            up = w1_bf[:, inter:].view(E, inter // 32, 32, H)
             w1_il = torch.stack([gate, up], dim=2).view(E, 2 * inter, H)
             # 交织后 128(N)×128(K) 重量化 -> scale 块与 B tile 天然对齐
             v = w1_il.view(E, 2 * inter // 128, 128, H // 128, 128)

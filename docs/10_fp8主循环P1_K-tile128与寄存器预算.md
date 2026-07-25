@@ -81,3 +81,48 @@ local/smem 而非 HBM）；IPC 崩 + 指令数大涨；raw（无累加器变体�
 单卡：`verify_fp8_gemm 64 256 4096 1536 10`（NCU 同 docs/08 §1 命令）+
 `cuobjdump --dump-resource-usage` 确认 STACK 回落；预期 L0 tensor
 60.9% → 70%+。全宽双缓冲版数据留档于本文 §2，勿复跑。
+
+## 6. setmaxnreg 路线判负：本平台 TMA 是驱动 syscall
+
+P1 修复版（A 双/B 单）仍慢：NCU 1.36ms vs 旧 924µs，REG:168 + STACK:216
+残留 spill。排查链：
+
+1. `regs_per_mp = 65536`（288 线程静态上限 224），168 不是硬顶；
+2. CUTLASS 87c 探针也是 **REG:168 STACK:0**——人家结构正好塞下；
+3. 试 setmaxnreg（CUTLASS cooperative 同手法，producer dec 64 /
+   consumer inc 232）→ ptxas 报 **C7506: 'setmaxnreg' ignored to
+   maintain compatibility into 'extern' call**，全数忽略；
+4. `__forceinline__` dispenser 无用——SASS 里 `CALL.ABS.NOINC` 的
+   目标是 **`__cuda_syscall_cp_async_bulk_tensor_{4d,5d}_tile_unicast`**：
+   **本平台（sm_120 工作站卡）的 TMA bulk tensor 拷贝是驱动 syscall
+   实现的**（每个 `tma::load_async/store_async` 都是一次 ABI 调用）。
+
+结论：ptxas 对含 ABI call 的 kernel 预留 ~56 regs/thread 调用帧 →
+**有效寄存器上限 = 224 − 56 = 168**（分毫不差），且 setmaxnreg 对本
+平台任何用 TMA 的 kernel 都是死路。CUTLASS 能在 168 内零 spill，我们
+128 宽 tile 需求 ~230 塞不下。唯一的出路是把需求压进 168。
+
+另注：TMA syscall 意味着每次 TMA 调用有 ~8 条指令 + syscall 延迟的
+额外开销（CUTLASS 的 2D descriptor 可能走原生路径——后续杠杆之一：
+A/B 改 2D TMA descriptor 绕开 4d/5d syscall）。
+
+## 7. P2：COL_BLOCK = 64（把需求压进 168）
+
+acc+sub = 128 regs 是 128 宽 tile（8 warp × 16×128）的数学下限，无解；
+COL=64 后 acc/sub 各 32，A/B 全双缓冲（b 16×2）总需求 ~135 ≤ 168，
+**任何 cap 理论下都安全**，且恢复了 P1 原设计的全双缓冲主循环。
+
+配套改动：
+- `gemm_config_fp8`：COL_BLOCK 128→64，PIPELINE_STAGES 3→4
+  （stage = A 16KB + B 8KB = 24KB，4×24 = 96KB ≤ 99KB）；
+- store policy 模板化（`operator()<COL>`，bf16=128 / fp8=64 共用）；
+- GLU 权重交织 `[gate64|up64]`→`[gate32|up32]`（同一 128 列 scale 块内
+  置换，量化/scale 布局零改动；`tk_tp_scheme.py`）；
+- `w_scales` 块索引 `col_idx >> 1`（128 列 scale 块含两个 64 列 tile），
+  三个 entry 的 w_scales 尺寸检查同步按 SCALE_K 修正；
+- 协议侧零改动：`signal_epilogue` 的 col_blocks 在 kernel 内按
+  `weights.rows()/cfg::COL_BLOCK` 现算，自动一致；任务数翻倍由
+  dispenser 吸收。
+
+代价（记录在案）：任务数 ×2（L0 3072 个），epilogue 信号 ×2，TMA
+syscall 次数 ×2（每次 stage 2 个），A tile 的 L2 复用压力略增。

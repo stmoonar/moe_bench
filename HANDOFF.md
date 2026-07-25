@@ -1,6 +1,27 @@
 # HANDOFF — TK 通算融合 MoE 进度交接
 
-## 2026-07-25：P1 落码——fp8 GEMM 主循环改 CUTLASS 式 K-tile 128 + 寄存器双缓冲（待上机）
+## 2026-07-25（P2 终态）：COL=64 解寄存器墙（待上机复测，详见 docs/10 §6/§7）
+
+- 寄存器墙真相链：全宽 B 双缓冲 → ptxas spill acc/sub（STACK:520，
+  4.7× 回退）→ B 单缓冲仍 168+STACK:216 → setmaxnreg 被 **C7506 全忽略**
+  → **本平台 TMA 是驱动 syscall**（CALL.ABS 目标 =
+  `__cuda_syscall_cp_async_bulk_tensor_{4d,5d}_tile_unicast`）→
+  ptxas 预留 ~56 regs/thread → **有效上限 168**，setmaxnreg 对任何
+  用 TMA 的 kernel 都是死路。CUTLASS 87c 也是 168（正好塞下）。
+- **P2**：COL_BLOCK 128→64（acc/sub 各 32，A/B 全双缓冲总需求 ~135
+  ≤ 168）+ 4 stage（24KB×4=96KB）。配套：store policy 模板化
+  （bf16=128/fp8=64 共用）、GLU 权重交织改 [gate32|up32]（同一 128 列
+  scale 块内置换，量化零改动）、w_scales 按 col_idx>>1 取块（三个
+  entry 检查同步修正）、协议零改动（col_blocks kernel 内现算）。
+  方案A warp 路径仍禁用。死锁审计沿用（无新等待点）。
+- **待上机**：rm -rf kernels/tk/build → verify_fp8_gemm 对拍（预期
+  fp8 ≈ raw×1.1-1.3，spill 0）→ NCU 重采 vs 旧 924µs / CUTLASS 664µs
+  （目标 Duration <924，tensor ≥65-70%）→ 03f8 + 04f8 A/B（基线
+  1629µs）。
+- 后续杠杆：A/B 改 2D TMA descriptor 绕开 4d/5d syscall；scale 走
+  smem（cp.async 原生指令）。
+
+## 2026-07-25（P1，已被上方 P2 取代）：P1 落码——fp8 GEMM 主循环改 CUTLASS 式 K-tile 128 + 寄存器双缓冲（待上机）
 
 - 对比结论（CUTLASS 87c sm120 blockwise 源码精读，同 MMA atom）：
   差距不在重标定**频率**（两边都是每 128 K 一次），在**流水结构**：

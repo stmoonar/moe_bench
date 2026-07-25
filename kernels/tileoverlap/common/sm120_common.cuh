@@ -183,31 +183,36 @@ __device__ inline void grouped_gemm_sm120(const Globals &G, const Gate &gate, co
  * silu pass over 75MB of HBM traffic. Called by EVERY consumer warp with its
  * own accumulator (group<CONSUMER_WARPS>::store composes the full tile). */
 
-/** Default: store the full COL_BLOCK-wide fp32 accumulator as bf16. */
+/** Default: store the full COL_BLOCK-wide fp32 accumulator as bf16.
+ *  COL 模板化: bf16 128 / fp8 64(docs/10 §7) 共用; group::store 的 tile
+ *  坐标随 rt 宽度自动缩放。 */
 template <typename OutGL>
 struct plain_store_policy {
     const OutGL &out;
-    __device__ inline void operator()(rt_fl<16, gemm_config::COL_BLOCK> &acc,
+    template <int COL = gemm_config::COL_BLOCK>
+    __device__ inline void operator()(rt_fl<16, COL> &acc,
                                       int row_idx, int col_idx) const {
         kittens::group<gemm_config::CONSUMER_WARPS>::store(out, acc, {row_idx, col_idx});
     }
 };
 
-/** SwiGLU store: weights are column-INTERLEAVED per COL_BLOCK so each output
- * tile is [gate(64) | up(64)] for the SAME intermediate columns. Compute
- * act = silu(gate) * up in fp32 registers and store the 64-wide act tile at
- * the same tile coordinate (act tensor is (rows, inter), 64-col tile units).
+/** SwiGLU store: weights are column-INTERLEAVED so each output tile holds
+ * [gate | up] halves of the SAME intermediate columns ([gate64|up64] per
+ * 128-col block for bf16; [gate32|up32] per 64-col block for fp8, docs/10 §7).
+ * Compute act = silu(gate) * up in fp32 registers and store the half-width
+ * act tile at the same tile coordinate (tile units follow rt width).
  * More accurate than the old path (silu on fp32 accs, not on rounded bf16).
  * NOTE: the A-load strip permutation (store_strip, docs/05) depends only on
- * CONSUMER_WARPS, not tile width, so acc rows line up for the 64-wide store
- * exactly as for the 128-wide one. */
+ * CONSUMER_WARPS, not tile width, so acc rows line up for the half-width
+ * store exactly as for the full-width one. */
 template <typename OutGL>
 struct glu_store_policy {
     const OutGL &out;
-    __device__ inline void operator()(rt_fl<16, gemm_config::COL_BLOCK> &acc,
+    template <int COL = gemm_config::COL_BLOCK>
+    __device__ inline void operator()(rt_fl<16, COL> &acc,
                                       int row_idx, int col_idx) const {
-        constexpr int HW = gemm_config::COL_BLOCK / 32;  // half-width in 16-col base tiles
-        rt_fl<16, gemm_config::COL_BLOCK / 2> act;
+        constexpr int HW = COL / 32;  // half-width in 16-col base tiles
+        rt_fl<16, COL / 2> act;
         #pragma unroll
         for (int j = 0; j < HW; j++) {
             #pragma unroll
@@ -491,11 +496,15 @@ __device__ inline void grouped_gemm_sm120_dispenser(
  *
  * 结构 = grouped_gemm_sm120_dispenser 的 fp8 变体:
  *  - **P1: K-tile = 128 == 量化块**(CUTLASS 87c blockwise 主循环同构,
- *    docs/08 §5): A/B tile 各 16KB, 3 stage 96KB ≤ 99KB; 每个 stage 一次
- *    fp32 重标定 acc += sub × (a_scale[row] × w_scale[kblk,cblk])。
- *    consumer 为 KK=4 步主循环(A 双缓冲, B 单缓冲 —— 全宽 B 双缓冲会
- *    触发 ptxas spill acc/sub, 见 consumer 注释; 下一 stage 的 wait 提到
- *    末尾 QMMA 之前), 重标定点与旧 per-2-step 版一致 → 数值逐比特等价;
+ *    docs/08 §5): 每个 stage 一次 fp32 重标定 acc += sub × (a_scale[row]
+ *    × w_scale[kblk,cblk]); 下一 stage 的 wait 提到末尾 QMMA 之前,
+ *    重标定点与旧 per-2-step 版一致 → 数值逐比特等价;
+ *  - **P2: COL_BLOCK = 64**(docs/10 §7): 本平台 TMA 是驱动 syscall(ABI
+ *    call) → ptxas 预留 ~56 regs/thread, 有效上限 168 且 setmaxnreg 被
+ *    忽略(C7506); 128 宽 tile 需求 ~230 必 spill acc 进 local。64 宽后
+ *    acc/sub 各 32, A/B 全双缓冲总需求 ~135 ≤ 168。A tile 16KB + B tile
+ *    8KB, 4 stage 96KB ≤ 99KB。GLU 配对改 [gate32|up32] 交织(同一 128
+ *    列 scale 块内置换, 量化零改动); w_scales 按 col_idx>>1 取 128 列块;
  *  - scale 直接从 global 读(L2 广播,每 K 块每线程 3 个 float,不进
  *    smem,不动 TMA expect 字节数);
  *  - 行内 scale 映射:rt 行布局 data[偶] → 行 lane/4,data[奇] → +8
@@ -509,10 +518,15 @@ __device__ inline void grouped_gemm_sm120_dispenser(
 
 struct gemm_config_fp8 {
     static constexpr int ROW_BLOCK = TK_ROW_BLOCK;
-    static constexpr int COL_BLOCK = 128;
+    // P2: COL_BLOCK 128→64(docs/10 §7)。本平台 TMA 是驱动 syscall(ABI call)
+    // → ptxas 预留 ~56 regs/thread → 有效上限 168(setmaxnreg 被 C7506 忽略)。
+    // 128 宽 tile 需求 ~230(acc/sub 128 + frags + 寻址) 必 spill acc 进 local;
+    // 64 宽后 acc/sub 各 32, 全双缓冲下总需求 ~135, 稳进 168。GLU 配对改
+    // [gate32|up32] 交织(同一 128 列 scale 块内置换, 量化零改动)。
+    static constexpr int COL_BLOCK = 64;
     static constexpr int RED_BLOCK = 128;            // K-tile == 量化块(P1)
     static constexpr int SCALE_K = 128;              // 量化块 K 宽
-    static constexpr int PIPELINE_STAGES = 3;        // 3 × 32KB = 96KB ≤ 99KB
+    static constexpr int PIPELINE_STAGES = 4;        // 4 × 24KB = 96KB ≤ 99KB
     static constexpr int MMA_K = 32;                 // m16n8k32
 
     static constexpr int CONSUMER_WARPS = ROW_BLOCK / 16;
@@ -520,7 +534,7 @@ struct gemm_config_fp8 {
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
     using A_tile = st_fp8e4m3<ROW_BLOCK, RED_BLOCK>; // 16KB (RB=128)
-    using B_tile = st_fp8e4m3<COL_BLOCK, RED_BLOCK>; // 16KB, B^T (N-major)
+    using B_tile = st_fp8e4m3<COL_BLOCK, RED_BLOCK>; // 8KB, B^T (N-major)
 
     struct pipeline_inputs {
         A_tile A;
@@ -529,8 +543,8 @@ struct gemm_config_fp8 {
 
     static constexpr int DYNAMIC_SHARED_MEMORY = PIPELINE_STAGES * sizeof(pipeline_inputs);
     static_assert(SCALE_K == RED_BLOCK, "P1: K-tile == 量化块, 每 stage 重标定一次");
-    static_assert(PIPELINE_STAGES * ROW_BLOCK * RED_BLOCK * 2 <= 101376 - 2048,
-                  "fp8 pipeline 3x32KB=96KB, 须给静态 smem 留余量(sm120 上限 101376)");
+    static_assert(PIPELINE_STAGES * (ROW_BLOCK + COL_BLOCK) * RED_BLOCK <= 101376 - 2048,
+                  "fp8 pipeline 4x24KB=96KB, 须给静态 smem 留余量(sm120 上限 101376)");
 };
 
 /**
@@ -588,11 +602,6 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
 
     if (warp_id == cfg::CONSUMER_WARPS) {
         // ------------------------------------------------------ producer warp
-        // setmaxnreg(CUTLASS cooperative 同手法, docs/10 §6): producer 让出
-        // 寄存器给 consumer。dec 无条件执行; consumer inc 需求 16384 ≤ 空闲
-        // 池 17152(不依赖本 warp 先 dec) → inc 不阻塞, 无新等待依赖。
-        // 池账: 8×32×232 + 32×64 = 61440 ≤ 65536。
-        kittens::group<4>::decrease_registers<64>();
         if (lane_id == 0) {
             const int nblk = num_tasks / col_blocks;
             int q = 0;
@@ -625,15 +634,14 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
     } else {
         // ---------------------------------------------------- consumer warps
         // P1 主循环(CUTLASS sm120 blockwise 同构, docs/08 §5): 每 stage 恰好一
-        // 个量化块(K=128 = RED_BLOCK), KK=4 个 MMA step; A 寄存器双缓冲、
-        // B 单缓冲(寄存器预算约束, 见下); 下一 stage 的 arrived wait 提前到
-        // 本 stage 最后一条 QMMA 之前(mbarrier 延迟全遮蔽); finished arrive
-        // 保持在最后一条 QMMA 之后(此时该 stage 的 LDSM 已全部被 QMMA 消费
-        // 完毕, smem 可读覆)。重标定点与旧 per-2-step 版完全相同(每 128 K),
-        // 块内 MMA 顺序一致(K 升序) → 数值逐比特等价。
-        // setmaxnreg: consumer 拿 232 regs(docs/10 §6; acc/sub 128 + frags +
-        // 寻址需求 ~205-230, 静态 168 必 spill acc 进 local)。
-        kittens::group<4>::increase_registers<232>();
+        // 个量化块(K=128 = RED_BLOCK), KK=4 个 MMA step, A/B 全双缓冲(P2
+        // COL=64 后寄存器预算宽裕, docs/10 §7); 下一 stage 的 arrived wait
+        // 提前到本 stage 最后一条 QMMA 之前(mbarrier 延迟全遮蔽); finished
+        // arrive 保持在最后一条 QMMA 之后(此时该 stage 的 LDSM 已全部被
+        // QMMA 消费完毕, smem 可读覆)。重标定点与旧 per-2-step 版完全相同
+        // (每 128 K), 块内 MMA 顺序一致(K 升序) → 数值逐比特等价。
+        // 注: 不要在这里加 setmaxnreg —— 本平台 TMA 是驱动 syscall(ABI
+        // call), ptxas C7506 全忽略, docs/10 §6。
         constexpr int KK = cfg::RED_BLOCK / cfg::MMA_K;   // 4
         int q = 0;
         while (true) {
@@ -656,59 +664,48 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
             // scale 预取(docs/38: 首测耗时降低 21.3%, 边界处的 3 个 global scale 读
             // 在关键路径上, 32 个边界 × L2 延迟 ≈ 40% 气泡)。边界只消费
             // 已在寄存器的值, 同时发起下一块的加载(1 个 stage 的着陆窗)。
+            // w_scales 块 = 128 列: 每个 128 列 scale 块含两个 64 列 GEMM tile
             float bsc_n, s0_n, s1_n;
             if constexpr (RESCALE) {
-                bsc_n = G.w_scales[{e, col_idx, 0}];
+                bsc_n = G.w_scales[{e, col_idx >> 1, 0}];
                 s0_n = G.a_scales[{r0, 0}];
                 s1_n = G.a_scales[{r0 + 8, 0}];
             }
             (void)e;
 
-            // 寄存器预算(sm120 @288 线程上限 224 regs): acc+sub 已占 128,
-            // B 全宽(rt<128,32>=32 regs)双缓冲会把峰值推过阈值, ptxas 转
-            // spill 模式把 acc/sub 扔进 local(2026-07-25 首测 STACK:520,
-            // 性能 4.7x 回退) → A 双缓冲(仅 8 regs), B 单缓冲: kk+1 的 B
-            // LDSM 紧跟 kk 的 16 条 QMMA 之后发射(WAR 由程序序保证安全,
-            // LDSM 延迟由 QMMA 群掩护); 下一 stage 的 arrived wait 仍提前
-            // 到末尾 QMMA 之前(CUTLASS 序, mbarrier 延迟全遮蔽)。
+            // COL=64 后寄存器预算宽裕(docs/10 §7: 总需求 ~135 ≤ 168),
+            // 恢复 A/B 全双缓冲(P1 原设计): kk+1 的 LDSM 在 kk 的 QMMA 之前
+            // 发射; 下一 stage 的 arrived wait + 首个预取提到末尾 QMMA 之前
+            // (CUTLASS 序); finished arrive 保持在末尾 QMMA 之后(该 stage 的
+            // LDSM 已全部被 QMMA 消费, smem 可读覆)。
             rt_fp8e4m3<16, cfg::MMA_K> a_reg[2];
-            rt_fp8e4m3<cfg::COL_BLOCK, cfg::MMA_K> b_reg;
-            auto load_a = [&](int buf, int st, int kk) {
+            rt_fp8e4m3<cfg::COL_BLOCK, cfg::MMA_K> b_reg[2];
+            auto load_kk = [&](int buf, int st, int kk) {
                 auto a_sub = inputs[st].A.template subtile<16, cfg::MMA_K>({store_strip, kk});
                 warp::load(a_reg[buf], a_sub);
-            };
-            auto load_b = [&](int st, int kk) {
                 // B^T 行布局加载(ldmatrix 路径; col-layout fp8 加载在 TK
                 // 里没写完), mma_ABt 的 fp8 特化做 (M,K)x(N,K)^T
                 auto b_sub = inputs[st].B.template subtile<cfg::COL_BLOCK, cfg::MMA_K>({0, kk});
-                warp::load(b_reg, b_sub);
+                warp::load(b_reg[buf], b_sub);
             };
 
             wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
             update_phasebit<0>(phasebits, stage);
-            load_a(0, stage, 0);
-            load_b(stage, 0);
+            load_kk(0, stage, 0);
 
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                 const int nxt = (stage + 1) % cfg::PIPELINE_STAGES;
                 #pragma unroll
                 for (int kk = 0; kk < KK; kk++) {
                     if (kk + 1 < KK) {
-                        load_a((kk + 1) & 1, stage, kk + 1);
-                        warp::mma_ABt(sub, a_reg[kk & 1], b_reg, sub);
-                        load_b(stage, kk + 1);
-                    } else {
-                        if (red_idx + 1 < num_iters) {
-                            // CUTLASS 序: 下一 stage 的 wait 提到末尾 QMMA 前
-                            wait(inputs_arrived[nxt], get_phasebit<0>(phasebits, nxt));
-                            update_phasebit<0>(phasebits, nxt);
-                        }
-                        warp::mma_ABt(sub, a_reg[kk & 1], b_reg, sub);
-                        if (red_idx + 1 < num_iters) {
-                            load_a(0, nxt, 0);
-                            load_b(nxt, 0);
-                        }
+                        load_kk((kk + 1) & 1, stage, kk + 1);
+                    } else if (red_idx + 1 < num_iters) {
+                        // CUTLASS 序: 下一 stage 的 wait + 预取提到末尾 QMMA 前
+                        wait(inputs_arrived[nxt], get_phasebit<0>(phasebits, nxt));
+                        update_phasebit<0>(phasebits, nxt);
+                        load_kk(0, nxt, 0);
                     }
+                    warp::mma_ABt(sub, a_reg[kk & 1], b_reg[kk & 1], sub);
                 }
                 warp::arrive(inputs_finished[stage]);
                 stage = nxt;
@@ -719,7 +716,7 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                     const float s1 = s1_n * bsc_n;
                     const int kblk1 = red_idx + 1;
                     if (kblk1 < num_iters) {  // 预取下一块
-                        bsc_n = G.w_scales[{e, col_idx, kblk1}];
+                        bsc_n = G.w_scales[{e, col_idx >> 1, kblk1}];
                         s0_n = G.a_scales[{r0, kblk1}];
                         s1_n = G.a_scales[{r0 + 8, kblk1}];
                     }

@@ -226,7 +226,7 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     TORCH_CHECK(a_scales.size(0) == inputs.size(0) &&
                 a_scales.size(1) == inputs.size(1) / cfg::SCALE_K,
                 "a_scales must be (rows, K/128)");
-    TORCH_CHECK(w_scales.size(1) == weights.size(1) / cfg::COL_BLOCK &&
+    TORCH_CHECK(w_scales.size(1) == weights.size(1) / cfg::SCALE_K &&
                 w_scales.size(2) == weights.size(2) / cfg::SCALE_K,
                 "w_scales must be (E, N/128, K/128)");
     TORCH_CHECK(task_next.numel() == 1, "task_next must be a single int counter");
@@ -3778,7 +3778,7 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
     TORCH_CHECK(weights.size(2) == act_fp8.size(1), "w2 K must match act inter");
     TORCH_CHECK(act_fp8.size(1) % cfg::SCALE_K == 0, "inter % 128");
     TORCH_CHECK(act_scales.size(1) == act_fp8.size(1) / cfg::SCALE_K, "act_scales (P, inter/128)");
-    TORCH_CHECK(w_scales.size(1) == globals::H / cfg::COL_BLOCK &&
+    TORCH_CHECK(w_scales.size(1) == globals::H / cfg::SCALE_K &&
                 w_scales.size(2) == static_cast<int>(weights.size(2)) / cfg::SCALE_K,
                 "w2_scales must be (E, H/128, inter/128)");
     TORCH_CHECK(gemm_next.numel() == 1 && job_next.numel() == 1, "counters");
@@ -3992,7 +3992,7 @@ void entry_warp(at::Tensor &act_fp8, at::Tensor &act_scales,
     TORCH_CHECK(weights.size(2) == act_fp8.size(1), "w2 K must match act inter");
     TORCH_CHECK(act_fp8.size(1) % cfg::SCALE_K == 0, "inter % 128");
     TORCH_CHECK(act_scales.size(1) == act_fp8.size(1) / cfg::SCALE_K, "act_scales (P, inter/128)");
-    TORCH_CHECK(w_scales.size(1) == globals::H / cfg::COL_BLOCK &&
+    TORCH_CHECK(w_scales.size(1) == globals::H / cfg::SCALE_K &&
                 w_scales.size(2) == static_cast<int>(weights.size(2)) / cfg::SCALE_K,
                 "w2_scales must be (E, H/128, inter/128)");
     TORCH_CHECK(gemm_next.numel() == 1 && job_next.numel() == 1, "counters");
