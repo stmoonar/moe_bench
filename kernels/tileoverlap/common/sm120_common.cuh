@@ -585,6 +585,11 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
 
     if (warp_id == cfg::CONSUMER_WARPS) {
         // ------------------------------------------------------ producer warp
+        // setmaxnreg(CUTLASS cooperative 同手法, docs/10 §6): producer 让出
+        // 寄存器给 consumer。dec 无条件执行; consumer inc 需求 16384 ≤ 空闲
+        // 池 17152(不依赖本 warp 先 dec) → inc 不阻塞, 无新等待依赖。
+        // 池账: 8×32×232 + 32×64 = 61440 ≤ 65536。
+        kittens::group<4>::decrease_registers<64>();
         if (lane_id == 0) {
             const int nblk = num_tasks / col_blocks;
             int q = 0;
@@ -623,6 +628,9 @@ __device__ inline void grouped_gemm_sm120_fp8_dispenser(
         // 保持在最后一条 QMMA 之后(此时该 stage 的 LDSM 已全部被 QMMA 消费
         // 完毕, smem 可读覆)。重标定点与旧 per-2-step 版完全相同(每 128 K),
         // 块内 MMA 顺序一致(K 升序) → 数值逐比特等价。
+        // setmaxnreg: consumer 拿 232 regs(docs/10 §6; acc/sub 128 + frags +
+        // 寻址需求 ~205-230, 静态 168 必 spill acc 进 local)。
+        kittens::group<4>::increase_registers<232>();
         constexpr int KK = cfg::RED_BLOCK / cfg::MMA_K;   // 4
         int q = 0;
         while (true) {
