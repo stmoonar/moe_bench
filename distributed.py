@@ -248,7 +248,13 @@ def run_distributed(config: MoEBenchConfig, scheme_name: str = "serial") -> None
         config = dataclasses.replace(config, use_cuda_graph=False)
 
     host = os.getenv("LOCALHOST", "localhost")
-    init_method = f"tcp://{host}:{get_open_port()}"
+    port = get_open_port()
+    init_method = f"tcp://{host}:{port}"
+    # NVSHMEM scheme(tdtp)走 triton_dist.initialize_distributed, 其内部
+    # init_process_group 用 env:// rendezvous, 需要 MASTER_ADDR/MASTER_PORT;
+    # mp.spawn 不设置, 与 init_method 同源补上(子进程继承父进程环境)。
+    os.environ.setdefault("MASTER_ADDR", host)
+    os.environ.setdefault("MASTER_PORT", str(port))
     mp.spawn(
         _worker,
         args=(config.world_size, init_method, config, scheme_name),
