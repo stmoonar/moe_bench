@@ -3,7 +3,29 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-26）：baseline 的 triton 一直跑未调优兜底 config
+## 最新（2026-07-26 晚）：引擎归因探针出结论 + TMA cta 形态修复（待上机验证）
+
+单卡探针一键跑完（`tools/probe_engine.sh`，产物
+`tp_test_results/probe_20260726_080115_engine/`），结论与账全在
+[`docs/11`](docs/11_引擎归因探针与TMA_cta形态.md)：
+
+- **L0 差距 110.6µs = 重标定 76.9µs（70%）+ 结构性 33.7µs**（NCU 锁频，
+  fp8 774.6µs/71.2% tensor vs raw 697.7/79.4% vs CUTLASS 锚点 664/84.9%）；
+  四份 NCU 第一大 stall 全是固定延迟依赖（31-36%），发射槽 60% 空闲
+  → 重标定切片交织是头号杠杆。
+- **L1 已反超 CUTLASS**（425 vs 453µs）且 raw DRAM 67.7% 近带宽墙，
+  引擎优化只做 L0。
+- **TASK_Q 2→4 判负**（+0.2~0.6% 变慢）；K 扫描定价每任务边界 ~0.5-0.7µs
+  （L0 合计 ~20µs，小头）。
+- **试金石实锤：`.shared::cta` 载入是原生 UTMALDG，TK 用的 `.shared::cluster`
+  才走驱动 syscall**（.so 里 109 个 CALL.ABS 全来自 load）。已在
+  `sm120_common.cuh` 加 `tma_cta::load_async`（tile 5d/4d + vec 4d）替换全部
+  8 个 load 调用点（dispenser 2 + push 2 + scatter 4）。**⚠️ 未上机编译/验证**，
+  runbook 在 docs/11 §8——先编 litmus 的 `ld5d_cta`（5d cta 形态当时没测，
+  已补），再重编看 ptxas REG（168 帽是否随 CALL 消失而解除，决定
+  4×2+COL=128 路线生死），census 应 109→0，verify rel_err 应仍 1.68e-03。
+
+## 2026-07-26 早：baseline 的 triton 一直跑未调优兜底 config
 
 查 vLLM 源码确认：本机（RTX PRO 5000 / sm120）在 `fused_moe/configs/` 里没有任何
 条目，`try_get_optimal_moe_config` 查 `E=64,N=768,...` 落空后走 `get_default_config`
@@ -145,8 +167,12 @@ T=1024 3115µs，NCU 下 L0 789µs / tensor 71.3%（CUTLASS 参照 664µs / 84.9
    要（a）balanced / uniform 各出一份 JSON，（b）用
    `VLLM_TUNED_CONFIG_FOLDER` 复测 serial e2e，（c）按新 baseline 重报领先幅度，
    （d）把 docs/08 §2 的 triton 锁频数字标注为"未调优"或用调优 config 重采。
-5. 剩余优化杠杆（按归因排序）：A/B 改 2D TMA descriptor 绕开 4d/5d 的驱动 syscall；
-   4×2 warp 几何 + smem GLU 配对减 LDSM；scale 走 smem；e2e 侧继续压未隐藏通信。
+5. 剩余优化杠杆（2026-07-26 探针后重排，账见 docs/11 §9）：①重标定切片
+   交织（L0 差距的 70%，寄存器零成本、逐比特等价）；②任务边界 store 后置
+   （~20µs/L0）；③4×2 几何 + COL=128 + [gate16|up16]（等 cta 补丁后的 REG
+   裁决）；已关闭：TASK_Q（判负）、scale 进 smem（无 stall signature，降级
+   观察）、L1 引擎（已反超 CUTLASS 参照）。e2e 侧另有 act 量化暴露 ~50µs、
+   L1 尾 + final reduce watermark 可重叠量，未动。
 
 ## 6. 红线（写/改 kernel 前必读）
 

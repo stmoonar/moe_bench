@@ -261,8 +261,8 @@ __device__ inline void push_lane(const pglobals &G, int *__restrict__ push_next,
         const int t = G.push_order[{G.dev_idx, j}];   // 本源在各 dest 的消费序
         tma::expect_bytes(sem, sizeof(typename pglobals::token_vec) +
                                sizeof(typename pglobals::scale_vec));
-        tma::load_async(tok, G.pre_tokens[G.dev_idx], {t, 0}, sem);
-        tma::load_async(sc, G.pre_scales[G.dev_idx], {t, 0}, sem);
+        tma_cta::load_async(tok, G.pre_tokens[G.dev_idx], {t, 0}, sem);
+        tma_cta::load_async(sc, G.pre_scales[G.dev_idx], {t, 0}, sem);
         pcie_sync::guarded_wait(sem, phase);
         phase ^= 1;
         const int d = G.dev_idx * G.num_tokens + t;
@@ -310,11 +310,11 @@ __device__ inline void scatter_lane(const pglobals &G, int *__restrict__ pull_ne
         tma::expect_bytes(sem, sizeof(typename pglobals::token_vec) +
                                sizeof(typename pglobals::scale_vec));
         if (src == G.dev_idx) {       // 自己分片直读(免 staging 一跳)
-            tma::load_async(tok, G.pre_tokens[src], {t, 0}, sem);
-            tma::load_async(sc, G.pre_scales[src], {t, 0}, sem);
+            tma_cta::load_async(tok, G.pre_tokens[src], {t, 0}, sem);
+            tma_cta::load_async(sc, G.pre_scales[src], {t, 0}, sem);
         } else {                      // 本地 staging 读(~0.5µs, 无 PCIe RTT)
-            tma::load_async(tok, G.ag_staging[G.dev_idx], {d, 0}, sem);
-            tma::load_async(sc, G.ag_sscales[G.dev_idx], {d, 0}, sem);
+            tma_cta::load_async(tok, G.ag_staging[G.dev_idx], {d, 0}, sem);
+            tma_cta::load_async(sc, G.ag_sscales[G.dev_idx], {d, 0}, sem);
         }
         pcie_sync::guarded_wait(sem, phase);
         phase ^= 1;

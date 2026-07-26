@@ -113,6 +113,80 @@ __device__ static inline void wait_slot(const BAR &bar, const int my_dev, const 
 
 } // namespace pcie_sync
 
+/* ==========================================================================
+ * 1.5 tma_cta — .shared::cta 形态的 TMA load(docs/11)
+ *
+ * 2026-07-26 编译期试金石(tools/tma_litmus.cu)实锤: 本平台(sm_120a)上
+ * cp.async.bulk.tensor 的 **.shared::cluster 目标形态走驱动 syscall**
+ * (CALL.ABS.NOINC → __cuda_syscall_*, 每 kernel 预留 ~56 regs 调用帧,
+ * docs/10 §6 的 168 寄存器帽根因), 而 **.shared::cta 目标形态是原生单条
+ * UTMALDG**(REG:4, 零栈帧, 2d/4d 已验证; 5d 见 litmus ld5d_cta)。TK 上游
+ * (子模块, 不可改)的 load_async 固定发射 cluster 形态, 这里复刻其地址/
+ * 坐标计算, 仅把状态空间修饰符换成 cta。store 路径 TK 本来就是
+ * .global.shared::cta(原生 UTMASTG/UBLKCP), 无需处理。
+ *
+ * 语义等价性: sm120 无 thread block cluster, CTA == cluster, 两种形态的
+ * dst/mbar 操作数(CTA 本地 shared 地址)与完成语义(mbarrier complete_tx)
+ * 完全一致, 仅指令编码不同。mbarrier 的 expect_tx(tma::expect_bytes)
+ * 是原生 mbarrier 指令, 与拷贝指令的状态空间修饰符无耦合, 不用动。
+ * ======================================================================== */
+
+namespace tma_cta {
+
+/** tile 版(swizzled → 5d, 否则 4d): 对应 kittens::tma::load_async 的
+ *  NORMAL/dim::ROW 特化, 坐标计算原样复用 TK 的 detail::tma_coords。 */
+template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD = coord<ST>>
+__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore &bar) {
+    constexpr int AXIS = dim::ROW;
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src.template get_tma<ST, AXIS>());
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
+    uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&dst));
+    auto unit_coord = idx.template unit_coord<AXIS, 3>();
+    if constexpr (ST::swizzle) {
+        int4 tc = tma::detail::tma_coords<ST, AXIS>(unit_coord);
+        asm volatile(
+            "cp.async.bulk.tensor.5d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+            " [%0], [%1, {%3, %4, %5, %6, %7}], [%2];"
+            :
+            : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+              "n"(0), "r"(tc.x), "r"(tc.y), "r"(tc.z), "r"(tc.w)
+            : "memory");
+    } else {
+        static_assert(AXIS == 2, "For non-swizzled tiles, only axis 2 is supported.");
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+            " [%0], [%1, {%3, %4, %5, %6}], [%2];"
+            :
+            : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+              "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b)
+            : "memory");
+    }
+}
+
+/** vec 版(sv → 4d, 按 sv_tma_dim2 分片): 对应 kittens::tma::load_async
+ *  的 sv 重载, 分片/偏移逻辑原样复用 TK 的 sv_tma_dim1/2。 */
+template<ducks::sv::all SV, ducks::gl::all GL, ducks::coord::vec COORD = coord<SV>>
+__device__ static inline void load_async(SV &dst, const GL &src, const COORD &idx, semaphore &bar) {
+    coord<> unit_coord = idx.template unit_coord<-1, 3>();
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src.template get_tma<SV, -1>());
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
+    uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&dst));
+    for (int i = 0; i < ::kittens::detail::tma::sv_tma_dim2<SV>; i++) {
+        coord<> tma_coord = unit_coord;
+        tma_coord.c += i * ::kittens::detail::tma::sv_tma_dim1<SV>;
+        uint32_t dst_i_ptr = dst_ptr + i * ::kittens::detail::tma::sv_tma_dim1<SV> * sizeof(typename SV::dtype);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+            " [%0], [%1, {%3, %4, %5, %6}], [%2];"
+            :
+            : "r"(dst_i_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+              "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b)
+            : "memory");
+    }
+}
+
+} // namespace tma_cta
+
 struct noop_epilogue { __device__ inline void operator()(int, int) const {} };
 
 /* ROW_BLOCK = 每个 tile 的 token 行数, 同时是 expert 的 padding 单位。
@@ -318,9 +392,9 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
                     tma::expect_bytes(inputs_arrived[stage], sizeof(typename cfg::pipeline_inputs));
-                    tma::load_async(inputs[stage].A, G.activations, {row_idx, red_idx}, inputs_arrived[stage]);
+                    tma_cta::load_async(inputs[stage].A, G.activations, {row_idx, red_idx}, inputs_arrived[stage]);
                     // B^T: (E, N, K) 布局, tile 坐标 {N 块, K 块}
-                    tma::load_async(inputs[stage].B, G.weights, {e, col_idx, red_idx}, inputs_arrived[stage]);
+                    tma_cta::load_async(inputs[stage].B, G.weights, {e, col_idx, red_idx}, inputs_arrived[stage]);
                     stage = (stage + 1) % cfg::PIPELINE_STAGES;
                 }
                 q = (q + 1) % TASK_Q;

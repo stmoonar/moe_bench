@@ -20,6 +20,7 @@ set -u
 # ---------- 参数 ----------
 GPU="${1:-}"
 [ -z "$GPU" ] && { echo "用法: bash moe_bench/tools/probe_engine.sh <GPU_ID> [--no-ncu] [--taskq4] [--skip-build] [--repeats N]"; exit 1; }
+GPU="${GPU%%,*}"     # 单卡探针: 传了卡组也只取第一张(空闲检查/计时都按单卡口径)
 shift
 DO_NCU=1; DO_TASKQ=0; SKIP_BUILD=0; REPEATS=3
 while [ $# -gt 0 ]; do

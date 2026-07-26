@@ -107,6 +107,16 @@ __global__ void ld4d_cta(const FakeTmap *tm) {
             :: "r"(s32(buf)), "l"(tm), "r"(s32(&mbar)),
                "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
 }
+
+__global__ void ld5d_cta(const FakeTmap *tm) {   // tma_cta 的 swizzled tile 路径(A/B 加载)
+    SMEM_DECLS;
+    if (threadIdx.x == 0)
+        asm volatile(
+            "cp.async.bulk.tensor.5d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+            " [%0], [%1, {%3, %4, %5, %6, %7}], [%2];"
+            :: "r"(s32(buf)), "l"(tm), "r"(s32(&mbar)),
+               "n"(0), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
+}
 #endif
 
 /* ---------------- stores: shared -> global, bulk_group 完成语义 ---------------- */
