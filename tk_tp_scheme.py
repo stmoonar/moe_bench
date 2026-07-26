@@ -348,7 +348,25 @@ class TKFusedTP(DistributedScheme):
                 "blk_expert": self.blk_expert,
                 "slot_job": self.slot_job, "slot_w": self.slot_w,
             }
+            # 融合 kernel(tk.tp_sched_build, 单 block ~20-30us 替代 ~215us
+            # torch op 链)。smem 需求随 P 变(N + 4P + 4S + 小表), 超 99KB
+            # 自动回退 torch 版; TK_SCHED_FUSED=0 强制回退(A/B)。
+            _N = world * num_tokens * self.top_k
+            _smem_need = (_N + 4 * num_padded_total + 4 * world * num_tokens
+                          + 264 * 4 * 3 + 256 * 4 + 256 * 4 * world + 256)
+            self._sched_fused = (os.environ.get("TK_SCHED_FUSED", "1") == "1"
+                                 and _smem_need <= 101376)
             self._sched_graph = None  # captured lazily on first run()
+
+    def _sched_fused_call(self):
+        """单 kernel 调度表构建(与 _build_tp_schedules_gpu 逐元素一致,
+        首跑对拍)。"""
+        self.tk.tp_sched_build(
+            self._packed_all, self.padded, self.tp_slots, self.prered_w,
+            self.slack, self.pull_order, self.job_order, self.push_order,
+            self.blk_expert, self.slot_job, self.slot_w,
+            self.ctx.world_size, self.num_tokens, self._num_experts,
+            self.num_padded_total)
 
         # ---- weights ----
         # w1: fp8 权重先反量化(setup 一次), 按 GLU 列交织后重量化 —— scale 块
@@ -464,15 +482,32 @@ class TKFusedTP(DistributedScheme):
             torch.distributed.all_gather_into_tensor(
                 self._packed_all.view(-1), self._packed_local.view(-1))
             if self._sched_graph is None:
-                _build_tp_schedules_gpu(self._packed_all,
-                                        self.ctx.world_size, self._num_experts,
-                                        self.ctx.rank, self._sched_out)  # warmup
-                torch.cuda.synchronize()
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
+                if self._sched_fused:
+                    # 首跑对拍(此时 packed_all 已有真实路由): torch 向量化版
+                    # (基准, preflight 已裁决其与 golden 一致) vs 融合 kernel,
+                    # 逐表 torch.equal, 不过直接 raise, 不静默退化。
                     _build_tp_schedules_gpu(self._packed_all,
                                             self.ctx.world_size, self._num_experts,
                                             self.ctx.rank, self._sched_out)
+                    snap = {k: v.clone() for k, v in self._sched_out.items()}
+                    self._sched_fused_call()
+                    torch.cuda.synchronize()
+                    bad = [k for k in snap
+                           if not torch.equal(snap[k], self._sched_out[k])]
+                    assert not bad, f"tp_sched_build vs torch builder mismatch: {bad}"
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        self._sched_fused_call()
+                else:
+                    _build_tp_schedules_gpu(self._packed_all,
+                                            self.ctx.world_size, self._num_experts,
+                                            self.ctx.rank, self._sched_out)  # warmup
+                    torch.cuda.synchronize()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        _build_tp_schedules_gpu(self._packed_all,
+                                                self.ctx.world_size, self._num_experts,
+                                                self.ctx.rank, self._sched_out)
                 self._sched_graph = g
             else:
                 self._sched_graph.replay()

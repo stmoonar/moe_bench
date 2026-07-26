@@ -3,7 +3,39 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-26 深夜）：L1 EPIRED（epilogue 直推加权归约）已实现（待上机验证）
+## 最新（2026-07-26 深夜 2）：sched 融合 kernel（tpsched）已实现（待上机验证）
+
+L1 三条快速杠杆收口后（见下节），转向 e2e 第二大项 **sched 259µs**：
+`_build_tp_schedules_gpu` 的 ~20 个串行 torch op（CUDA graph 内 ~215µs）
+融合为**单 block kernel**（`tpsched::sched_build_kernel`，`tk.tp_sched_build`）。
+
+- 算法（与 golden/torch 版逐元素一致）：warp compaction 按 eid 保序分桶
+  （`__vcmpeq4` + shfl 前缀）一趟写 tp_slots/slot_job/slot_w；pull/job_order
+  利用 slot 双射 ⇒ mins/maxs 唯一，P 项出现标记 + 段式 scan 求秩**免
+  argsort**；push_order = pull_order 按 source 过滤派生，免第三次排序。
+- 正确性三层链：host golden ↔ torch 向量化版（preflight 裁决，未动）↔
+  融合 kernel（**首次 run 时逐表 `torch.equal` 对拍，不过直接 raise**）。
+  开关 `TK_SCHED_FUSED`（默认 1），smem 需求超 99KB（P 过大时）自动回退
+  torch 版。
+- 死锁审计：单 block kernel，无跨块/跨卡等待、无自旋、无 mbarrier，仅
+  `__syncthreads`/warp shfl，无等待点；graph 捕获安全。
+- 预期 sched 259 → ~85µs（all_gather 40 + pack 5 + kernel ~30-40），
+  e2e 1571 → ~1400。本地 preflight 回归通过（torch 版未动）。
+
+**⚠️ 未上机**（开发机无 nvcc）。runbook：
+
+```bash
+cd /workspace
+rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10
+#   ↑ setup 首跑自动执行 fused vs torch 逐表对拍(失败即 assert 退出);
+#     正确性门 rel_err 应仍 ~4.28e-2
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512
+#   ↑ 看 sched 段: 259 -> 预期 ~85; TK_SCHED_FUSED=0 可 A/B 回退
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --no-verify  # e2e
+```
+
+## 2026-07-26 深夜：L1 EPIRED（epilogue 直推加权归约）已实现（待上机验证）
 
 主配置 stage 归因（`time_tp_stages 64 20 512`，卡组 0-3）实测
 **L1 exposure 222.8µs**（L1_fused 572.2 vs L1_gemm_alone 349.4），账：

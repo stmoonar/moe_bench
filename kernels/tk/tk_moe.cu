@@ -876,6 +876,243 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
 
 } // namespace tppr8
 
+/* ===================================================================== *
+ * 6. TP 调度表融合构建(单 block kernel): 替代 _build_tp_schedules_gpu 的
+ *    ~20 个串行 torch op(CUDA graph 内 ~215us)。算法与 host golden /
+ *    torch 向量化版逐元素一致(setup 首跑 torch.equal 对拍, 不过直接
+ *    raise; preflight 继续裁决 torch 版 vs golden):
+ *      slot(n) = padded_base[eid[n]] + #{n'<n: eid[n']==eid[n]}
+ *    —— 按 eid 的**保序**计数分桶(warp compaction: vcmpeq4 + shfl 前缀),
+ *    一趟同时写出 tp_slots / slot_job / slot_w;
+ *      pull/job_order = argsort(mins/maxs) —— slot 是双射 => mins/maxs
+ *    跨 token 唯一(preflight 有双射不变式), 用 P 项出现标记 + 段式 scan
+ *    求秩, 免 argsort; push_order = pull_order 按 source 过滤(序保持),
+ *    免第三次排序。
+ *    单 block 无跨块/跨卡等待、无自旋, CUDA-graph 安全。
+ * ===================================================================== */
+namespace tpsched {
+constexpr int TOPK = 8;
+struct sched_params {
+    const int *packed;      // (N, 2) int32: [n*2]=eid, [n*2+1]=w bits
+    int *padded;            // (E,)
+    int *tp_slots;          // (S, TOPK) flat == slot_by_n
+    float *prered_w;        // (S, TOPK) flat
+    int *slack;             // (nblk,)
+    int *pull_order;        // (S,)
+    int *job_order;         // (S,)
+    int *push_order;        // (world, T)
+    int *blk_expert;        // (nblk,)
+    int *slot_job;          // (P,)
+    float *slot_w;          // (P,)
+    int world, T, E, S, N, P, nblk;
+};
+/* 段式 inclusive scan(单 block): 每线程段内串行 -> s_seg 段和 -> tid0 扫
+ * s_seg(exclusive) -> 段前缀加回。data 就地变为 inclusive 前缀。 */
+__device__ inline void seg_scan(int *data, const int L, int *s_seg) {
+    const int tid = threadIdx.x;
+    const int seg = (L + 255) / 256;
+    int sum = 0;
+    for (int i = 0; i < seg; i++) {
+        const int idx = tid * seg + i;
+        if (idx < L) { sum += data[idx]; data[idx] = sum; }
+    }
+    s_seg[tid] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        int acc = 0;
+        #pragma unroll 4
+        for (int i = 0; i < 256; i++) { const int t = s_seg[i]; s_seg[i] = acc; acc += t; }
+    }
+    __syncthreads();
+    const int base = s_seg[tid];
+    if (base != 0)
+        for (int i = 0; i < seg; i++) {
+            const int idx = tid * seg + i;
+            if (idx < L) data[idx] += base;
+        }
+    __syncthreads();
+}
+__global__ __launch_bounds__(256)
+void sched_build_kernel(const __grid_constant__ sched_params p) {
+    constexpr int RB = TK_ROW_BLOCK;
+    extern __shared__ int __shm[];
+    /* smem 切分: eid_u8[N] | scan_a[P](int) | misc[S](int) | 小表 */
+    uint8_t *eid_u8 = reinterpret_cast<uint8_t *>(__shm);
+    int *scan_a = reinterpret_cast<int *>(eid_u8 + p.N);          // (P,)
+    int *misc = scan_a + p.P;                                     // (S,)
+    int *s_counts = misc + p.S;                                   // (264,)
+    int *s_pbase  = s_counts + 264;                               // (264,)
+    int *s_rbend  = s_pbase + 264;                                // (264,)
+    int *s_seg    = s_rbend + 264;                                // (256,)
+    int *s_seg4   = s_seg + 256;                                  // (256*TK_NUM_DEVICES,)
+    const int tid = threadIdx.x;
+    // ---- phase 0: 清小表, 预载 eid + counts + prered_w; 清 padding 区 ----
+    if (tid < 264) s_counts[tid] = 0;
+    for (int i = tid; i < p.P; i += 256) { p.slot_job[i] = -1; p.slot_w[i] = 0.f; }
+    for (int i = tid; i < p.nblk; i += 256) p.slack[i] = 0;
+    __syncthreads();
+    for (int i = tid; i < p.N; i += 256) {
+        const int e = p.packed[i * 2];
+        eid_u8[i] = (uint8_t)e;
+        atomicAdd(&s_counts[e], 1);
+        p.prered_w[i] = __int_as_float(p.packed[i * 2 + 1]);
+    }
+    __syncthreads();
+    if (tid == 0) {   // per-expert 前缀(grp_start / padded_base / 行块前缀)
+        int ap = 0, ag = 0;
+        for (int e = 0; e < p.E; e++) {
+            const int c = s_counts[e];
+            const int pd = (c + RB - 1) / RB * RB;
+            s_pbase[e] = ap;
+            s_counts[e] = ag;       // 复用: 存 grp_start(未 padding 前缀)
+            ag += c; ap += pd;
+            p.padded[e] = pd;
+            s_rbend[e] = ap / RB;
+        }
+        s_counts[p.E] = ag;         // 末项, 供 phase 2 差分恢复原 counts
+    }
+    __syncthreads();
+    // ---- phase 1: warp compaction 保序分桶, 一趟写 tp_slots/slot_job/slot_w ----
+    {
+        const int warp = tid >> 5, lane = tid & 31;
+        const uint32_t *eid32 = reinterpret_cast<const uint32_t *>(eid_u8);
+        for (int e = warp; e < p.E; e += 8) {
+            const uint32_t e4 = 0x01010101u * (uint32_t)e;
+            int cursor = 0;
+            const int base = s_pbase[e];
+            for (int i4 = lane; i4 < p.N / 4; i4 += 32) {
+                const uint32_t eq = __vcmpeq4(eid32[i4], e4);
+                const int my_cnt = __popc(eq) >> 3;
+                int pref = my_cnt;
+                #pragma unroll
+                for (int off = 1; off < 32; off <<= 1) {
+                    const int v = __shfl_up_sync(~0u, pref, off);
+                    if (lane >= off) pref += v;
+                }
+                int slot = base + cursor + pref - my_cnt;
+                cursor += __shfl_sync(~0u, pref, 31);
+                if (my_cnt) {
+                    #pragma unroll
+                    for (int b = 0; b < 4; b++) {
+                        if ((eq >> (8 * b)) & 0xFF) {
+                            const int n = i4 * 4 + b;
+                            p.tp_slots[n] = slot;
+                            p.slot_job[slot] = n / TOPK;
+                            p.slot_w[slot] = p.prered_w[n];
+                            slot++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    // ---- phase 2: slack(尾块) + blk_expert ----
+    if (tid < p.E) {
+        const int c = s_counts[tid + 1] - s_counts[tid];   // grp_start 差分
+        if (c > 0) {
+            const int pd = (c + RB - 1) / RB * RB;
+            p.slack[(s_pbase[tid] + pd) / RB - 1] = pd - c;
+        }
+    }
+    for (int b = tid; b < p.nblk; b += 256) {
+        int e = 0;
+        while (e < p.E - 1 && s_rbend[e] <= b) e++;
+        p.blk_expert[b] = e;
+    }
+    __syncthreads();
+    // ---- phase 3+4: pull_order (mins 秩) / job_order (maxs 秩) ----
+    for (int half = 0; half < 2; half++) {
+        const bool is_min = (half == 0);
+        int *order = is_min ? p.pull_order : p.job_order;
+        for (int i = tid; i < p.P; i += 256) scan_a[i] = 0;
+        __syncthreads();
+        for (int j = tid; j < p.S; j += 256) {
+            int mn = 0x7fffffff, mx = -1;
+            #pragma unroll
+            for (int k = 0; k < TOPK; k++) {
+                const int s = p.tp_slots[j * TOPK + k];
+                mn = min(mn, s); mx = max(mx, s);
+            }
+            const int key = is_min ? mn : mx;
+            misc[j] = key;
+            scan_a[key] = 1;       // key 跨 token 唯一(双射), 无原子
+        }
+        __syncthreads();
+        seg_scan(scan_a, p.P, s_seg);
+        for (int j = tid; j < p.S; j += 256) order[scan_a[misc[j]] - 1] = j;
+        __syncthreads();
+    }
+    // ---- phase 5: push_order = pull_order 按 source 过滤(序保持) ----
+    {
+        const int seg = (p.S + 255) / 256;
+        int my_cnt[TK_NUM_DEVICES];
+        #pragma unroll
+        for (int s = 0; s < TK_NUM_DEVICES; s++) my_cnt[s] = 0;
+        for (int i = 0; i < seg; i++) {
+            const int idx = tid * seg + i;
+            if (idx < p.S) my_cnt[p.pull_order[idx] / p.T]++;
+        }
+        #pragma unroll
+        for (int s = 0; s < TK_NUM_DEVICES; s++)
+            s_seg4[tid * TK_NUM_DEVICES + s] = my_cnt[s];
+        __syncthreads();
+        if (tid == 0)   // 每 source 的 256 段前缀
+            #pragma unroll
+            for (int s = 0; s < TK_NUM_DEVICES; s++) {
+                int acc = 0;
+                for (int i = 0; i < 256; i++) {
+                    const int t = s_seg4[i * TK_NUM_DEVICES + s];
+                    s_seg4[i * TK_NUM_DEVICES + s] = acc; acc += t;
+                }
+            }
+        __syncthreads();
+        #pragma unroll
+        for (int s = 0; s < TK_NUM_DEVICES; s++) my_cnt[s] = 0;
+        for (int i = 0; i < seg; i++) {
+            const int idx = tid * seg + i;
+            if (idx < p.S) {
+                const int j = p.pull_order[idx];
+                const int s = j / p.T;
+                p.push_order[s * p.T + s_seg4[tid * TK_NUM_DEVICES + s] + my_cnt[s]++] = j;
+            }
+        }
+    }
+}
+void sched_build_entry(const at::Tensor &packed_all, at::Tensor &padded,
+                       at::Tensor &tp_slots, at::Tensor &prered_w,
+                       at::Tensor &slack, at::Tensor &pull_order,
+                       at::Tensor &job_order, at::Tensor &push_order,
+                       at::Tensor &blk_expert, at::Tensor &slot_job,
+                       at::Tensor &slot_w, const int world, const int T,
+                       const int E, const int P) {
+    const int S = world * T, N = S * TOPK, nblk = P / TK_ROW_BLOCK;
+    TORCH_CHECK(packed_all.numel() == N * 2, "packed_all (world,T,TOPK,2)");
+    TORCH_CHECK(tp_slots.numel() == N && prered_w.numel() == N, "tp_slots/prered_w");
+    TORCH_CHECK(slot_job.numel() >= P && slot_w.numel() >= P, "slot tables");
+    TORCH_CHECK(pull_order.numel() == S && job_order.numel() == S, "orders");
+    TORCH_CHECK(push_order.numel() == S, "push_order");
+    TORCH_CHECK(slack.numel() >= nblk && blk_expert.numel() >= nblk, "blk tables");
+    const int64_t smem = (int64_t)N + (int64_t)P * 4 + (int64_t)S * 4
+                       + 264 * 4 * 3 + 256 * 4 + 256 * 4 * TK_NUM_DEVICES + 256;
+    TORCH_CHECK(smem <= 101376, "sched fused kernel smem over 99KB, use torch path");
+    sched_params p {
+        .packed = packed_all.data_ptr<int>(),
+        .padded = padded.data_ptr<int>(), .tp_slots = tp_slots.data_ptr<int>(),
+        .prered_w = prered_w.data_ptr<float>(), .slack = slack.data_ptr<int>(),
+        .pull_order = pull_order.data_ptr<int>(), .job_order = job_order.data_ptr<int>(),
+        .push_order = push_order.data_ptr<int>(), .blk_expert = blk_expert.data_ptr<int>(),
+        .slot_job = slot_job.data_ptr<int>(), .slot_w = slot_w.data_ptr<float>(),
+        .world = world, .T = T, .E = E, .S = S, .N = N, .P = P, .nblk = nblk
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CUDACHECK(cudaFuncSetAttribute(sched_build_kernel,
+               cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    sched_build_kernel<<<1, 256, smem, stream>>>(p);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace tpsched
+
 #include <torch/csrc/utils/pybind.h>
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_TK_PARALLEL_TENSOR(m);
@@ -885,4 +1122,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tp_dispatch_gemm_fp8_push", &tpdisp8::entry_push);
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
     m.def("moe_final_reduce_push", &preredpush::final_reduce_push_entry);
+    m.def("tp_sched_build", &tpsched::sched_build_entry);
 }
