@@ -190,13 +190,24 @@ def _worker(
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     torch.set_default_device(device)
-    dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl",
-        init_method=init_method,
-        rank=local_rank,
-        world_size=world_size,
-        device_id=device,
-    )
+    # 需要 NVSHMEM 的 scheme(如 tdtp): 用 triton_dist 的初始化(内部完成 PG
+    # init + NVSHMEM init, 不能再重复 init PG)。env RANK/WORLD_SIZE/
+    # LOCAL_RANK 由 mp.spawn 提供; LOCAL_WORLD_SIZE 默认 8, 本机 4 卡要覆盖。
+    from .schemes import SCHEMES as _SCHEMES
+    _nvshmem = (scheme_name in _SCHEMES
+                and getattr(_SCHEMES[scheme_name], "requires_nvshmem", False))
+    if _nvshmem:
+        os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
+        from triton_dist.utils import initialize_distributed
+        initialize_distributed()
+    else:
+        dist.init_process_group(
+            backend="cpu:gloo,cuda:nccl",
+            init_method=init_method,
+            rank=local_rank,
+            world_size=world_size,
+            device_id=device,
+        )
     # Warm the world group.
     dist.all_reduce(torch.tensor([local_rank], device=device))
 
@@ -213,7 +224,11 @@ def _worker(
     except Exception:
         _fail_fast_exit()
     if dist.is_initialized():
-        dist.destroy_process_group()
+        if _nvshmem:
+            from triton_dist.utils import finalize_distributed
+            finalize_distributed()
+        else:
+            dist.destroy_process_group()
 
 
 def run_distributed(config: MoEBenchConfig, scheme_name: str = "serial") -> None:

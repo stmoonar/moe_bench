@@ -3,7 +3,40 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-26 午后）：正式里程碑 —— T=512 耗时降低 28.2% / T=1024 31.5%
+## 最新（2026-07-26 午后 2）：tdtp 新 scheme（Triton-distributed FP8 TP）已接入（待上机验证）
+
+应需求新增对照实现 **tdtp**：用 Triton-distributed 原语实现的 FP8 TP MoE
+（移植自 `tmp/td_benchmark` 的 c4，bf16 参考 = triton_dist 上游 `tp_moe.py`）。
+数据流：token 量化(1×128) → `fp8_ag_group_gemm`（NVSHMEM FP8 AG + tile 级
+overlap GEMM）→ swiglu+路由权重+量化融合 → `run_fp8_moe_reduce_rs(n_chunks=32)`
+（FP8 down GEMM + BF16 RS 分块 overlap）。与 tktp 的差别：GEMM 引擎是
+triton tl.dot（非手工 TK/mma.sync），融合靠多 stream + tile 级 wait（非单
+kernel persistent）。定位：**对照实验**（预期落在 serial 与 tktp 之间，
+GEMM 引擎差距决定上限），也是两级 tile 的快速原型土壤。
+
+- 移植：`kernels/td/` 下 6 个文件（fp8_tp_moe/fp8_allgather_group_gemm/
+  fp8_moe_reduce_rs/swiglu_quantize_fp8/common_ops/moe_utils，import 路径
+  已改为 `moe_bench.kernels.td.*`，依赖 triton_dist 上游包）；`td_tp_scheme.py`
+  （权重直接用 problem 的 fp8 数据 + 转置视图，与 tktp/serial 同一份量化、
+  公平口径）；`schemes.py` lazy 注册；`distributed.py` worker 在
+  `requires_nvshmem` 时改走 `triton_dist.utils.initialize_distributed()`
+  （内部 PG+NVSHMEM init，**不能再重复 init PG**；LOCAL_WORLD_SIZE=4 已覆盖）。
+- 死锁审计（红线）：triton_dist 的 wait 是**无界自旋**、NVSHMEM barrier_all
+  是对称集合——rank 崩溃时无 trap guard（与 07-16 同类风险，第三方库原语
+  不可改）。处理：① 首测严格单步隔离；② worker fail-fast 硬退出已有；
+  ③ tdtp 定位实验对照、不进生产路径；④ 若要转正，需用 compat 机制给
+  wait 打超时 guard patch。**本次未引入自有等待点。**
+- ⚠️ 未上机（开发机无 CUDA/triton_dist/vllm，本地仅 lint/结构验证）。
+  runbook（先确认卡空闲；triton_dist 环境与 NVSHMEM_SYMMEMRIC_SIZE≥1G 前提）：
+
+```bash
+cd /workspace
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --scheme tdtp --iters 10   # 正确性门(单步隔离)
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --scheme tdtp --no-verify \
+  --json tp_test_results/tdtp_t512/tdtp_t512.json                                          # 性能(vs serial/tktp)
+```
+
+## 2026-07-26 午后：正式里程碑 —— T=512 耗时降低 28.2% / T=1024 31.5%
 
 **主配置正式回归（`tp_test_results/tp_run_20260726_114848`，PASS=12 FAIL=0，
 卡组 0-3，warmup=20/bench=50）**：

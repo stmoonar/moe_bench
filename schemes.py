@@ -150,8 +150,8 @@ SCHEMES: dict[str, type[DistributedScheme]] = {
 
 
 def _register_optional_schemes() -> None:
-    """Register schemes with heavy/optional deps (TK extension) lazily, so a
-    missing build doesn't break the serial baseline import."""
+    """Register schemes with heavy/optional deps (TK extension, triton_dist)
+    lazily, so a missing build doesn't break the serial baseline import."""
     import sys as _sys
     import traceback as _tb
     try:
@@ -159,6 +159,12 @@ def _register_optional_schemes() -> None:
         SCHEMES[TKFusedTP.name] = TKFusedTP
     except Exception:
         print("[schemes] tktp unavailable:", file=_sys.stderr)
+        _tb.print_exc()
+    try:
+        from .td_tp_scheme import TDTFusedTP
+        SCHEMES[TDTFusedTP.name] = TDTFusedTP
+    except Exception:
+        print("[schemes] tdtp unavailable:", file=_sys.stderr)
         _tb.print_exc()
 
 
