@@ -998,7 +998,6 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
                             const int n = i4 * 4 + b;
                             p.tp_slots[n] = slot;
                             p.slot_job[slot] = n / TOPK;
-                            p.slot_w[slot] = p.prered_w[n];
                             slot++;
                         }
                     }
@@ -1006,6 +1005,13 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
             }
         }
     }
+    __syncthreads();
+    // ---- phase 1.5: slot_w 独立阶段。phase 1 里 "slot_w[slot] =
+    // prered_w[n]" 是随机读->随机写依赖链: 单 block(8 warp)藏不住 L2 读
+    // 延迟(2026-07-26 实测此句让 kernel 从 ~35us 指令账涨到 ~530us)。
+    // 拆成顺序读(coalesced 易藏) + 随机写(fire-and-forget 不等返回)。
+    for (int n = tid; n < p.N; n += 256)
+        p.slot_w[p.tp_slots[n]] = p.prered_w[n];
     __syncthreads();
     // ---- phase 2: slack(尾块) + blk_expert ----
     if (tid < p.E) {
