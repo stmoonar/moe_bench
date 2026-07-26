@@ -425,13 +425,14 @@ class TKFusedTP(DistributedScheme):
         self.act_scales = torch.zeros(P, inter // 128, device=device,
                                       dtype=torch.float32)
         self.expert_out = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
-        # EPIRED(TK_L1_EPIRED, 默认开): W2 GEMM 的 epilogue 把 C tile 乘 w
-        # 直接 red.add 进这张 fp32 部分和, expert_out 不再落地、push_job 不再
-        # 重读 8 行。本卡私有(只被本卡 GEMM 写/本卡 push_job 读); push_job
-        # 读出后顺手清零, 每迭代自维持, 无需额外 reset。
+        # EPIRED(TK_L1_EPIRED, 默认关 —— 2026-07-26 A/B 判负, docs/04):
+        # W2 GEMM 的 epilogue 把 C tile 乘 w 直接 red.add 进这张 fp32 部分和,
+        # expert_out 不落地、push_job 不重读 8 行。数值正确(rel_err 同基线),
+        # 但标量 red +193us / v2 向量 red +108us: 本机 L2 fp32 原子吞吐打不进
+        # per-task epilogue 关键路径。代码保留供复现, 默认走原路径。
         self.combine_partial = torch.zeros(self.num_jobs, H, device=device,
                                            dtype=torch.float32)
-        self.l1_epired = int(os.environ.get("TK_L1_EPIRED", "1"))
+        self.l1_epired = int(os.environ.get("TK_L1_EPIRED", "0"))
         # peer-writable combine staging: plane d (rows [d*T, d*T+T)) is written
         # only by card d (single writer, no atomics).
         self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,

@@ -80,6 +80,23 @@ TK_L1_EPIRED=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_st
 把默认翻回 0、负结果记入 docs/04（附 SASS 证据），转向 push_job 流水化
 （不依赖原子吞吐）和 `TK_COMM_SMS_L1` sweep。
 
+**v2 A/B 定案（2026-07-26 10:18，卡组 0-3）**：EPIRED=1(v2) exposure
+**300.4**（L1_fused 651.5）vs EPIRED=0 **192.2**（543.8，full_run 1572.9
+为目前最好）。标量→v2 改善 85µs（与原子数减半近似线性）仍输 108µs →
+**EPIRED 判负定案，默认已翻回 `TK_L1_EPIRED=0`**。SASS 证据：RED 原生指令
+（CALL.ABS=0）、158 寄存器无 spill → 瓶颈就是本机 L2 fp32 原子吞吐
+（~10^11 ops/s 量级）。**数值正确性已验证**：rel_err 4.278e-2 与历史基线
+4.28e-2 一致（W1 二次量化的既有口径问题，非本次引入；列/行映射裁决通过）。
+负结果已记入 docs/04 §2。
+
+**下一步（按 ROI）**：让渡税 ~98µs 是 L1 exposure 最大头（24 个 comm SM
+全程不做 GEMM），两条线：
+1. `TK_COMM_SMS_L1` sweep（0 改动）：12/16/20/32 × `time_tp_stages`，
+   找让渡税 vs push 吞吐的新拐点（当前 24 沿用 L0，L1 未必同点）；
+2. push_job 流水化（小改动）：TMA store 的 wait 推迟、双 buffer 允许 2 个
+   push 在飞，per-job 关键路径去掉 PCIe RTT（~1.5-2µs/job × 85 串行
+   job/块），给小 comm_sms 腾出空间，与 1 协同。
+
 ## 2026-07-26 晚：引擎归因探针出结论 + TMA cta 形态修复（待上机验证）
 
 单卡探针一键跑完（`tools/probe_engine.sh`，产物
