@@ -3,6 +3,19 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
+## 最新（2026-07-26 晚间）：修复 tdtp `setup` 接口参数错位（待复跑正确性门）
+
+首次上机已完成 Gloo/NCCL/NVSHMEM 初始化，但在 scheme setup 阶段报
+`TDTFusedTP.setup() missing 1 required positional argument: 'ctx'`。根因是实现误写为
+`setup(problem, cfg, ctx)`，与 `DistributedScheme.setup(problem, ctx)` 契约不一致；且
+多出的 `cfg` 从未使用，配置本来就由 `problem.config` 读取。现已改回标准二参数接口。
+本次没有修改 kernel、通信协议或等待点；应继续按单步隔离口径复跑：
+
+```bash
+cd /workspace
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --scheme tdtp --iters 10
+```
+
 ## 最新（2026-07-26 午后 2）：tdtp 新 scheme（Triton-distributed FP8 TP）已接入（待上机验证）
 
 应需求新增对照实现 **tdtp**：用 Triton-distributed 原语实现的 FP8 TP MoE

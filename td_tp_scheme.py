@@ -38,7 +38,7 @@ class TDTFusedTP(DistributedScheme):
     name = "tdtp"
     requires_nvshmem = True  # worker 据此走 NVSHMEM 初始化(不重复 init PG)
 
-    def setup(self, problem: MoEProblem, cfg, ctx: DistContext) -> None:
+    def setup(self, problem: MoEProblem, ctx: DistContext) -> None:
         from .kernels.td.fp8_tp_moe import FP8_TP_MoE
         import triton
 
