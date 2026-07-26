@@ -640,10 +640,12 @@ struct wred_store_policy {
                 const int job = (k & 1) ? job1 : job0;
                 if (job < 0) continue;
                 const float w = (k & 1) ? w1 : w0;
+                // float2 覆盖相邻 2 列且地址 8B 对齐: v2 向量原子(PTX 8.3+,
+                // sm_90+)一条顶两条标量 red, 原子数/L2 反压减半。
                 float *dst = &G.partial[{job, c0 + j * 16 + ((k >> 1) << 3)}];
                 const float2 v = acc.tiles[0][j].data[k];
-                asm volatile("red.global.add.f32 [%0], %1;" :: "l"(dst), "f"(v.x * w) : "memory");
-                asm volatile("red.global.add.f32 [%0], %1;" :: "l"(dst + 1), "f"(v.y * w) : "memory");
+                asm volatile("red.global.add.v2.f32 [%0], {%1, %2};"
+                             :: "l"(dst), "f"(v.x * w), "f"(v.y * w) : "memory");
             }
         }
     }

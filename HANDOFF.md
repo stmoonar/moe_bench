@@ -48,6 +48,38 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --no-verify  # e
 指令）。**风险**：fp32 red.add 的 L2 原子吞吐未在本机定量——若 A/B 不
 及预期，回退 `TK_L1_EPIRED=0` 并补一个 red 吞吐探针再裁决。
 
+**首轮 A/B（2026-07-26 10:08，卡组 0-3，`time_tp_stages 64 20 512`）**：
+EPIRED=1 exposure **385.6**（L1_fused 735.6）vs EPIRED=0 **192.7**
+（542.9，与旧基线 222.8/572.2 相当，差异在波动范围；注意第一组
+tok_copy 48.5 有干扰痕迹）。EPIRED=1 慢 ~193µs：**标量 red 判负（暂定）**。
+根因假设（待 SASS 裁决）：① epilogue 反压——8192 次标量 red/tile，
+LSU/L2 原子延迟把 per-task epilogue 打进 GEMM 关键路径（95 tasks/block
+× ~1.5µs ≈ 143µs，量级吻合）；② 寄存器/spill；③ 噪声放大（只解释零头）。
+
+**修正（v2，已提交）**：`red.add.v2.f32` 向量原子——float2 本就覆盖相邻
+2 列且 8B 对齐，一条顶两条，原子数 67M→33.5M，吞吐/反压同时减半。
+验证序列（先确认卡空闲；**若第 0 步没打印 V2_SUPPORTED 就不要重编 moe**）：
+
+```bash
+cd /workspace
+# 0) v2 试金石: 确认 sm120 支持 red.add.v2.f32
+printf '__global__ void k(float*p){asm volatile("red.global.add.v2.f32 [%%0],{%%1,%%2};"::"l"(p),"f"(1.f),"f"(2.f):"memory");}\n' > /tmp/redv2.cu
+nvcc -arch=sm_120a -c /tmp/redv2.cu -o /tmp/redv2.o && echo V2_SUPPORTED
+# 1) SASS 诊断(旧 .so, 可选但决定性): CALL.ABS 计数(判 syscall)、RED 形态
+cuobjdump -sass moe_bench/kernels/tk/build/tk_moe_w4_h4096_rb128.so | grep -c CALL.ABS
+cuobjdump -sass moe_bench/kernels/tk/build/tk_moe_w4_h4096_rb128.so | grep -m5 RED
+# 2) 重编 + 正确性门(v2 版, 单步隔离)
+rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10
+# 3) A/B: v2 vs 回退路径 (正确性过了再跑)
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512
+TK_L1_EPIRED=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512
+```
+
+裁决口径：EPIRED=1(v2) 必须打赢 EPIRED=0 的 192.7 才算方案成立；仍输则
+把默认翻回 0、负结果记入 docs/04（附 SASS 证据），转向 push_job 流水化
+（不依赖原子吞吐）和 `TK_COMM_SMS_L1` sweep。
+
 ## 2026-07-26 晚：引擎归因探针出结论 + TMA cta 形态修复（待上机验证）
 
 单卡探针一键跑完（`tools/probe_engine.sh`，产物
