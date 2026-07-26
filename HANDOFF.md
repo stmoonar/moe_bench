@@ -23,19 +23,19 @@ L1 三条快速杠杆收口后（见下节），转向 e2e 第二大项 **sched 
   e2e 1571 → ~1400。本地 preflight 回归通过（torch 版未动）。
 
 **上机验证通过（2026-07-26 11:27，卡组 0-3）**：对拍通过、正确性门
-rel_err 4.28e-2 同基线。**sched 259 → 227.2µs，e2e full_run 1571 →
-1526.0µs（本轮新低）**。三轮修复：① `push_order` 值域（全局 j → 局部
-j−s*T）；② `slot_w` 随机读→写依赖链摘出（576→374）；③ 1024 线程
-（8→32 warp 延迟隐藏，374→227）。**关键教训：单 block kernel 是延迟
-受限，8 warp 时全局读/shfl 串行链藏不住，指令账无效；随机读→写依赖链
-必须拆成顺序读+fire-and-forget 写。**
+rel_err 4.28e-2 同基线。**sched 259 → 227.2 →（微优化）204.6µs**；
+e2e full_run 在 1510-1550 区间（verify run min 1508.67 历史最低，med
+有双峰——共享机器老问题，终数不能挑孤立 min）。四轮修复/优化：
+① `push_order` 值域（全局 j → 局部 j−s*T）；② `slot_w` 随机读→写
+依赖链摘出（576→374）；③ 1024 线程（8→32 warp 延迟隐藏，374→227）；
+④ int4 分量 scan + phase 2 挪位 + 向量化读（227→204.6，省 22.6µs）。
+**关键教训：单 block kernel 是延迟受限，8 warp 时全局读/shfl 串行链
+藏不住，指令账无效；随机读→写依赖链必须拆成顺序读+fire-and-forget 写。**
 
-sched 227.2 的构成 ≈ pack ~5-10 + NCCL all_gather ~40-70 + kernel
-~120-180（仍高于指令账，疑 1024 线程 barrier ×~28 次与 clock 是主因）。
-剩余空间（未做）：kernel 微优化（int4 分量 scan 省 6 sync、phase 3/4 两
-轮合一、sync 精简，~20-30µs）；**NCCL all_gather 捕获进 graph**（消启动
-开销 ~30-50µs，torch NCCL 支持 graph capture，风险中）；argsort 混合
-方案（已无必要）。
+sched 204.6 的构成 ≈ pack ~5-10 + NCCL all_gather ~40-70 + kernel
+~120-150。剩余空间（未做）：**NCCL all_gather 捕获进 graph**（消启动
+开销 ~20-40µs，torch NCCL 支持 capture 但有坑，风险中）；kernel 继续
+抠（barrier/clock 主导，ROI 低）。
 
 ## 2026-07-26 深夜：L1 EPIRED（epilogue 直推加权归约）已实现（待上机验证）
 
