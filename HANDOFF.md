@@ -97,25 +97,28 @@ TK_L1_EPIRED=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_st
    push 在飞，per-job 关键路径去掉 PCIe RTT（~1.5-2µs/job × 85 串行
    job/块），给小 comm_sms 腾出空间，与 1 协同。
 
-**流水化已实现（待上机验证）**：push_job 双 buffer 2 在飞——TK 的
-`store_async` 末尾自带 `commit_group`，每 job 自成一组；槽位复用前
-`store_async_wait<1>` 只等最老一组并 retire（本地计数+选举 watermark），
-与新 job 的 wait_slot 同阶段并行（retire=tid0，wait_slot 改 tid1..8）；
-循环末按发出序 drain 两级（wait<1>/wait<0>）。watermark 语义不变（数据
-落地才计数），只延后 ~1 个 job。死锁审计：wait_group 等本线程自己发出的
-store（硬件事务必定完成），与旧版 wait<0> 性质相同，不新增跨卡等待类型；
-对端崩溃的 PCIe 传染路径与现状一致（docs/06 兜底）。A/B 无开关，对照 =
-父提交 `64e3b0b` 的 exposure 192.2。runbook：
+**流水化 + sweep 收官（2026-07-26 10:32，卡组 0-3）**：正确性门 rel_err
+4.28e-2 同基线（流水协议正确）。**流水化零收益**（exposure 192.6 vs
+192.2）——归因：24 块时 push **供给受限**（job 就绪速率 ≈ 2048/GEMM 窗口
+≈ 4.6 jobs/µs < 24 块消费能力），per-job RTT 本就不在瓶颈，消费侧再提速
+无处发挥。代码保留（协议等价、零成本，供给侧变化时受益）。
+**`TK_COMM_SMS_L1` sweep 见底**：12→281.5 / 16→260.5 / 20→196.0 /
+**24→192.6（甜点）** / 32→223.2，U 型底确认 20-24；减块尾部暴涨、增块
+让渡税线性涨。exposure 分解（让渡模型 GEMM×110/(110−comm)）：让渡税 97
++ act 量化 ~35 + 归约争带宽 ~40 + 供给受限尾 ~11。**L1 通信侧已无快速
+杠杆**，剩余可动的见下节"下一步"。
 
-```bash
-cd /workspace
-rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10   # 正确性门(单步隔离; rel_err 应仍 ~4.28e-2 不恶化)
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512
-# 协同 sweep(流水化后拐点可能下移):
-for c in 12 16 20 32; do echo "== TK_COMM_SMS_L1=$c =="; TK_COMM_SMS_L1=$c \
-  CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512 | grep -E "L1_fused|L1 exposure|full_run"; done
-```
+**下一步候选（按 ROI）**：
+1. **act 量化下沉 L0 epilogue（代号 L0Q，~35-50µs）**：glu epilogue 的
+   tile（128 行 × 64 列）恰好覆盖 1×64 量化组——组内 amax 可在 tile 内
+   shfl 归约，直接产 act_fp8 + 半组 scale，**独立量化 kernel 和 act bf16
+   落地（50MB 写读）全消失**；代价 = L1 主循环重标定改双半组（每 stage
+   2 次，复用 sub 寄存器组不加预算，L1 只 6 stage 约 +10µs）+ 数值口径
+   1×128→1×64（更细更准）。三处改动：glu epilogue、主循环重标定、缓冲。
+2. **sched 融合 kernel（259µs → 预期 ~150，另一条战线）**：当前 GPU
+   builder 是 ~15 个串行小 kernel + 4 次 argsort（CUDA graph 内），手写
+   融合 kernel（计数+prefix+slot+三序）可省一半；需 preflight 逐比特对拍
+   扩展。收益比 L1 内部继续挖更大，但偏离 L1 战线。
 
 ## 2026-07-26 晚：引擎归因探针出结论 + TMA cta 形态修复（待上机验证）
 
