@@ -934,6 +934,43 @@ __device__ inline void blk_exclusive_scan(int *s_seg, const int NT) {
     if (tid < NT) s_seg[tid] = wsum[warp] + x - v;
     __syncthreads();
 }
+/* int4 分量版(world=4 的 push_order 段前缀): 一次调用顶 4 次标量版,
+ * 省 6 次 __syncthreads。 */
+__device__ inline void blk_exclusive_scan_int4(int4 *s_seg, const int NT) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int4 v = (tid < NT) ? s_seg[tid] : make_int4(0, 0, 0, 0);
+    int4 x = v;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        int4 y;
+        y.x = __shfl_up_sync(~0u, x.x, off); y.y = __shfl_up_sync(~0u, x.y, off);
+        y.z = __shfl_up_sync(~0u, x.z, off); y.w = __shfl_up_sync(~0u, x.w, off);
+        if (lane >= off) { x.x += y.x; x.y += y.y; x.z += y.z; x.w += y.w; }
+    }
+    __shared__ int4 wsum4[32];
+    if (lane == 31) wsum4[warp] = x;
+    __syncthreads();
+    if (warp == 0) {
+        int4 w = (lane < NT / 32) ? wsum4[lane] : make_int4(0, 0, 0, 0);
+        int4 wx = w;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            int4 y;
+            y.x = __shfl_up_sync(~0u, wx.x, off); y.y = __shfl_up_sync(~0u, wx.y, off);
+            y.z = __shfl_up_sync(~0u, wx.z, off); y.w = __shfl_up_sync(~0u, wx.w, off);
+            if (lane >= off) { wx.x += y.x; wx.y += y.y; wx.z += y.z; wx.w += y.w; }
+        }
+        if (lane < NT / 32)
+            wsum4[lane] = make_int4(wx.x - w.x, wx.y - w.y, wx.z - w.z, wx.w - w.w);
+    }
+    __syncthreads();
+    if (tid < NT) {
+        const int4 b = wsum4[warp];
+        s_seg[tid] = make_int4(b.x + x.x - v.x, b.y + x.y - v.y,
+                               b.z + x.z - v.z, b.w + x.w - v.w);
+    }
+    __syncthreads();
+}
 /* 段式 inclusive scan: 每线程段内串行 -> blk_exclusive_scan 段前缀 -> 加回。 */
 __device__ inline void seg_scan(int *data, const int L, int *s_seg) {
     constexpr int NT = 1024;
@@ -980,10 +1017,10 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
     for (int i = tid; i < p.nblk; i += NT) p.slack[i] = 0;
     __syncthreads();
     for (int i = tid; i < p.N; i += NT) {
-        const int e = p.packed[i * 2];
-        eid_u8[i] = (uint8_t)e;
-        atomicAdd(&s_counts[e], 1);
-        p.prered_w[i] = __int_as_float(p.packed[i * 2 + 1]);
+        const int2 pk = reinterpret_cast<const int2 *>(p.packed)[i];
+        eid_u8[i] = (uint8_t)pk.x;
+        atomicAdd(&s_counts[pk.x], 1);
+        p.prered_w[i] = __int_as_float(pk.y);
     }
     __syncthreads();
     if (tid == 0) {   // per-expert 前缀(grp_start / padded_base / 行块前缀)
@@ -1000,6 +1037,20 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
         s_counts[p.E] = ag;         // 末项, 供 phase 2 差分恢复原 counts
     }
     __syncthreads();
+    // ---- phase 2: slack(尾块) + blk_expert(挪到 phase 1 前: 输入只依赖
+    // tid0 段, 与 phase 1 无写竞争, 共用其后的 sync) ----
+    if (tid < p.E) {
+        const int c = s_counts[tid + 1] - s_counts[tid];   // grp_start 差分
+        if (c > 0) {
+            const int pd = (c + RB - 1) / RB * RB;
+            p.slack[(s_pbase[tid] + pd) / RB - 1] = pd - c;
+        }
+    }
+    for (int b = tid; b < p.nblk; b += NT) {
+        int e = 0;
+        while (e < p.E - 1 && s_rbend[e] <= b) e++;
+        p.blk_expert[b] = e;
+    }
     // ---- phase 1: warp compaction 保序分桶, 一趟写 tp_slots/slot_job ----
     {
         const int warp = tid >> 5, lane = tid & 31;
@@ -1038,21 +1089,11 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
     // prered_w[n]" 是随机读->随机写依赖链: 单 block 藏不住 L2 读延迟
     // (2026-07-26 实测此句让 kernel 从 ~35us 指令账涨到 ~530us)。
     // 拆成顺序读(coalesced 易藏) + 随机写(fire-and-forget 不等返回)。
-    for (int n = tid; n < p.N; n += NT)
-        p.slot_w[p.tp_slots[n]] = p.prered_w[n];
-    __syncthreads();
-    // ---- phase 2: slack(尾块) + blk_expert ----
-    if (tid < p.E) {
-        const int c = s_counts[tid + 1] - s_counts[tid];   // grp_start 差分
-        if (c > 0) {
-            const int pd = (c + RB - 1) / RB * RB;
-            p.slack[(s_pbase[tid] + pd) / RB - 1] = pd - c;
-        }
-    }
-    for (int b = tid; b < p.nblk; b += NT) {
-        int e = 0;
-        while (e < p.E - 1 && s_rbend[e] <= b) e++;
-        p.blk_expert[b] = e;
+    for (int n4 = tid; n4 < p.N / 4; n4 += NT) {
+        const int4 sl = reinterpret_cast<const int4 *>(p.tp_slots)[n4];
+        const float4 wv = reinterpret_cast<const float4 *>(p.prered_w)[n4];
+        p.slot_w[sl.x] = wv.x; p.slot_w[sl.y] = wv.y;
+        p.slot_w[sl.z] = wv.z; p.slot_w[sl.w] = wv.w;
     }
     __syncthreads();
     // ---- phase 3+4: pull_order (mins 秩) / job_order (maxs 秩) ----
@@ -1062,12 +1103,12 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
         for (int i = tid; i < p.P; i += NT) scan_a[i] = 0;
         __syncthreads();
         for (int j = tid; j < p.S; j += NT) {
-            int mn = 0x7fffffff, mx = -1;
-            #pragma unroll
-            for (int k = 0; k < TOPK; k++) {
-                const int s = p.tp_slots[j * TOPK + k];
-                mn = min(mn, s); mx = max(mx, s);
-            }
+            const int4 a = reinterpret_cast<const int4 *>(p.tp_slots)[j * 2];
+            const int4 b = reinterpret_cast<const int4 *>(p.tp_slots)[j * 2 + 1];
+            const int mn = min(min(min(a.x, a.y), min(a.z, a.w)),
+                               min(min(b.x, b.y), min(b.z, b.w)));
+            const int mx = max(max(max(a.x, a.y), max(a.z, a.w)),
+                               max(max(b.x, b.y), max(b.z, b.w)));
             const int key = is_min ? mn : mx;
             misc[j] = key;
             scan_a[key] = 1;       // key 跨 token 唯一(双射), 无原子
@@ -1081,6 +1122,7 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
     // 注意 golden 语义: push_order[s] 存**局部** token id (j - s*T, 值域
     // [0,T), push_lane 用它索引本卡 token 行), 不是全局 j。
     {
+        static_assert(TK_NUM_DEVICES == 4, "int4 分量 scan 一次顶 4 次标量");
         const int seg = (p.S + NT - 1) / NT;
         int my_cnt[TK_NUM_DEVICES];
         #pragma unroll
@@ -1089,13 +1131,12 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
             const int idx = tid * seg + i;
             if (idx < p.S) my_cnt[p.pull_order[idx] / p.T]++;
         }
-        #pragma unroll
-        for (int s = 0; s < TK_NUM_DEVICES; s++)
-            s_seg4[s * NT + tid] = my_cnt[s];              // 列主: [s][tid]
+        reinterpret_cast<int4 *>(s_seg4)[tid] =
+            make_int4(my_cnt[0], my_cnt[1], my_cnt[2], my_cnt[3]);
         __syncthreads();
-        #pragma unroll
-        for (int s = 0; s < TK_NUM_DEVICES; s++)
-            blk_exclusive_scan(&s_seg4[s * NT], NT);
+        blk_exclusive_scan_int4(reinterpret_cast<int4 *>(s_seg4), NT);
+        const int4 pref4 = reinterpret_cast<const int4 *>(s_seg4)[tid];
+        const int pref[TK_NUM_DEVICES] = {pref4.x, pref4.y, pref4.z, pref4.w};
         #pragma unroll
         for (int s = 0; s < TK_NUM_DEVICES; s++) my_cnt[s] = 0;
         for (int i = 0; i < seg; i++) {
@@ -1103,7 +1144,7 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
             if (idx < p.S) {
                 const int j = p.pull_order[idx];
                 const int s = j / p.T;
-                p.push_order[s * p.T + s_seg4[s * NT + tid] + my_cnt[s]++] = j - s * p.T;
+                p.push_order[s * p.T + pref[s] + my_cnt[s]++] = j - s * p.T;
             }
         }
     }
