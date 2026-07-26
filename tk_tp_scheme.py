@@ -62,6 +62,11 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
         arrival-flag position mapping);
       - blk_expert (nblk,) int32: row block -> expert id (the dispenser GEMM's
         B-tile index);
+      - slot_job (num_padded_total,) int32: gathered row -> dense job id
+        (src_dev*T + src_tok), -1 on padding rows — the INVERSE map of
+        tp_slots, driving the layer1 EPIRED epilogue's weighted red.add;
+      - slot_w (num_padded_total,) float32: routing weight per gathered row,
+        0 on padding rows;
       - num_padded_total: gathered rows (= sum(padded)).
 
     Slot order within an expert is CANONICAL (src_dev, src_tok, kpos) —
@@ -93,6 +98,8 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     S = world_size * num_tokens
     tp_slots = torch.full((S, top_k), -1, dtype=torch.int32, device="cpu")
     tp_w = torch.zeros((S, top_k), dtype=torch.float32, device="cpu")
+    slot_job = torch.full((num_padded_total,), -1, dtype=torch.int32, device="cpu")
+    slot_w = torch.zeros(num_padded_total, dtype=torch.float32, device="cpu")
     for src_dev in range(world_size):  # canonical: src_dev ascending on EVERY rank
         for src_tok in range(num_tokens):
             j = src_dev * num_tokens + src_tok
@@ -100,7 +107,10 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
                 slot = write_pos[eid]
                 write_pos[eid] += 1
                 tp_slots[j, kpos] = slot
-                tp_w[j, kpos] = float(all_w_cpu[src_dev, src_tok, kpos])
+                wjk = float(all_w_cpu[src_dev, src_tok, kpos])
+                tp_w[j, kpos] = wjk
+                slot_job[slot] = j
+                slot_w[slot] = wjk
 
     nblk = num_padded_total // ROW_BLOCK
     slack = torch.zeros(nblk, dtype=torch.int32, device="cpu")
@@ -134,7 +144,7 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     return (padded.to(torch.int32).to(device), tp_slots.to(device),
             tp_w.to(device), slack.to(device), pull_order.to(device),
             job_order.to(device), push_order.to(device), blk_expert.to(device),
-            num_padded_total)
+            slot_job.to(device), slot_w.to(device), num_padded_total)
 
 
 def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
@@ -193,6 +203,15 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     # through prered_w's int32 view.
     out["prered_w"].view(torch.int32).copy_(
         packed_all[..., 1].reshape(world_size * T, top_k))
+    # inverse map slot -> (job, w) for the layer1 EPIRED epilogue (weighted
+    # red.add needs job id + weight per gathered row). slot_by_n is a
+    # bijection onto the valid slots, so padding rows keep the fill value
+    # (job=-1 -> epilogue skips; w=0). Rebuilt every run: clear then scatter.
+    job_of_n = (torch.arange(N, device=device) // top_k).to(torch.int32)
+    out["slot_job"].fill_(-1)
+    out["slot_job"].scatter_(0, slot_by_n.long(), job_of_n)
+    out["slot_w"].zero_()
+    out["slot_w"].scatter_(0, slot_by_n.long(), out["prered_w"].reshape(N))
 
     # slack: only the tail block of each expert carries (padded - real); scatter
     # via a trash slot for empty experts (capture-safe, no boolean compaction).
@@ -270,7 +289,7 @@ class TKFusedTP(DistributedScheme):
 
         # ---- host golden schedule (not timed) ----
         (padded, tp_slots, tp_w, slack, pull_order, job_order, push_order,
-         blk_expert, num_padded_total) = _build_tp_schedules(
+         blk_expert, slot_job, slot_w, num_padded_total) = _build_tp_schedules(
             problem.topk_ids, problem.topk_weights, num_tokens, world,
             num_experts, ctx.rank, device)
         self.padded = padded
@@ -281,6 +300,8 @@ class TKFusedTP(DistributedScheme):
         self.job_order = job_order.contiguous()
         self.push_order = push_order.contiguous()
         self.blk_expert = blk_expert.contiguous()
+        self.slot_job = slot_job.contiguous()
+        self.slot_w = slot_w.contiguous()
         self.num_padded_total = num_padded_total
         self.num_jobs = world * num_tokens
         # 每迭代清零的计数器(同 stream, 无需额外同步)
@@ -325,6 +346,7 @@ class TKFusedTP(DistributedScheme):
                 "job_order": self.job_order,
                 "push_order": self.push_order,
                 "blk_expert": self.blk_expert,
+                "slot_job": self.slot_job, "slot_w": self.slot_w,
             }
             self._sched_graph = None  # captured lazily on first run()
 
@@ -403,6 +425,13 @@ class TKFusedTP(DistributedScheme):
         self.act_scales = torch.zeros(P, inter // 128, device=device,
                                       dtype=torch.float32)
         self.expert_out = torch.zeros(P, H, device=device, dtype=torch.bfloat16)
+        # EPIRED(TK_L1_EPIRED, 默认开): W2 GEMM 的 epilogue 把 C tile 乘 w
+        # 直接 red.add 进这张 fp32 部分和, expert_out 不再落地、push_job 不再
+        # 重读 8 行。本卡私有(只被本卡 GEMM 写/本卡 push_job 读); push_job
+        # 读出后顺手清零, 每迭代自维持, 无需额外 reset。
+        self.combine_partial = torch.zeros(self.num_jobs, H, device=device,
+                                           dtype=torch.float32)
+        self.l1_epired = int(os.environ.get("TK_L1_EPIRED", "1"))
         # peer-writable combine staging: plane d (rows [d*T, d*T+T)) is written
         # only by card d (single writer, no atomics).
         self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
@@ -482,12 +511,13 @@ class TKFusedTP(DistributedScheme):
         tk.moe_tp_gemm_prered_push_fp8(
             self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
             self.expert_out, self.padded,
+            self.combine_partial, self.slot_job, self.slot_w,
             self.combine_staging, self.prered_dst, self.tp_slots,
             self.prered_w, self.combine_local_cnt, self.push_expected_l1,
             self.blk_expert, self.l1_gemm_next, self.job_order,
             self.job_next, self.barrier_l1, self.num_comm_sms_l1,
             self.num_padded_total, self.num_tokens, self.num_jobs,
-            self._l1_seq)
+            self._l1_seq, self.l1_epired)
         tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
                                  self.recv_from, self.combine_out, self.barrier_l1,
                                  self.num_tokens, self._l1_seq)

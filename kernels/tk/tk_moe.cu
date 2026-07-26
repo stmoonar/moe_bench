@@ -553,6 +553,9 @@ struct globals {
     using weights_gl     = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;  // w2 (E, H, inter) = B^T
     using w_scales_gl    = gl<float, 1, -1, -1, -1>;                 // (E, H/128, inter/128)
     using outputs_gl     = gl<bf16, 1, 1, -1, H>;                    // expert_out (bf16)
+    using partial_gl     = gl<float, 1, 1, -1, H>;                   // combine_partial (num_jobs, H) fp32
+    using sjob_gl        = gl<int, 1, 1, 1, -1>;                     // slot_job (P,)
+    using sw_gl          = gl<float, 1, 1, 1, -1>;                   // slot_w (P,)
     using counts_gl      = gl<int, 1, 1, 1, -1>;
     using staging_pgl    = pgl<gl<bf16, 1, 1, -1, H, row_vec>, NUM_DEVICES, false>;
     using dst_gl         = gl<int, 1, 1, -1, 2>;
@@ -565,6 +568,9 @@ struct globals {
     weights_gl weights;
     w_scales_gl w_scales;
     outputs_gl outputs;
+    partial_gl partial;
+    sjob_gl slot_job;
+    sw_gl slot_w;
     counts_gl padded_tokens_per_expert;
     const int num_local_experts;
     const int expert_offset;
@@ -581,6 +587,7 @@ struct globals {
     const int num_jobs;
     const int num_comp_sms;
     const int seq;
+    const int use_epired;
 };
 struct no_gate { __device__ inline void operator()(int) const {} };
 // 与 preredpush::signal_epilogue 同构(fp8 config 的 CONSUMER_WARPS 同值)
@@ -599,8 +606,52 @@ struct signal_epilogue {
                          :: "l"(&G.barrier[G.dev_idx][{1, row_idx}]), "r"(G.seq) : "memory");
     }
 };
-// push_job: 行块就绪后做本地 top-k 加权归约, 把整行推到源卡 staging,
-// 最后一条到达时由本地选举出的唯一写者发 watermark(源卡 final reduce 等它)。
+// EPIRED store policy(TK_L1_EPIRED): C tile 不再写 expert_out, 在寄存器里
+// 乘 w 后直接 red.add 进 combine_partial 的对应 job 行 —— 省掉 expert_out
+// 写 134MB + push_job 重读 8 行 134MB(H=4096, P=16K 时)。red 是
+// fire-and-forget(无返回、无等待), 可见性由 signal_epilogue 既有的
+// threadfence + 行块放行信号保证; padding 行 slot_job=-1 跳过。
+// rt 布局(docs/10, global_to_register 实测): data[k] 偶 → 行 r0, 奇 → r0+8;
+// k>>1 → 列 +8; float2 = 相邻 2 列。
+struct wred_store_policy {
+    const globals &G;
+    template <int COL = gemm_config_fp8::COL_BLOCK>
+    __device__ inline void operator()(rt_fl<16, COL> &acc,
+                                      int row_idx, int col_idx) const {
+        if (!G.use_epired) {
+            kittens::group<gemm_config_fp8::CONSUMER_WARPS>::store(
+                G.outputs, acc, {row_idx, col_idx});
+            return;
+        }
+        constexpr int WG = gemm_config_fp8::CONSUMER_WARPS;
+        const int warp_id = kittens::warpid();
+        const int lane = kittens::laneid();
+        const int strip = (WG % 4 == 0) ? (warp_id / 4 + (warp_id % 4) * (WG / 4)) : warp_id;
+        const int r0 = row_idx * gemm_config_fp8::ROW_BLOCK + strip * 16 + (lane >> 2);
+        const int job0 = G.slot_job[{r0}];
+        const int job1 = G.slot_job[{r0 + 8}];
+        const float w0 = G.slot_w[{r0}];
+        const float w1 = G.slot_w[{r0 + 8}];
+        const int c0 = col_idx * COL + (lane & 3) * 2;
+        #pragma unroll
+        for (int j = 0; j < acc.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
+                const int job = (k & 1) ? job1 : job0;
+                if (job < 0) continue;
+                const float w = (k & 1) ? w1 : w0;
+                float *dst = &G.partial[{job, c0 + j * 16 + ((k >> 1) << 3)}];
+                const float2 v = acc.tiles[0][j].data[k];
+                asm volatile("red.global.add.f32 [%0], %1;" :: "l"(dst), "f"(v.x * w) : "memory");
+                asm volatile("red.global.add.f32 [%0], %1;" :: "l"(dst + 1), "f"(v.y * w) : "memory");
+            }
+        }
+    }
+};
+// push_job: 行块就绪后做本地 top-k 加权归约(EPIRED 时归约已在 GEMM
+// epilogue 完成, 这里只读 fp32 部分和转 bf16 并顺手清零, 供下一迭代直接用),
+// 把整行推到源卡 staging, 最后一条到达时由本地选举出的唯一写者发
+// watermark(源卡 final reduce 等它)。
 __device__ inline void push_job(const globals &G, const int j) {
     if (j >= G.num_jobs) return;
     constexpr int H = globals::H, VEC = 8, HVEC = H / VEC;
@@ -631,6 +682,23 @@ __device__ inline void push_job(const globals &G, const int j) {
 
     // 归约结果先落 smem 行, 再 TMA 推远端
     float4 *row_v = reinterpret_cast<float4 *>(reinterpret_cast<bf16 *>(&row));
+    if (G.use_epired) {
+        // epilogue 已把 w 乘进 partial; 读 fp32 行(16KB)转 bf16, 读位清零。
+        // 本卡私有缓冲, 唯一读者就是 push_job, 无竞争; 清零保证下一迭代从 0 累加。
+        float4 *p_v = reinterpret_cast<float4 *>(&G.partial[{j, 0}]);
+        constexpr int HF8 = H / 8;   // 每迭代 8 个 fp32 -> 16B bf16
+        for (int c = threadIdx.x; c < HF8; c += blockDim.x) {
+            float4 lo = p_v[2 * c], hi = p_v[2 * c + 1];
+            bf16_2 res[4];
+            res[0] = __floats2bfloat162_rn(lo.x, lo.y);
+            res[1] = __floats2bfloat162_rn(lo.z, lo.w);
+            res[2] = __floats2bfloat162_rn(hi.x, hi.y);
+            res[3] = __floats2bfloat162_rn(hi.z, hi.w);
+            row_v[c] = *reinterpret_cast<const float4 *>(res);
+            p_v[2 * c]     = make_float4(0.f, 0.f, 0.f, 0.f);
+            p_v[2 * c + 1] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    } else {
     for (int c = threadIdx.x; c < HVEC; c += blockDim.x) {
         float acc[VEC];
         #pragma unroll
@@ -653,6 +721,7 @@ __device__ inline void push_job(const globals &G, const int j) {
         #pragma unroll
         for (int jj = 0; jj < VEC / 2; jj++) res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
         row_v[c] = *reinterpret_cast<const float4 *>(res);
+    }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -677,7 +746,7 @@ void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_exper
         const int nblk = G.num_padded_local_tokens / gemm_config_fp8::ROW_BLOCK;
         grouped_gemm_sm120_fp8_dispenser(
             G, no_gate{}, signal_epilogue{G, col_blocks},
-            plain_store_policy<globals::outputs_gl>{G.outputs},
+            wred_store_policy{G},
             blk_expert, gemm_next, nblk * col_blocks);
         kittens::group<gemm_config_fp8::NUM_WARPS>::sync(2);  // 专用命名 barrier(docs/04)
     }
@@ -701,13 +770,15 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
            at::Tensor &weights, at::Tensor &w_scales,
            at::Tensor &expert_outputs,
            at::Tensor &padded_tokens_per_expert,
+           at::Tensor &partial, at::Tensor &slot_job, at::Tensor &slot_w,
            kittens::py::TKParallelTensor &staging, at::Tensor &prered_dst,
            at::Tensor &prered_slots, at::Tensor &prered_w, at::Tensor &local_cnt,
            at::Tensor &push_expected_l1, at::Tensor &blk_expert,
            at::Tensor &gemm_next, at::Tensor &job_order, at::Tensor &job_next,
            kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_padded_local_tokens,
-           const int num_source_tokens, const int num_jobs, const int seq) {
+           const int num_source_tokens, const int num_jobs, const int seq,
+           const int use_epired) {
     using cfg = gemm_config_fp8;
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
@@ -721,6 +792,12 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
                 "w2_scales must be (E, H/128, inter/128)");
     TORCH_CHECK(gemm_next.numel() == 1 && job_next.numel() == 1, "counters");
     TORCH_CHECK(job_order.size(0) == num_jobs, "job_order");
+    TORCH_CHECK(partial.size(0) == num_jobs && partial.size(1) == globals::H &&
+                partial.scalar_type() == at::ScalarType::Float,
+                "partial must be fp32 (num_jobs, H)");
+    TORCH_CHECK(slot_job.numel() >= num_padded_local_tokens &&
+                slot_w.numel() >= num_padded_local_tokens,
+                "slot_job/slot_w must cover all padded rows");
     TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms >= 1");
     const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
     TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
@@ -733,6 +810,9 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
         .weights = kittens::py::tensor_to_gl<globals::weights_gl>(weights),
         .w_scales = kittens::py::tensor_to_gl<globals::w_scales_gl>(w_scales),
         .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(expert_outputs),
+        .partial = kittens::py::tensor_to_gl<globals::partial_gl>(partial),
+        .slot_job = kittens::py::tensor_to_gl<globals::sjob_gl>(slot_job),
+        .slot_w = kittens::py::tensor_to_gl<globals::sw_gl>(slot_w),
         .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(padded_tokens_per_expert),
         .num_local_experts = num_local_experts, .expert_offset = 0,
         .staging = kittens::py::parallel_tensor_to_pgl<globals::staging_pgl>(staging),
@@ -744,7 +824,7 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
         .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
         .dev_idx = dev_idx, .num_padded_local_tokens = num_padded_local_tokens,
         .num_source_tokens = num_source_tokens, .num_jobs = num_jobs,
-        .num_comp_sms = num_comp_sms, .seq = seq
+        .num_comp_sms = num_comp_sms, .seq = seq, .use_epired = use_epired
     };
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;   // 96KB GEMM > 8KB push row

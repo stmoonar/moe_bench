@@ -113,11 +113,13 @@ def _worker(rank, world, init_method, ne, iters, tokens):
             s.tk.rowgroup_quant_fp8(s.act, s.act_fp8, s.act_scales)
             s.tk.moe_tp_gemm_prered_push_fp8(
                 s.act_fp8, s.act_scales, s.w2_fp8, s.w2_scales,
-                s.expert_out, s.padded, s.combine_staging,
+                s.expert_out, s.padded, s.combine_partial,
+                s.slot_job, s.slot_w, s.combine_staging,
                 s.prered_dst, s.tp_slots, s.prered_w, s.combine_local_cnt,
                 s.push_expected_l1, s.blk_expert, s.l1_gemm_next,
                 s.job_order, s.job_next, s.barrier_l1, s.num_comm_sms_l1,
-                s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq)
+                s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq,
+                s.l1_epired)
         timed("L1_fused", st_l1)
 
         timed("final_red", lambda: s.tk.moe_final_reduce_push(

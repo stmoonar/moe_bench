@@ -103,8 +103,8 @@ def check_builders(mod, ROW_BLOCK=128):
                 _STATE["ids"], _STATE["w"] = all_ids, all_w
                 with RequireExplicitDevice():
                     (padded_g, slots_g, w_g, slack_g, pull_g, job_g, pusho_g,
-                     blk_g, P) = mod._build_tp_schedules(all_ids[rank], all_w[rank],
-                                                         T, world, ne, rank, "cpu")
+                     blk_g, sjob_g, sw_g, P) = mod._build_tp_schedules(
+                         all_ids[rank], all_w[rank], T, world, ne, rank, "cpu")
                 N = world * T * topk
                 packed_all = torch.stack(
                     [all_ids, all_w.contiguous().view(torch.int32)], dim=-1).contiguous()
@@ -117,6 +117,8 @@ def check_builders(mod, ROW_BLOCK=128):
                     "job_order": torch.zeros(world * T, dtype=torch.int32, device="cpu"),
                     "push_order": torch.zeros(world, T, dtype=torch.int32, device="cpu"),
                     "blk_expert": torch.zeros(P // ROW_BLOCK, dtype=torch.int32, device="cpu"),
+                    "slot_job": torch.zeros(P, dtype=torch.int32, device="cpu"),
+                    "slot_w": torch.zeros(P, dtype=torch.float32, device="cpu"),
                 }
                 with RequireExplicitDevice():
                     mod._build_tp_schedules_gpu(packed_all, world, ne, rank, out)
@@ -128,7 +130,9 @@ def check_builders(mod, ROW_BLOCK=128):
                                        ("pull_order", out["pull_order"], pull_g),
                                        ("job_order", out["job_order"], job_g),
                                        ("push_order", out["push_order"], pusho_g),
-                                       ("blk_expert", out["blk_expert"], blk_g)]:
+                                       ("blk_expert", out["blk_expert"], blk_g),
+                                       ("slot_job", out["slot_job"], sjob_g),
+                                       ("slot_w", out["slot_w"], sw_g)]:
                     if got.shape != ref.shape or not torch.equal(got, ref):
                         fails.append(f"[{tag}] {name} host/GPU MISMATCH")
                 # blk_expert invariants (dispenser GEMM 的 B tile 索引)
@@ -141,6 +145,14 @@ def check_builders(mod, ROW_BLOCK=128):
                 flat = slots_g.reshape(-1).long()
                 if flat.unique().numel() != N or int(flat.min()) < 0 or int(flat.max()) >= P:
                     fails.append(f"[{tag}] tp_slots not a bijection onto [0,P)")
+                # slot_job/slot_w = tp_slots/prered_w 的逆映射 (EPIRED 查表)
+                sj = sjob_g.long()
+                if int(sj.max()) >= world * T:
+                    fails.append(f"[{tag}] slot_job out of range")
+                elif not torch.equal(sj[flat], torch.arange(N) // topk):
+                    fails.append(f"[{tag}] slot_job not the inverse of tp_slots")
+                if not torch.equal(sw_g[flat], w_g.reshape(-1)):
+                    fails.append(f"[{tag}] slot_w not the inverse of prered_w")
                 real_per_blk = torch.bincount(flat // ROW_BLOCK, minlength=P // ROW_BLOCK)
                 if not torch.equal(real_per_blk + slack_g.long(),
                                    torch.full_like(real_per_blk, ROW_BLOCK)):
@@ -194,8 +206,8 @@ def check_dataflow(mod):
 
     staging = [torch.zeros(world, T, H, device="cpu") for _ in range(world)]
     for r in range(world):
-        (padded, tp_slots, tp_w, _slack, _po, _jo, _pso, _blk, P) = mod._build_tp_schedules(
-            ids[r], w[r], T, world, E, r, "cpu")
+        (padded, tp_slots, tp_w, _slack, _po, _jo, _pso, _blk, _sj, _sw,
+         P) = mod._build_tp_schedules(ids[r], w[r], T, world, E, r, "cpu")
         gathered = torch.zeros(P, H, device="cpu")
         gathered[tp_slots.view(-1).long()] = X.repeat_interleave(topk, dim=0)
         expert_out = torch.zeros(P, H, device="cpu")

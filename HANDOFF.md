@@ -3,7 +3,52 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-26 晚）：引擎归因探针出结论 + TMA cta 形态修复（待上机验证）
+## 最新（2026-07-26 深夜）：L1 EPIRED（epilogue 直推加权归约）已实现（待上机验证）
+
+主配置 stage 归因（`time_tp_stages 64 20 512`，卡组 0-3）实测
+**L1 exposure 222.8µs**（L1_fused 572.2 vs L1_gemm_alone 349.4），账：
+SM 让渡 ~98（L1 comm 块全程专职、不能像 L0 推完转岗）+ act 量化 ~35 +
+预归约重读争带宽 ~40 + push 尾部 ~25 + 杂项 ~10。对比 L0 exposure 仅 88.3。
+其中**预归约每 job 读 8 行 expert_out，全体合计恰好把 expert_out
+（P×H bf16 ≈ 134MB）完整重读一遍**，加上它的写 134MB，是纯增量流量。
+
+本轮实现**方案 4（EPIRED）**：W2 GEMM 的 C tile 在寄存器里乘 w 后直接
+`red.global.add.f32` 累加进 `combine_partial (num_jobs, H) fp32` 部分和，
+expert_out 不再落地；push_job 从"读 8 行 expert_out 加权"变成"读 1 行
+fp32 部分和转 bf16 并顺手清零（迭代间自维持，无 reset kernel）"。省
+134MB 写 + 134MB 重读，代价是 67M 次 fp32 red（L2 原子，fire-and-forget）；
+少一次 bf16 中间舍入，数值只会更准。
+
+- 开关 `TK_L1_EPIRED`，默认 1，=0 回退原路径（A/B 用，无需重编译，
+  store policy 内运行时分支）。
+- 新表 `slot_job/slot_w (P,)` = tp_slots/prered_w 的逆映射（padding 行
+  -1/0），host golden 与 GPU builder 同步构建，preflight 逐元素对拍 +
+  逆映射不变式已过（本机 CPU，2026-07-26）。
+- 改动文件：`tk_tp_scheme.py`（调度表 + combine_partial + 开关）、
+  `kernels/tk/tk_moe.cu`（tppr8：globals/wred_store_policy/push_job
+  双路径/entry 签名）、`tools/time_tp_stages.py`（st_l1 传参）、
+  `tools/preflight_tp_cpu.py`（对拍范围）。
+- 死锁审计（红线）：**无新增等待点**。red.add 无返回无等待；行块信号链
+  不变且均有界（~32s trap）；partial 生产者（GEMM block）与消费者
+  （push_job）同 kernel 同生命周期，trap 连带；跨 rank 依赖链不变无环。
+
+**⚠️ 尚未上机编译/验证**（开发机无 nvcc）。上机 runbook（先确认卡空闲）：
+
+```bash
+cd /workspace
+rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4
+#   ↑ 看 ptxas -v: epilogue 新增 ~10 寄存器, 主循环不应 spill
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10   # 正确性门(单步隔离)
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512  # EPIRED=1
+TK_L1_EPIRED=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512  # A/B 回退路径
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --no-verify  # e2e 性能
+```
+
+预期：L1_fused 572 → ~420-480（省 268MB DRAM 流量，付 L2 原子与 epilogue
+指令）。**风险**：fp32 red.add 的 L2 原子吞吐未在本机定量——若 A/B 不
+及预期，回退 `TK_L1_EPIRED=0` 并补一个 red 吞吐探针再裁决。
+
+## 2026-07-26 晚：引擎归因探针出结论 + TMA cta 形态修复（待上机验证）
 
 单卡探针一键跑完（`tools/probe_engine.sh`，产物
 `tp_test_results/probe_20260726_080115_engine/`），结论与账全在
