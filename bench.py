@@ -192,12 +192,13 @@ def _apply_overrides(
 
 
 def main() -> None:
-    try:
-        from vllm.utils.argparse_utils import FlexibleArgumentParser as Parser
-    except ImportError:
-        Parser = argparse.ArgumentParser
-
-    parser = Parser(description="vLLM MoE layer benchmark")
+    # NOTE: deliberately NOT using vLLM's FlexibleArgumentParser. Its
+    # _pull_args_from_config() reads the --config YAML and injects every key
+    # as a CLI arg (verify: true -> --verify, distributed: true -> --distributed,
+    # …), which collides with our own MoEBenchConfig.from_file() loading and
+    # makes --verify ambiguous with --verify-atol / --verify-rtol. We load the
+    # YAML ourselves below, so a plain ArgumentParser is sufficient.
+    parser = argparse.ArgumentParser(description="vLLM MoE layer benchmark")
     parser.add_argument(
         "--config",
         type=str,
