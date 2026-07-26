@@ -3,7 +3,25 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-26 深夜 2）：sched 融合 kernel（tpsched）已实现（待上机验证）
+## 最新（2026-07-26 午后）：正式里程碑 —— T=512 耗时降低 28.2% / T=1024 31.5%
+
+**主配置正式回归（`tp_test_results/tp_run_20260726_114848`，PASS=12 FAIL=0，
+卡组 0-3，warmup=20/bench=50）**：
+
+| 口径 | tktp | serial（triton 兜底未调优） | 耗时降低 |
+|---|---:|---:|---:|
+| T=512 | **1508.1µs**（med 1503.2） | 2099.6µs | **28.2%** |
+| T=1024 | **2768.9µs**（med 2765.0） | 4044.7µs | **31.5%** |
+
+今日三条战线（详见下文与 docs/03）：L1 通信（EPIRED 判负入 docs/04、流水化
+保留、sweep 定档 24）、L1 exposure 223→~185（机器噪声区间）、**sched 融合
+kernel 259→204.6µs**。正确性：单卡 GEMM 裁决 rel_err 1.68e-03 OK；全链路
+tktp 4.28e-2（W1 二次量化）/serial 1.67e-2 均超旧容差（口径待裁决，非回归）。
+未闭环：① serial 调优（`tune_triton_moe.py` 未上机，调优后领先需重报）；
+② FP8 容差/W1 布局裁决；③ 剩余优化（NCCL 进 graph ~20-40µs、act 量化
+下沉 ~35-50µs）。
+
+## 2026-07-26 深夜 2：sched 融合 kernel（tpsched）已实现（待上机验证）
 
 L1 三条快速杠杆收口后（见下节），转向 e2e 第二大项 **sched 259µs**：
 `_build_tp_schedules_gpu` 的 ~20 个串行 torch op（CUDA graph 内 ~215µs）
