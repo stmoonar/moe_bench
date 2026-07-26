@@ -906,11 +906,39 @@ struct sched_params {
     float *slot_w;          // (P,)
     int world, T, E, S, N, P, nblk;
 };
-/* 段式 inclusive scan(单 block): 每线程段内串行 -> s_seg 段和 -> tid0 扫
- * s_seg(exclusive) -> 段前缀加回。data 就地变为 inclusive 前缀。 */
+/* 块级 exclusive scan(1024 线程, 两级 warp scan)。s_seg[tid] 就地变为
+ * exclusive 前缀。 */
+__device__ inline void blk_exclusive_scan(int *s_seg, const int NT) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int v = (tid < NT) ? s_seg[tid] : 0;
+    int x = v;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int y = __shfl_up_sync(~0u, x, off);
+        if (lane >= off) x += y;
+    }
+    __shared__ int wsum[32];
+    if (lane == 31) wsum[warp] = x;
+    __syncthreads();
+    if (warp == 0) {
+        const int w = (lane < NT / 32) ? wsum[lane] : 0;
+        int wx = w;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int y = __shfl_up_sync(~0u, wx, off);
+            if (lane >= off) wx += y;
+        }
+        if (lane < NT / 32) wsum[lane] = wx - w;   // exclusive
+    }
+    __syncthreads();
+    if (tid < NT) s_seg[tid] = wsum[warp] + x - v;
+    __syncthreads();
+}
+/* 段式 inclusive scan: 每线程段内串行 -> blk_exclusive_scan 段前缀 -> 加回。 */
 __device__ inline void seg_scan(int *data, const int L, int *s_seg) {
+    constexpr int NT = 1024;
     const int tid = threadIdx.x;
-    const int seg = (L + 255) / 256;
+    const int seg = (L + NT - 1) / NT;
     int sum = 0;
     for (int i = 0; i < seg; i++) {
         const int idx = tid * seg + i;
@@ -918,12 +946,7 @@ __device__ inline void seg_scan(int *data, const int L, int *s_seg) {
     }
     s_seg[tid] = sum;
     __syncthreads();
-    if (tid == 0) {
-        int acc = 0;
-        #pragma unroll 4
-        for (int i = 0; i < 256; i++) { const int t = s_seg[i]; s_seg[i] = acc; acc += t; }
-    }
-    __syncthreads();
+    blk_exclusive_scan(s_seg, NT);
     const int base = s_seg[tid];
     if (base != 0)
         for (int i = 0; i < seg; i++) {
@@ -932,26 +955,31 @@ __device__ inline void seg_scan(int *data, const int L, int *s_seg) {
         }
     __syncthreads();
 }
-__global__ __launch_bounds__(256)
+/* 单 block 1024 线程(32 warp): 256 线程(8 warp)版实测 ~324us —— 单 SM
+ * 延迟隐藏能力随 warp 数线性, 全局读/shfl 串行链在 8 warp 下藏不住。 */
+__global__ __launch_bounds__(1024)
 void sched_build_kernel(const __grid_constant__ sched_params p) {
     constexpr int RB = TK_ROW_BLOCK;
+    constexpr int NT = 1024;
     extern __shared__ int __shm[];
-    /* smem 切分: eid_u8[N] | scan_a[P](int) | misc[S](int) | 小表 */
+    /* smem 切分(union 控预算): [eid_u8 N | scan_a 4P 同区] | misc/seg4 同区
+     * | 小表(尾部, 不被 scan_a 覆盖)。eid 最后用在 phase 1, scan_a phase 3
+     * 才启用, 安全。 */
     uint8_t *eid_u8 = reinterpret_cast<uint8_t *>(__shm);
-    int *scan_a = reinterpret_cast<int *>(eid_u8 + p.N);          // (P,)
-    int *misc = scan_a + p.P;                                     // (S,)
-    int *s_counts = misc + p.S;                                   // (264,)
+    int *scan_a = reinterpret_cast<int *>(__shm);                 // (P,) union w/ eid
+    int *misc = __shm + p.P;                                      // (S,) | seg4 (NT*ND,)
+    int *s_counts = misc + max(p.S, NT * TK_NUM_DEVICES);         // (264,)
     int *s_pbase  = s_counts + 264;                               // (264,)
     int *s_rbend  = s_pbase + 264;                                // (264,)
-    int *s_seg    = s_rbend + 264;                                // (256,)
-    int *s_seg4   = s_seg + 256;                                  // (256*TK_NUM_DEVICES,)
+    int *s_seg    = s_rbend + 264;                                // (NT,)
+    int *s_seg4   = misc;                                         // union w/ misc
     const int tid = threadIdx.x;
     // ---- phase 0: 清小表, 预载 eid + counts + prered_w; 清 padding 区 ----
     if (tid < 264) s_counts[tid] = 0;
-    for (int i = tid; i < p.P; i += 256) { p.slot_job[i] = -1; p.slot_w[i] = 0.f; }
-    for (int i = tid; i < p.nblk; i += 256) p.slack[i] = 0;
+    for (int i = tid; i < p.P; i += NT) { p.slot_job[i] = -1; p.slot_w[i] = 0.f; }
+    for (int i = tid; i < p.nblk; i += NT) p.slack[i] = 0;
     __syncthreads();
-    for (int i = tid; i < p.N; i += 256) {
+    for (int i = tid; i < p.N; i += NT) {
         const int e = p.packed[i * 2];
         eid_u8[i] = (uint8_t)e;
         atomicAdd(&s_counts[e], 1);
@@ -972,11 +1000,11 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
         s_counts[p.E] = ag;         // 末项, 供 phase 2 差分恢复原 counts
     }
     __syncthreads();
-    // ---- phase 1: warp compaction 保序分桶, 一趟写 tp_slots/slot_job/slot_w ----
+    // ---- phase 1: warp compaction 保序分桶, 一趟写 tp_slots/slot_job ----
     {
         const int warp = tid >> 5, lane = tid & 31;
         const uint32_t *eid32 = reinterpret_cast<const uint32_t *>(eid_u8);
-        for (int e = warp; e < p.E; e += 8) {
+        for (int e = warp; e < p.E; e += NT / 32) {
             const uint32_t e4 = 0x01010101u * (uint32_t)e;
             int cursor = 0;
             const int base = s_pbase[e];
@@ -1007,10 +1035,10 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
     }
     __syncthreads();
     // ---- phase 1.5: slot_w 独立阶段。phase 1 里 "slot_w[slot] =
-    // prered_w[n]" 是随机读->随机写依赖链: 单 block(8 warp)藏不住 L2 读
-    // 延迟(2026-07-26 实测此句让 kernel 从 ~35us 指令账涨到 ~530us)。
+    // prered_w[n]" 是随机读->随机写依赖链: 单 block 藏不住 L2 读延迟
+    // (2026-07-26 实测此句让 kernel 从 ~35us 指令账涨到 ~530us)。
     // 拆成顺序读(coalesced 易藏) + 随机写(fire-and-forget 不等返回)。
-    for (int n = tid; n < p.N; n += 256)
+    for (int n = tid; n < p.N; n += NT)
         p.slot_w[p.tp_slots[n]] = p.prered_w[n];
     __syncthreads();
     // ---- phase 2: slack(尾块) + blk_expert ----
@@ -1021,7 +1049,7 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
             p.slack[(s_pbase[tid] + pd) / RB - 1] = pd - c;
         }
     }
-    for (int b = tid; b < p.nblk; b += 256) {
+    for (int b = tid; b < p.nblk; b += NT) {
         int e = 0;
         while (e < p.E - 1 && s_rbend[e] <= b) e++;
         p.blk_expert[b] = e;
@@ -1031,9 +1059,9 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
     for (int half = 0; half < 2; half++) {
         const bool is_min = (half == 0);
         int *order = is_min ? p.pull_order : p.job_order;
-        for (int i = tid; i < p.P; i += 256) scan_a[i] = 0;
+        for (int i = tid; i < p.P; i += NT) scan_a[i] = 0;
         __syncthreads();
-        for (int j = tid; j < p.S; j += 256) {
+        for (int j = tid; j < p.S; j += NT) {
             int mn = 0x7fffffff, mx = -1;
             #pragma unroll
             for (int k = 0; k < TOPK; k++) {
@@ -1046,14 +1074,14 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
         }
         __syncthreads();
         seg_scan(scan_a, p.P, s_seg);
-        for (int j = tid; j < p.S; j += 256) order[scan_a[misc[j]] - 1] = j;
+        for (int j = tid; j < p.S; j += NT) order[scan_a[misc[j]] - 1] = j;
         __syncthreads();
     }
     // ---- phase 5: push_order = pull_order 按 source 过滤(序保持) ----
     // 注意 golden 语义: push_order[s] 存**局部** token id (j - s*T, 值域
     // [0,T), push_lane 用它索引本卡 token 行), 不是全局 j。
     {
-        const int seg = (p.S + 255) / 256;
+        const int seg = (p.S + NT - 1) / NT;
         int my_cnt[TK_NUM_DEVICES];
         #pragma unroll
         for (int s = 0; s < TK_NUM_DEVICES; s++) my_cnt[s] = 0;
@@ -1063,18 +1091,11 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
         }
         #pragma unroll
         for (int s = 0; s < TK_NUM_DEVICES; s++)
-            s_seg4[tid * TK_NUM_DEVICES + s] = my_cnt[s];
+            s_seg4[s * NT + tid] = my_cnt[s];              // 列主: [s][tid]
         __syncthreads();
-        if (tid == 0)   // 每 source 的 256 段前缀
-            #pragma unroll
-            for (int s = 0; s < TK_NUM_DEVICES; s++) {
-                int acc = 0;
-                for (int i = 0; i < 256; i++) {
-                    const int t = s_seg4[i * TK_NUM_DEVICES + s];
-                    s_seg4[i * TK_NUM_DEVICES + s] = acc; acc += t;
-                }
-            }
-        __syncthreads();
+        #pragma unroll
+        for (int s = 0; s < TK_NUM_DEVICES; s++)
+            blk_exclusive_scan(&s_seg4[s * NT], NT);
         #pragma unroll
         for (int s = 0; s < TK_NUM_DEVICES; s++) my_cnt[s] = 0;
         for (int i = 0; i < seg; i++) {
@@ -1082,7 +1103,7 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
             if (idx < p.S) {
                 const int j = p.pull_order[idx];
                 const int s = j / p.T;
-                p.push_order[s * p.T + s_seg4[tid * TK_NUM_DEVICES + s] + my_cnt[s]++] = j - s * p.T;
+                p.push_order[s * p.T + s_seg4[s * NT + tid] + my_cnt[s]++] = j - s * p.T;
             }
         }
     }
@@ -1101,8 +1122,10 @@ void sched_build_entry(const at::Tensor &packed_all, at::Tensor &padded,
     TORCH_CHECK(pull_order.numel() == S && job_order.numel() == S, "orders");
     TORCH_CHECK(push_order.numel() == S, "push_order");
     TORCH_CHECK(slack.numel() >= nblk && blk_expert.numel() >= nblk, "blk tables");
-    const int64_t smem = (int64_t)N + (int64_t)P * 4 + (int64_t)S * 4
-                       + 264 * 4 * 3 + 256 * 4 + 256 * 4 * TK_NUM_DEVICES + 256;
+    // smem = scan_a(4P, union eid) + misc/seg4(max(S, 1024*ND)) + 小表
+    const int64_t misc_elems = S > 1024 * TK_NUM_DEVICES ? S : 1024 * TK_NUM_DEVICES;
+    const int64_t smem = (int64_t)P * 4 + misc_elems * 4
+                       + 264 * 4 * 3 + 1024 * 4 + 512;
     TORCH_CHECK(smem <= 101376, "sched fused kernel smem over 99KB, use torch path");
     sched_params p {
         .packed = packed_all.data_ptr<int>(),
@@ -1116,7 +1139,7 @@ void sched_build_entry(const at::Tensor &packed_all, at::Tensor &padded,
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     CUDACHECK(cudaFuncSetAttribute(sched_build_kernel,
                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    sched_build_kernel<<<1, 256, smem, stream>>>(p);
+    sched_build_kernel<<<1, 1024, smem, stream>>>(p);
     CUDACHECK(cudaGetLastError());
 }
 } // namespace tpsched

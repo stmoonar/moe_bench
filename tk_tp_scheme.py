@@ -348,12 +348,12 @@ class TKFusedTP(DistributedScheme):
                 "blk_expert": self.blk_expert,
                 "slot_job": self.slot_job, "slot_w": self.slot_w,
             }
-            # 融合 kernel(tk.tp_sched_build, 单 block ~20-30us 替代 ~215us
-            # torch op 链)。smem 需求随 P 变(N + 4P + 4S + 小表), 超 99KB
+            # 融合 kernel(tk.tp_sched_build, 单 block 1024 线程)。
+            # smem 需求随 P 变(scan_a 4P + misc/seg4 + 小表), 超 99KB
             # 自动回退 torch 版; TK_SCHED_FUSED=0 强制回退(A/B)。
-            _N = world * num_tokens * self.top_k
-            _smem_need = (_N + 4 * num_padded_total + 4 * world * num_tokens
-                          + 264 * 4 * 3 + 256 * 4 + 256 * 4 * world + 256)
+            _smem_need = (4 * num_padded_total
+                          + 4 * max(world * num_tokens, 1024 * world)
+                          + 264 * 4 * 3 + 1024 * 4 + 512)
             self._sched_fused = (os.environ.get("TK_SCHED_FUSED", "1") == "1"
                                  and _smem_need <= 101376)
             self._sched_graph = None  # captured lazily on first run()
