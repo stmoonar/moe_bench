@@ -97,6 +97,26 @@ TK_L1_EPIRED=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_st
    push 在飞，per-job 关键路径去掉 PCIe RTT（~1.5-2µs/job × 85 串行
    job/块），给小 comm_sms 腾出空间，与 1 协同。
 
+**流水化已实现（待上机验证）**：push_job 双 buffer 2 在飞——TK 的
+`store_async` 末尾自带 `commit_group`，每 job 自成一组；槽位复用前
+`store_async_wait<1>` 只等最老一组并 retire（本地计数+选举 watermark），
+与新 job 的 wait_slot 同阶段并行（retire=tid0，wait_slot 改 tid1..8）；
+循环末按发出序 drain 两级（wait<1>/wait<0>）。watermark 语义不变（数据
+落地才计数），只延后 ~1 个 job。死锁审计：wait_group 等本线程自己发出的
+store（硬件事务必定完成），与旧版 wait<0> 性质相同，不新增跨卡等待类型；
+对端崩溃的 PCIe 传染路径与现状一致（docs/06 兜底）。A/B 无开关，对照 =
+父提交 `64e3b0b` 的 exposure 192.2。runbook：
+
+```bash
+cd /workspace
+rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10   # 正确性门(单步隔离; rel_err 应仍 ~4.28e-2 不恶化)
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512
+# 协同 sweep(流水化后拐点可能下移):
+for c in 12 16 20 32; do echo "== TK_COMM_SMS_L1=$c =="; TK_COMM_SMS_L1=$c \
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512 | grep -E "L1_fused|L1 exposure|full_run"; done
+```
+
 ## 2026-07-26 晚：引擎归因探针出结论 + TMA cta 形态修复（待上机验证）
 
 单卡探针一键跑完（`tools/probe_engine.sh`，产物

@@ -650,21 +650,44 @@ struct wred_store_policy {
         }
     }
 };
-// push_job: 行块就绪后做本地 top-k 加权归约(EPIRED 时归约已在 GEMM
-// epilogue 完成, 这里只读 fp32 部分和转 bf16 并顺手清零, 供下一迭代直接用),
-// 把整行推到源卡 staging, 最后一条到达时由本地选举出的唯一写者发
-// watermark(源卡 final reduce 等它)。
-__device__ inline void push_job(const globals &G, const int j) {
+// TMA store 完成确认后的收尾(本地计数 + 选举发 watermark)。语义与旧串行版
+// 相同: 数据落地(store_async_wait 确认)后才计数; watermark 只随 drain 延后
+// ~1 个 job, 释放序不变。
+__device__ inline void push_retire_one(const globals &G, const int s_s) {
+    int old;
+    asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                 : "=r"(old) : "l"(&G.local_cnt[{s_s}]) : "memory");
+    if (old + 1 == G.push_expected_l1[{s_s}]) {
+        __threadfence_system();
+        pcie_sync::signal_slot(G.barrier, s_s, 2 + G.dev_idx, 0, G.seq);
+    }
+}
+// push_job(流水版, 双 buffer 2 在飞): 行块就绪后做本地 top-k 加权归约
+// (EPIRED 时归约已在 GEMM epilogue 完成, 这里只读 fp32 部分和转 bf16 并顺手
+// 清零, 供下一迭代直接用), 把整行推到源卡 staging。
+// 与旧串行版的差别: TMA store 发出后**不等**(TK store_async 末尾自带
+// commit_group, 每 job 自成一组); 下一次复用该槽位前才 store_async_wait<1>
+// (只等最老一组)并 retire —— per-job 关键路径不再含 PCIe RTT
+// (~1.5-2µs/job × ~85 串行 job/块)。wait_group 等的是本线程自己发出的
+// store, 等待性质与旧版 wait<0> 相同, 不新增跨卡等待类型(死锁审计)。
+__device__ inline void push_job(const globals &G, const int j,
+                                typename globals::row_vec &row,
+                                const int pipe_slot, int *pipe_ss) {
     if (j >= G.num_jobs) return;
     constexpr int H = globals::H, VEC = 8, HVEC = H / VEC;
-    extern __shared__ int __shm[];
-    tma_swizzle_allocator al((int*)&__shm[0]);
-    typename globals::row_vec &row = al.allocate<typename globals::row_vec>();
     __shared__ int s_slot[globals::TOP_K];
     __shared__ float s_w[globals::TOP_K];
     __shared__ int s_s, s_t, s_has;
-    if (threadIdx.x < globals::TOP_K) {
-        const int k = threadIdx.x;
+    // 同阶段并行: tid0 retire 槽位旧主(wait<1> 只等最老一组, 通常已完成);
+    // tid1..8 等本 job 8 个 slot 的行块信号。
+    if (threadIdx.x == 0) {
+        if (pipe_ss[pipe_slot] >= 0) {
+            tma::store_async_wait<1>();
+            push_retire_one(G, pipe_ss[pipe_slot]);
+            pipe_ss[pipe_slot] = -1;
+        }
+    } else if (threadIdx.x <= globals::TOP_K) {
+        const int k = threadIdx.x - 1;
         const int slot = G.prered_slots[{j, k}];
         s_slot[k] = slot;
         s_w[k] = G.prered_w[{j, k}];
@@ -728,15 +751,8 @@ __device__ inline void push_job(const globals &G, const int j) {
     __syncthreads();
     if (threadIdx.x == 0) {
         const int dst_row = G.dev_idx * G.num_source_tokens + s_t;
-        tma::store_async(G.staging[s_s], row, {dst_row, 0});
-        tma::store_async_wait();
-        int old;
-        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
-                     : "=r"(old) : "l"(&G.local_cnt[{s_s}]) : "memory");
-        if (old + 1 == G.push_expected_l1[{s_s}]) {
-            __threadfence_system();
-            pcie_sync::signal_slot(G.barrier, s_s, 2 + G.dev_idx, 0, G.seq);
-        }
+        tma::store_async(G.staging[s_s], row, {dst_row, 0});  // commit 不 wait
+        pipe_ss[pipe_slot] = s_s;                            // 槽位在飞 = 本 job
     }
 }
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
@@ -752,14 +768,32 @@ void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_exper
             blk_expert, gemm_next, nblk * col_blocks);
         kittens::group<gemm_config_fp8::NUM_WARPS>::sync(2);  // 专用命名 barrier(docs/04)
     }
+    // push 流水: 双 buffer(2×8KB, 覆写 GEMM 已结束的 pipeline 区), 2 个 TMA
+    // store 在飞; 槽位复用前 retire 最老一组, 循环末按发出序 drain 两级。
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename globals::row_vec (&rowbuf)[2] = al.allocate<typename globals::row_vec, 2>();
     __shared__ int s_j;
+    int pipe_ss[2] = {-1, -1};   // tid0 私有: 槽位在飞 job 的 dst rank (-1=空)
+    int njobs = 0;
     while (true) {
         if (threadIdx.x == 0) s_j = atomicAdd(job_next, 1);
         __syncthreads();
         const int idx = s_j;
         if (idx >= G.num_jobs) break;
-        push_job(G, job_order[idx]);
+        push_job(G, job_order[idx], rowbuf[njobs & 1], njobs & 1, pipe_ss);
+        njobs++;
         __syncthreads();
+    }
+    if (threadIdx.x == 0) {     // drain: 依次 retire job njobs-2 / njobs-1
+        if (njobs >= 2 && pipe_ss[njobs & 1] >= 0) {
+            tma::store_async_wait<1>();
+            push_retire_one(G, pipe_ss[njobs & 1]);
+        }
+        if (njobs >= 1 && pipe_ss[(njobs + 1) & 1] >= 0) {
+            tma::store_async_wait<0>();
+            push_retire_one(G, pipe_ss[(njobs + 1) & 1]);
+        }
     }
 }
 __global__ __launch_bounds__(256)
