@@ -358,16 +358,6 @@ class TKFusedTP(DistributedScheme):
                                  and _smem_need <= 101376)
             self._sched_graph = None  # captured lazily on first run()
 
-    def _sched_fused_call(self):
-        """单 kernel 调度表构建(与 _build_tp_schedules_gpu 逐元素一致,
-        首跑对拍)。"""
-        self.tk.tp_sched_build(
-            self._packed_all, self.padded, self.tp_slots, self.prered_w,
-            self.slack, self.pull_order, self.job_order, self.push_order,
-            self.blk_expert, self.slot_job, self.slot_w,
-            self.ctx.world_size, self.num_tokens, self._num_experts,
-            self.num_padded_total)
-
         # ---- weights ----
         # w1: fp8 权重先反量化(setup 一次), 按 GLU 列交织后重量化 —— scale 块
         # 与 GEMM 的 B tile 天然对齐; w2 直接用原布局(见下)。
@@ -468,6 +458,16 @@ class TKFusedTP(DistributedScheme):
                                                   str(self.num_comm_sms)))
         self._l0_seq = 0
         self._l1_seq = 0
+
+    def _sched_fused_call(self):
+        """单 kernel 调度表构建(与 _build_tp_schedules_gpu 逐元素一致,
+        首跑对拍)。"""
+        self.tk.tp_sched_build(
+            self._packed_all, self.padded, self.tp_slots, self.prered_w,
+            self.slack, self.pull_order, self.job_order, self.push_order,
+            self.blk_expert, self.slot_job, self.slot_w,
+            self.ctx.world_size, self.num_tokens, self._num_experts,
+            self.num_padded_total)
 
     def run(self) -> torch.Tensor:
         tk = self.tk
