@@ -22,18 +22,20 @@ L1 三条快速杠杆收口后（见下节），转向 e2e 第二大项 **sched 
 - 预期 sched 259 → ~85µs（all_gather 40 + pack 5 + kernel ~30-40），
   e2e 1571 → ~1400。本地 preflight 回归通过（torch 版未动）。
 
-**⚠️ 未上机**（开发机无 nvcc）。runbook：
+**上机验证通过（2026-07-26 11:27，卡组 0-3）**：对拍通过、正确性门
+rel_err 4.28e-2 同基线。**sched 259 → 227.2µs，e2e full_run 1571 →
+1526.0µs（本轮新低）**。三轮修复：① `push_order` 值域（全局 j → 局部
+j−s*T）；② `slot_w` 随机读→写依赖链摘出（576→374）；③ 1024 线程
+（8→32 warp 延迟隐藏，374→227）。**关键教训：单 block kernel 是延迟
+受限，8 warp 时全局读/shfl 串行链藏不住，指令账无效；随机读→写依赖链
+必须拆成顺序读+fire-and-forget 写。**
 
-```bash
-cd /workspace
-rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10
-#   ↑ setup 首跑自动执行 fused vs torch 逐表对拍(失败即 assert 退出);
-#     正确性门 rel_err 应仍 ~4.28e-2
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.time_tp_stages 64 20 512
-#   ↑ 看 sched 段: 259 -> 预期 ~85; TK_SCHED_FUSED=0 可 A/B 回退
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --no-verify  # e2e
-```
+sched 227.2 的构成 ≈ pack ~5-10 + NCCL all_gather ~40-70 + kernel
+~120-180（仍高于指令账，疑 1024 线程 barrier ×~28 次与 clock 是主因）。
+剩余空间（未做）：kernel 微优化（int4 分量 scan 省 6 sync、phase 3/4 两
+轮合一、sync 精简，~20-30µs）；**NCCL all_gather 捕获进 graph**（消启动
+开销 ~30-50µs，torch NCCL 支持 graph capture，风险中）；argsort 混合
+方案（已无必要）。
 
 ## 2026-07-26 深夜：L1 EPIRED（epilogue 直推加权归约）已实现（待上机验证）
 
