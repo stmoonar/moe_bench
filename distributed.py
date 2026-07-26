@@ -197,6 +197,13 @@ def _worker(
     _nvshmem = (scheme_name in _SCHEMES
                 and getattr(_SCHEMES[scheme_name], "requires_nvshmem", False))
     if _nvshmem:
+        # mp.spawn 只把 local_rank 作为参数传入, 不设 RANK/WORLD_SIZE/
+        # LOCAL_RANK(那是 elastic launch 的行为); initialize_distributed 全
+        # 靠 env, 缺省会退化成"每进程都当 rank 0"(抢 TCPStore server 端口
+        # 冲突) + world_size=1(Gloo 0 peers)。从参数补齐。
+        os.environ.setdefault("RANK", str(local_rank))
+        os.environ.setdefault("WORLD_SIZE", str(world_size))
+        os.environ.setdefault("LOCAL_RANK", str(local_rank))
         os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
         from triton_dist.utils import initialize_distributed
         initialize_distributed()
