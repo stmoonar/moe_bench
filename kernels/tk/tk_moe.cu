@@ -1044,6 +1044,8 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
         __syncthreads();
     }
     // ---- phase 5: push_order = pull_order 按 source 过滤(序保持) ----
+    // 注意 golden 语义: push_order[s] 存**局部** token id (j - s*T, 值域
+    // [0,T), push_lane 用它索引本卡 token 行), 不是全局 j。
     {
         const int seg = (p.S + 255) / 256;
         int my_cnt[TK_NUM_DEVICES];
@@ -1074,7 +1076,7 @@ void sched_build_kernel(const __grid_constant__ sched_params p) {
             if (idx < p.S) {
                 const int j = p.pull_order[idx];
                 const int s = j / p.T;
-                p.push_order[s * p.T + s_seg4[tid * TK_NUM_DEVICES + s] + my_cnt[s]++] = j;
+                p.push_order[s * p.T + s_seg4[tid * TK_NUM_DEVICES + s] + my_cnt[s]++] = j - s * p.T;
             }
         }
     }
