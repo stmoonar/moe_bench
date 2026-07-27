@@ -108,7 +108,7 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     // 两级 tile(docs/09 §4): blk_rows 可选, 空 tensor = 全满块(既有行为)。
     const int *blk_rows_ptr = nullptr;
     if (blk_rows.defined() && blk_rows.numel() > 0) {
-        TORCH_CHECK(blk_rows.size(0) == nblk && blk_rows.dtype() == torch::kInt32,
+        TORCH_CHECK(blk_rows.size(0) == nblk && blk_rows.scalar_type() == at::kInt,
                     "blk_rows must be int32 with one entry per row block");
         blk_rows_ptr = blk_rows.data_ptr<int>();
     }
