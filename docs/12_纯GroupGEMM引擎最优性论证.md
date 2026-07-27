@@ -21,8 +21,9 @@
    L0 76.8% / L1 88.2%（§2.1）。
 3. **差距有账、杠杆在册。** L0（锁频 110.6µs）= 重标定机制 70% +
    结构性 30%，杠杆：重标定切片交织（头号）、任务边界 store 后置
-   （~20µs）；4×2+COL=128 几何已被 E4 判负（§5）。L1 的 11.8% 来源
-   （流量 vs 调度）待 E5。便宜旁路已全部实验判负（§4）。
+   （~20µs）；4×2+COL=128 几何已被 E4 判负（§5）。L1 的 11.8% 已由
+   E5 裁决为**延迟/调度**（DRAM 流量两边相同），与 L0 同类杠杆。
+   便宜旁路已全部实验判负（§4）。
 
 ## 2. 数据
 
@@ -77,7 +78,7 @@ L1 锁频：gg8 425.0µs/64.2% vs triton 537µs/50.2%（triton 受两颗 GEMM
 | scale 走 smem 流水 | stall 无 LDG 记分牌 signature，降级观察 | 11 §9 |
 | 全宽 B 双缓冲 / setmaxnreg | ptxas spill 4.7× 回退 / C7506 全数忽略 | 10 §2, §6 |
 | 4×2 warp 几何 + COL=128 | E4：CALL.ABS=0 后 ptxas 仍 168 帽，COL=128 四个大 kernel 全 spill，判负 | §5 E4、10 §7 |
-| L1 引擎优化曾判"关闭" | 重开：CUTLASS 同流量快 11.8%，待 E5 定方向 | 11 §2 |
+| L1 引擎优化曾判"关闭" | 重开：E5 定案差距在延迟/调度（流量相同），杠杆与 L0 同类 | 11 §2、§5 E5 |
 
 ## 5. 实验状态
 
@@ -96,21 +97,15 @@ L1 锁频：gg8 425.0µs/64.2% vs triton 537µs/50.2%（triton 受两颗 GEMM
 - **E1（待跑）**：cta 补丁后 NCU 锁频重定基，
   `bash moe_bench/tools/probe_engine.sh <空闲卡>`，§2.2 数字更新，
   rel_err 须仍 1.68e-03。
-- **E5（待跑，已升优先级）**：L1 差距来源裁决——tk 与 CUTLASS 各采一次
-  `dram__bytes.sum`（L1 形状）。字节相近 → 差在延迟/调度（tk 可修）；
-  CUTLASS 更少 → 差在 L2 复用/栅格化顺序。命令（在 /workspace/work 下；
-  注意必须带 `--kernel-name-base demangled`，否则 regex 匹配不到命名空间，
-  会报 "No kernels were profiled"）：
-
-```bash
-CUDA_VISIBLE_DEVICES=<空闲卡> ncu --kernel-name-base demangled --kernel-name 'regex:gg8' \
-  --launch-skip 4 --launch-count 1 --metrics dram__bytes.sum \
-  python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 10
-CUDA_VISIBLE_DEVICES=<空闲卡> ncu --kernel-name-base demangled --kernel-name 'regex:cutlass' \
-  --launch-skip 4 --launch-count 1 --metrics dram__bytes.sum \
-  moe_bench/tools/cutlass_probe/build/cutlass_fp8_grouped \
-  --groups=64 --m=256 --n=4096 --k=768 --iterations=10
-```
+- **E5 ✅ 完成（2026-07-27，GPU0）**：L1 `dram__bytes.sum` —— tk
+  **313.44MB** vs CUTLASS **317.89MB**（差 1.4%，CUTLASS 反而略多）。
+  **定案：L1 的 11.8% 差距不在流量，在延迟/调度**——同流量下有效 DRAM
+  带宽 tk ~876GB/s vs CUTLASS ~1007GB/s，时间差全是空转；L1 重开后的
+  杠杆与 L0 同类（重标定交织、任务边界；短 K 下每任务固定开销占比更高，
+  11 §4）。顺带实锤（NCU demangled 签名）：CUTLASS 87c 为 **4×2 warp
+  几何**（TiledMMA 4,2,1）+ **SM90_TMA_LOAD 2D 路径** + 384 线程，与
+  docs/10 §1 结构对照一致。⚠️ NCU 运行中打印的 wall-clock（fp8
+  454.2µs / cutlass "77.5ms"）受 replay/锁频扰动，不作数。
 
 - **E2（可选）**：CUTLASS 当前卡 NCU 锁频 tensor%，让 §2.2 不变量分解
   整体换到同卡口径。

@@ -19,12 +19,12 @@ config 的配置——triton 现有数字即其最优水位，"同类最优"主�
 精简版。**E4 已定案（07-27）**：COL=128 压力编译，CALL.ABS=0 前提下
 四个大 kernel 仍被 ptxas 压 168 reg 并 spill（gg8::kernel 504B stack）
 → **168 帽与 ABI call 无因果，4×2+COL=128 判死，COL=64 平台强制最优**
-（docs/10 §6、docs/11 §6 已加定案注）。**剩余实验（按序）**：E1
-`probe_engine.sh` cta 补丁后 NCU 锁频重定基 → E5（已升优先级）tk vs
-CUTLASS 双方 L1 dram__bytes 对比，裁决 11.8% 差距是流量还是调度（⚠️
-NCU 命令必须带 `--kernel-name-base demangled`，cutlass 二进制路径带
-moe_bench/ 前缀，docs/12 §5 已修正）→ E2 可选补 CUTLASS 当前卡 NCU
-tensor%。§2.1 的卡号/iterations 元数据待补。另：`time_tp_stages.py`
+（docs/10 §6、docs/11 §6 已加定案注）。**E5 已定案（07-27，GPU0）**：L1
+`dram__bytes.sum` tk 313.4MB vs CUTLASS 317.9MB——**流量相同，11.8%
+差距在延迟/调度**，L1 引擎重开、杠杆与 L0 同类（交织/任务边界）；NCU
+签名顺带实锤 CUTLASS 87c 用 4×2 几何 + SM90_TMA_LOAD 2D + 384 线程。
+**剩余实验**：E1 `probe_engine.sh` cta 补丁后 NCU 锁频重定基 → E2 可选
+补 CUTLASS 当前卡 NCU tensor%。§2.1 的卡号/iterations 元数据待补。另：`time_tp_stages.py`
 已支持 `--dist/--skew-alpha/--active` 覆盖 token 路由分布（与 run_tktp
 同口径）。
 
