@@ -1212,7 +1212,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("w_scales"), pybind11::arg("outputs"), pybind11::arg("padded"),
           pybind11::arg("blk_expert"), pybind11::arg("task_next"),
           pybind11::arg("expert_offset"), pybind11::arg("raw"),
-          pybind11::arg("blk_rows") = at::Tensor());
+          // 默认值必须是"已定义的空 tensor": 未定义 at::Tensor() 会被 caster
+          // 映射成 None, 省参调用时 None -> at::Tensor 反向转换直接被拒
+          pybind11::arg("blk_rows") = at::empty({0}, at::kInt));
     m.def("rowgroup_quant_fp8", &gg8::rowgroup_quant_entry);
     m.def("moe_tp_dispatch_gemm_fp8_push", &tpdisp8::entry_push);
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
