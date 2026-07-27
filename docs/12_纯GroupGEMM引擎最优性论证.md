@@ -3,7 +3,11 @@
 日期：2026-07-27（同日更新：CUTLASS 锚点同卡 boost 复测完成，见 §3.1，
 主张 1 已按新数据降级）。对象：`gg8::kernel`（`tk.grouped_gemm_fp8`，
 `tools/verify_fp8_gemm.py` 所测），即融合 kernel 里同一套 `gemm_config_fp8`
-引擎的"无通信角色"形态。本文回答一个问题：**这颗纯 grouped GEMM 是不是
+引擎的"无通信角色"形态——**真·纯 GEMM**：实例化传 `no_gate` +
+`noop_epilogue` + `plain_store_policy`（tk_moe.cu:62），输出 (P, N) bf16
+原样落地，无 GLU epilogue（GLU 只在生产 L0 kernel 的 `glu_store_policy`
+里，且 docs/08 实测其 GEMM 级零开销）、无路由 scatter、无通信 lane，
+与 CUTLASS 87c 的纯 GEMM 口径逐项对齐。本文回答一个问题：**这颗纯 grouped GEMM 是不是
 最优实现，证据链还缺哪几块**。数据来源 docs/08/10/11 + §3.1 同卡复测。
 
 ## 1. 主张的准确表述（三层，逐层可证伪）
