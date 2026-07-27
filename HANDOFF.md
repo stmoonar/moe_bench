@@ -3,7 +3,26 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 深夜）：P3 首测判定 + v2 修正；两级 tile Phase 0 就绪
+## 最新（2026-07-27 深夜 2）：P3 判负 revert；两级 tile Phase 0 定案、进入 Phase 1
+
+**P3 交织判负定案（docs/04 §2）**：v2（load_kk(1) 后置）ptxas 读数与
+性能均与 v1 纹丝不动（仍 168+8B spill；654.4/359.7 vs 基线 649.1/351.0）
+→ 源码级指令交织不优于 ptxas 自身调度（串行源码 ≠ 串行 SASS），只把
+活跃度顶穿 168 帽。**kernel 已 revert 回串行重标定版**（两版实现留在
+git 历史 49b4956/0a9d83d）。数值门两版全过。引擎侧在册杠杆只剩任务
+边界 store 后置（~20µs）。
+
+**两级 tile Phase 0 定案（docs/09 §4）**：RB64 vs RB128——L0 +14.5% /
+L1 +21.3%（任务 ×2）→ **64 行任务成本 ≈ 0.57/0.61 × 128 任务**（含
+2× B 读悲观成分，尾块不付）。立项成立但收益打折：uniform 税 22.9% →
+预计 ~13-15%（e2e −150~180µs）。附带发现：RB64 的 160 线程口径无 168
+寄存器帽（gg8 178/tppr8 184 零 spill）。**下一步 = Phase 1（L0-only
+先行，docs/09 §4 裁决点 1-4 + 点 5 前者）**：任务描述加 M 型别、
+producer 64 行 A tile TMA、尾任务 warps 4-7 跳算保信号、半高 store。
+
+⚠️ revert 后需重编重验：`rm -rf moe_bench/kernels/tk/build && python
+moe_bench/kernels/tk/build.py 4`，verify 两形状应回 649/351 水位、
+rel_err 1.68e-03。
 
 **P3v1 首测（GPU0）**：数值全过（verify 1.68e-03 两形状；e2e rel_err
 0.042817506939172745 与基线**逐位一致**，FAIL 是已知容差口径）。性能小幅

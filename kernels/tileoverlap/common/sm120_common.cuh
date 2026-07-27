@@ -214,11 +214,6 @@ struct noop_epilogue { __device__ inline void operator()(int, int) const {} };
  *    acc/sub 各 32, A/B 全双缓冲总需求 ~135 ≤ 168。A tile 16KB + B tile
  *    8KB, 4 stage 96KB ≤ 99KB。GLU 配对改 [gate32|up32] 交织(同一 128
  *    列 scale 块内置换, 量化零改动); w_scales 按 col_idx>>1 取 128 列块;
- *  - **P3: 重标定切片交织**(docs/11 §3/§9, docs/12): 前一量化块的 FFMA
- *    重标定按 16 列 base-tile 切片, 移进下一 stage kk0 与其 QMMA 交错
- *    发射, 拆掉"末 QMMA→FFMA→清零→次 stage QMMA"的固定延迟 RAW 串行链
- *    (NCU stall_wait 第一大空转, 发射槽 60% 空闲可吸收); 每个元素的运算
- *    次序不变 → 逐比特等价;
  *  - scale 直接从 global 读(L2 广播,每 K 块每线程 3 个 float,不进
  *    smem,不动 TMA expect 字节数);
  *  - 行内 scale 映射:rt 行布局 data[偶] → 行 lane/4,data[奇] → +8
@@ -414,9 +409,6 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
         // arrive 保持在最后一条 QMMA 之后(此时该 stage 的 LDSM 已全部被
         // QMMA 消费完毕, smem 可读覆)。重标定点与旧 per-2-step 版完全相同
         // (每 128 K), 块内 MMA 顺序一致(K 升序) → 数值逐比特等价。
-        // P3(交织): 重标定 FFMA 不再在 stage 边界串行执行, 而是移进下一
-        // stage 的 kk0, 按 16 列 base-tile 切片与 QMMA 交错; 首块以
-        // s0=s1=0 走同一路径, 尾块在循环外收尾。等待点/信号序完全不变。
         // 注: 不要在这里加 setmaxnreg —— 本平台 TMA 是驱动 syscall(ABI
         // call), ptxas C7506 全忽略, docs/10 §6。
         constexpr int KK = cfg::RED_BLOCK / cfg::MMA_K;   // 4
@@ -443,9 +435,6 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
             // 已在寄存器的值, 同时发起下一块的加载(1 个 stage 的着陆窗)。
             // w_scales 块 = 128 列: 每个 128 列 scale 块含两个 64 列 GEMM tile
             float bsc_n, s0_n, s1_n;
-            // P3: 待并入的"前一量化块"scale 积。首块用 s0=s1=0 走同一条交织
-            // 路径(acc += 0×0, fma(+0,+0,+0)=+0 逐比特无操作), 免 per-iter 分支。
-            float s0 = 0.0f, s1 = 0.0f;
             if constexpr (RESCALE) {
                 bsc_n = G.w_scales[{e, col_idx >> 1, 0}];
                 s0_n = G.a_scales[{r0, 0}];
@@ -477,38 +466,6 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 const int nxt = (stage + 1) % cfg::PIPELINE_STAGES;
                 #pragma unroll
                 for (int kk = 0; kk < KK; kk++) {
-                    if (RESCALE && kk == 0) {
-                        // P3 交织(docs/11 §3/§9): 前一量化块的重标定按 16 列
-                        // base-tile 切片, 与本块 kk0 的 QMMA 交错 ——
-                        // FFMA(片j)→清零(片j)→QMMA(片j)。片 j 的 FFMA 只等
-                        // 上一 stage 末 QMMA 中最早发射的两条原子(j 升序),
-                        // 片 j 的 QMMA 与片 j+1 的 FFMA 无依赖、在发射流里
-                        // 互相掩护。每元素运算次序与串行版一致(旧块 QMMA
-                        // K 升序→FFMA→清零→新块 QMMA K 升序) → 逐比特等价。
-                        // mma_ABt_base = mma_ABt 对 (n=0,m=j,k=0) 的同一原子
-                        // 调用(TK warp.cuh: d.tiles[0][m] 配 b.tiles[m][0])。
-                        // v2: load_kk(1) 移到交织块之后 —— v1 里它先发射,
-                        // a/b_reg[1] (~20 regs) 在整个交织期被迫存活, 把
-                        // gg8::kernel 顶到 168+spill(156→168, 8B, 实测判负
-                        // -5/-10.6µs); 后置让交织期只有单套 frag 存活,
-                        // kk1 LDSM 延迟由 kk0 的 8 条 QMMA 在 tensor 管线
-                        // 的积压掩护。
-                        #pragma unroll
-                        for (int j = 0; j < acc.width; j++) {
-                            #pragma unroll
-                            for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
-                                const float s = (k & 1) ? s1 : s0;
-                                acc.tiles[0][j].data[k].x += sub.tiles[0][j].data[k].x * s;
-                                acc.tiles[0][j].data[k].y += sub.tiles[0][j].data[k].y * s;
-                                sub.tiles[0][j].data[k].x = 0.0f;
-                                sub.tiles[0][j].data[k].y = 0.0f;
-                            }
-                            warp::mma_ABt_base(sub.tiles[0][j], a_reg[0].tiles[0][0],
-                                               b_reg[0].tiles[j][0], sub.tiles[0][j]);
-                        }
-                        load_kk(1, stage, 1);
-                        continue;
-                    }
                     if (kk + 1 < KK) {
                         load_kk((kk + 1) & 1, stage, kk + 1);
                     } else if (red_idx + 1 < num_iters) {
@@ -522,34 +479,31 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 warp::arrive(inputs_finished[stage]);
                 stage = nxt;
 
-                // P3: 边界只算下一次交织用的 scale 积 + 预取下一块的 3 个
-                // global scale; FFMA 本体已移进下一块 kk0(尾块在循环外收尾)
+                // 每 stage = 一个量化块(K=128): fp32 重标定并入主累加器
                 if constexpr (RESCALE) {
-                    s0 = s0_n * bsc_n;
-                    s1 = s1_n * bsc_n;
+                    const float s0 = s0_n * bsc_n;
+                    const float s1 = s1_n * bsc_n;
                     const int kblk1 = red_idx + 1;
                     if (kblk1 < num_iters) {  // 预取下一块
                         bsc_n = G.w_scales[{e, col_idx >> 1, kblk1}];
                         s0_n = G.a_scales[{r0, kblk1}];
                         s1_n = G.a_scales[{r0 + 8, kblk1}];
                     }
+                    #pragma unroll
+                    for (int j = 0; j < acc.width; j++) {
+                        #pragma unroll
+                        for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
+                            const float s = (k & 1) ? s1 : s0;
+                            acc.tiles[0][j].data[k].x += sub.tiles[0][j].data[k].x * s;
+                            acc.tiles[0][j].data[k].y += sub.tiles[0][j].data[k].y * s;
+                        }
+                    }
+                    warp::zero(sub);
                 }
             }
 
-            if constexpr (RESCALE) {
-                // P3 尾块重标定: 交织只并入"前一块", 最后一个量化块在此收尾
-                // (sub 此后不再使用, 免清零)
-                #pragma unroll
-                for (int j = 0; j < acc.width; j++) {
-                    #pragma unroll
-                    for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
-                        const float s = (k & 1) ? s1 : s0;
-                        acc.tiles[0][j].data[k].x += sub.tiles[0][j].data[k].x * s;
-                        acc.tiles[0][j].data[k].y += sub.tiles[0][j].data[k].y * s;
-                    }
-                }
-                store(acc, row_idx, col_idx);
-            } else store(sub, row_idx, col_idx);   // raw 探针: 存未标定值
+            if constexpr (RESCALE) store(acc, row_idx, col_idx);
+            else store(sub, row_idx, col_idx);   // raw 探针: 存未标定值
             consumers::sync(0);
             epilogue(row_idx, col_idx);
             warp::arrive(task_done[q]);
