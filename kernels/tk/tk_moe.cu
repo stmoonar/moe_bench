@@ -620,6 +620,12 @@ struct globals {
     const int num_comp_sms;
     const int seq;
     const int use_epired;
+    // 归因探针(TK_L1_NOGATE, docs/15): push_job 不等它 8 个 slot 的行块信号,
+    // **读到未算完的 expert_out, 数值是错的**, 只用于计时。
+    // t(L1_fused) - t(L1_fused@NOGATE) = "job 就绪塌缩"的真实成本 —— 随机路由
+    // 下 87.9% 的 token 的 max expert >= 50, 预归约的 8 行读与跨卡 push 因此
+    // 全部堆到 GEMM 尾部; 这个探针把堆积摊平, 差值即塌缩的代价。
+    const int no_gate;
 };
 struct no_gate { __device__ inline void operator()(int) const {} };
 // 与 preredpush::signal_epilogue 同构(fp8 config 的 CONSUMER_WARPS 同值)
@@ -731,7 +737,7 @@ __device__ inline void push_job(const globals &G, const int j,
         const int slot = G.prered_slots[{j, k}];
         s_slot[k] = slot;
         s_w[k] = G.prered_w[{j, k}];
-        if (slot >= 0)
+        if (slot >= 0 && !G.no_gate)   // 探针见 globals::no_gate
             pcie_sync::wait_slot(G.barrier, G.dev_idx, 1, slot / gemm_config_fp8::ROW_BLOCK, G.seq);
     }
     if (threadIdx.x == 0) {
@@ -855,7 +861,8 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
            kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_padded_local_tokens,
            const int num_source_tokens, const int num_jobs, const int seq,
-           const int use_epired, at::Tensor &slack, const int two_level) {
+           const int use_epired, at::Tensor &slack, const int two_level,
+           const int no_gate) {
     using cfg = gemm_config_fp8;
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
@@ -904,7 +911,8 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
         .barrier = kittens::py::parallel_tensor_to_pgl<globals::barrier_pgl>(barrier),
         .dev_idx = dev_idx, .num_padded_local_tokens = num_padded_local_tokens,
         .num_source_tokens = num_source_tokens, .num_jobs = num_jobs,
-        .num_comp_sms = num_comp_sms, .seq = seq, .use_epired = use_epired
+        .num_comp_sms = num_comp_sms, .seq = seq, .use_epired = use_epired,
+        .no_gate = no_gate
     };
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;   // 96KB GEMM > 8KB push row

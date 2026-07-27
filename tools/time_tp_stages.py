@@ -124,7 +124,8 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
                 s.push_expected_l1, s.blk_expert, s.l1_gemm_next,
                 s.job_order, s.job_next, s.barrier_l1, s.num_comm_sms_l1,
                 s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq,
-                s.l1_epired, s.slack, 0 if s.l1_epired else s.two_level)
+                s.l1_epired, s.slack, 0 if s.l1_epired else s.two_level,
+                s.l1_no_gate)
         timed("L1_fused", st_l1)
 
         timed("final_red", lambda: s.tk.moe_final_reduce_push(
@@ -168,7 +169,8 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
               f"dist={rdesc}, iters={iters}, comm_sms={s.num_comm_sms}, "
               f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.l0_push_sms}, "
               f"two_level={s.two_level}, local_first={s.local_first}, "
-              f"no_gate={s.l0_no_gate}, P={s.num_padded_total}, "
+              f"no_gate={s.l0_no_gate}/{s.l1_no_gate}, epired={s.l1_epired}, "
+              f"P={s.num_padded_total}, "
               f"max over ranks, us) ==")
         for k, v in zip(stages, t.tolist()):
             print(f"  {k:14} {v:10.1f}")

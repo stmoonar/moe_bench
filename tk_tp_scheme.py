@@ -567,6 +567,10 @@ class TKFusedTP(DistributedScheme):
         # 归因探针(TK_L0_NOGATE, docs/14 §5): L0 GEMM 不等行块到达计数 ——
         # **输出数值是错的**, 只用于把 gate 等待从 L0 exposure 里拆出来。
         self.l0_no_gate = int(os.environ.get("TK_L0_NOGATE", "0"))
+        # 同款探针的 L1 版(TK_L1_NOGATE, docs/15): push_job 不等它 8 个 slot
+        # 的行块信号 —— **输出数值是错的**, 只用于把"job 就绪塌缩"从 L1
+        # exposure 里拆出来。
+        self.l1_no_gate = int(os.environ.get("TK_L1_NOGATE", "0"))
         # peer-writable combine staging: plane d (rows [d*T, d*T+T)) is written
         # only by card d (single writer, no atomics).
         self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
@@ -683,7 +687,7 @@ class TKFusedTP(DistributedScheme):
             self.job_next, self.barrier_l1, self.num_comm_sms_l1,
             self.num_padded_total, self.num_tokens, self.num_jobs,
             self._l1_seq, self.l1_epired, self.slack,
-            0 if self.l1_epired else self.two_level)
+            0 if self.l1_epired else self.two_level, self.l1_no_gate)
         tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
                                  self.recv_from, self.combine_out, self.barrier_l1,
                                  self.num_tokens, self._l1_seq)
