@@ -16,7 +16,7 @@
   经济学"(docs/09 §4 两级 tile 立项判据; .so 按 rb 分开缓存, 互不污染)。
   tail_rows(默认 0, 1-64): 两级 tile Phase 1 裁决模式 —— 每 expert 真实
   行数 = rows_per_e + tail_rows, 128 补齐后多出一个近空尾块(uniform 税
-  的形状), A/B 对比两级 on(blk_rows 表)/off(全满块), 正确性只对真实行。
+  的形状), A/B 对比两级 on(blk_slack 表)/off(全满块), 正确性只对真实行。
 """
 from __future__ import annotations
 
@@ -90,10 +90,12 @@ def main():
     padded = torch.full((E,), per_e_pad, dtype=torch.int32, device=device)
     blk_expert = torch.arange(E, device=device, dtype=torch.int32) \
         .repeat_interleave(per_e_pad // rb).contiguous()
-    blk_rows = None
+    blk_slack = None
     if tail:
-        blk_rows = torch.tensor(([BLOCK] * (rows_e // BLOCK) + [tail]) * E,
-                                dtype=torch.int32, device=device)
+        # kernel 侧口径是 slack(每块 padding 行数) = ROW_BLOCK - 真实行数,
+        # 与调度表 slack 同源同语义(docs/09 §4)
+        blk_slack = torch.tensor(([0] * (rows_e // BLOCK) + [BLOCK - tail]) * E,
+                                 dtype=torch.int32, device=device)
     task_next = torch.zeros(1, dtype=torch.int32, device=device)
     out = torch.zeros(P, N, device=device, dtype=torch.bfloat16)
 
@@ -131,7 +133,7 @@ def main():
 
     ok = check("full", None)
     if tail:
-        ok = check("2level", blk_rows) and ok
+        ok = check("2level", blk_slack) and ok
 
     # ---- 效率: fp8 vs 裸 mma 上限(tail 模式下再加两级 on/off A/B) ----
     def bench(fn, n=iters, warm=5):
@@ -153,8 +155,8 @@ def main():
           f"raw {traw:8.1f}us ({fl / traw / 1e6:6.1f} TFLOP/s)   "
           f"重标定代价 {(t8 - traw) / traw * 100:+.1f}%")
     if tail:
-        t8_2 = bench(lambda: run(False, blk_rows))
-        traw_2 = bench(lambda: run(True, blk_rows))
+        t8_2 = bench(lambda: run(False, blk_slack))
+        traw_2 = bench(lambda: run(True, blk_slack))
         print(f"[fp8 gemm] 2level fp8 {t8_2:8.1f}us ({(t8_2 - t8) / t8 * 100:+.1f}% vs full)   "
               f"raw {traw_2:8.1f}us ({(traw_2 - traw) / traw * 100:+.1f}%)")
     return 0 if ok else 1

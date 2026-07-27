@@ -106,7 +106,7 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
                 s.tp_slots, s.slack, s.pull_order, s.push_order,
                 s.blk_expert, s.gemm_next, s.push_next, s.pull_next,
                 s.barrier_l0, s.num_comm_sms, s.l0_push_sms,
-                s.num_padded_total, s.num_tokens, s._l0_seq)
+                s.num_padded_total, s.num_tokens, s._l0_seq, s.two_level)
         timed("L0_fused", st_l0)
 
         def st_l1():
@@ -123,7 +123,7 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
                 s.push_expected_l1, s.blk_expert, s.l1_gemm_next,
                 s.job_order, s.job_next, s.barrier_l1, s.num_comm_sms_l1,
                 s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq,
-                s.l1_epired)
+                s.l1_epired, s.slack, 0 if s.l1_epired else s.two_level)
         timed("L1_fused", st_l1)
 
         timed("final_red", lambda: s.tk.moe_final_reduce_push(

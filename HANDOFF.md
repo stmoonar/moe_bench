@@ -3,7 +3,43 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 深夜 5）：v2 A64 实测 −8.9%/−6.7%，v3 修 SMSP 聚集（待验证）
+## 最新（2026-07-27 深夜 6）：两级 tile Phase 1b 已接线（⚠️ 待上机验证）
+
+v3 定案后（L0 −12.2%/L1 −9.9%，尾块成本 0.63/0.70）Phase 1b 接入 fused
+两层。**关键简化：blk_rows ≡ ROW_BLOCK − slack**，调度表的 slack 已有
+golden/tpsched 逐比特对拍且每迭代重建 → 调度链零改动。dispenser 参数
+语义改为 blk_slack（tail ⟺ slack ≥ 64）；L0 入口本就接收 slack（barrier
+重置用），只多传给 dispenser；L1 入口新增 slack + two_level 参数；两层
+globals 的 A-源 gl 挂 A_tail_tile 描述符（A64 装载自动启用）。开关
+`TK_TWO_LEVEL`（默认 1）；EPIRED 与 two_level 互斥（C++ TORCH_CHECK +
+scheme 自动降级）。探针/time_tp_stages 调用同步。
+
+- **死锁审计（红线）**：无新增等待点。gate/barrier 语义不变（barrier 初
+  值=slack、放行阈=ROW_BLOCK，与尾块无关）；epilogue/行块信号计数不变；
+  expect_bytes 尾块 16KB 与 A64+B 装载严格相等，producer/consumer tail
+  判定同源只读 slack。尾块上半 act/expert_out 行保持 stale——与既有
+  padding 行同语义（slot_job=-1 不被消费，fp8 NaN 类风险与现状同类）。
+- **正确性强判据**：真实行的计算序列与满块逐指令相同 → balanced 与
+  uniform 的输出都应与 TK_TWO_LEVEL=0 **逐位一致**。
+
+上机 runbook（先确认卡空闲；步 2 是尾块首次实战，单步隔离）：
+
+```bash
+cd /workspace
+rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4 2>&1 | grep -E 'registers|spill'
+# 1) balanced 回归门(无尾块): rel_err 须与基线逐位一致(0.042817...)
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10
+# 2) uniform 正确性门(首次真尾块): 与 two_level=0 的 rel_err 逐位对照
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10 --dist uniform
+TK_TWO_LEVEL=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10 --dist uniform
+# 3) uniform e2e A/B: on 预期比 off 快 ~100-180µs(off ≈ 历史 1988µs 水位)
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --no-verify --dist uniform --iters 50
+TK_TWO_LEVEL=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --no-verify --dist uniform --iters 50
+# 4) balanced e2e 零回退确认
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --no-verify
+```
+
+## 2026-07-27 深夜 5：v2 A64 实测 −8.9%/−6.7%，v3 修 SMSP 聚集（已验，v3 定案见 docs/09）
 
 v2（A64 装载）实测（GPU0）：L0 −8.9% / L1 −6.7%（v1 −6.7/−5.0），
 正确性全 OK、默认路径无回退。尾块成本 ~0.73-0.80 仍距 0.57，残差主因

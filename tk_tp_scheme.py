@@ -441,6 +441,11 @@ class TKFusedTP(DistributedScheme):
         self.combine_partial = torch.zeros(self.num_jobs, H, device=device,
                                            dtype=torch.float32)
         self.l1_epired = int(os.environ.get("TK_L1_EPIRED", "0"))
+        # 两级 tile(TK_TWO_LEVEL, 默认开, docs/09 §4): slack>=64 的尾块只算
+        # 前 64 行。slack 表与调度表同源(host golden/tpsched 逐比特对拍),
+        # balanced 下无尾块 → 满块路径逐指令不变, 零开销。EPIRED 的 wred
+        # tail 是 trap 桩, 互斥(L1 侧自动降级为关)。
+        self.two_level = int(os.environ.get("TK_TWO_LEVEL", "1"))
         # peer-writable combine staging: plane d (rows [d*T, d*T+T)) is written
         # only by card d (single writer, no atomics).
         self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
@@ -535,7 +540,8 @@ class TKFusedTP(DistributedScheme):
             self.pull_order, self.push_order, self.blk_expert,
             self.gemm_next, self.push_next, self.pull_next,
             self.barrier_l0, self.num_comm_sms, self.l0_push_sms,
-            self.num_padded_total, self.num_tokens, self._l0_seq)
+            self.num_padded_total, self.num_tokens, self._l0_seq,
+            self.two_level)
 
         # layer1: act 量化 -> W2 GEMM ⊕ 本地预归约 ⊕ push(稠密 ReduceScatter),
         # 然后源卡侧对 world 个 partial plane 做最终归约。
@@ -553,7 +559,8 @@ class TKFusedTP(DistributedScheme):
             self.blk_expert, self.l1_gemm_next, self.job_order,
             self.job_next, self.barrier_l1, self.num_comm_sms_l1,
             self.num_padded_total, self.num_tokens, self.num_jobs,
-            self._l1_seq, self.l1_epired)
+            self._l1_seq, self.l1_epired, self.slack,
+            0 if self.l1_epired else self.two_level)
         tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
                                  self.recv_from, self.combine_out, self.barrier_l1,
                                  self.num_tokens, self._l1_seq)

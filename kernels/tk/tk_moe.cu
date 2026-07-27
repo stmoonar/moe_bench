@@ -60,26 +60,26 @@ struct no_gate { __device__ inline void operator()(int) const {} };
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
             int *__restrict__ task_next, const int num_tasks,
-            const int *__restrict__ blk_rows) {
+            const int *__restrict__ blk_slack) {
     grouped_gemm_sm120_fp8_dispenser(G, no_gate{}, noop_epilogue{},
                                      plain_store_policy<globals::outputs_gl>{G.outputs},
-                                     blk_expert, task_next, num_tasks, blk_rows);
+                                     blk_expert, task_next, num_tasks, blk_slack);
 }
 // 裸 mma 吞吐探针(docs/03): 跳过重标定, 结果错, 只测 fp8+f32acc 硬上限
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel_raw(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
                 int *__restrict__ task_next, const int num_tasks,
-                const int *__restrict__ blk_rows) {
+                const int *__restrict__ blk_slack) {
     grouped_gemm_sm120_fp8_dispenser<false>(
         G, no_gate{}, noop_epilogue{},
         plain_store_policy<globals::outputs_gl>{G.outputs},
-        blk_expert, task_next, num_tasks, blk_rows);
+        blk_expert, task_next, num_tasks, blk_slack);
 }
 void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
            const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
            const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
            at::Tensor &task_next, const int expert_offset, const bool raw,
-           const at::Tensor &blk_rows) {
+           const at::Tensor &blk_slack) {
     using cfg = gemm_config_fp8;
     // 布局(docs/02): weights = B^T (E, N, K)(w1 原始布局, 免转置),
     // w_scales (E, N/128, K/128); mma_ABt + row-layout 加载。
@@ -106,12 +106,12 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     };
     const int nblk = static_cast<int>(inputs.size(0)) / cfg::ROW_BLOCK;
     TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
-    // 两级 tile(docs/09 §4): blk_rows 可选, 空 tensor = 全满块(既有行为)。
-    const int *blk_rows_ptr = nullptr;
-    if (blk_rows.defined() && blk_rows.numel() > 0) {
-        TORCH_CHECK(blk_rows.size(0) == nblk && blk_rows.scalar_type() == at::kInt,
-                    "blk_rows must be int32 with one entry per row block");
-        blk_rows_ptr = blk_rows.data_ptr<int>();
+    // 两级 tile(docs/09 §4): blk_slack(每块 padding 行数)可选, 空 = 全满块。
+    const int *blk_slack_ptr = nullptr;
+    if (blk_slack.defined() && blk_slack.numel() > 0) {
+        TORCH_CHECK(blk_slack.size(0) == nblk && blk_slack.scalar_type() == at::kInt,
+                    "blk_slack must be int32 with one entry per row block");
+        blk_slack_ptr = blk_slack.data_ptr<int>();
     }
     const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
@@ -120,11 +120,11 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     if (raw) {
         CUDACHECK(cudaFuncSetAttribute(kernel_raw, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel_raw<<<sm, cfg::NUM_THREADS, smem, stream>>>(
-            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks, blk_rows_ptr);
+            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks, blk_slack_ptr);
     } else {
         CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
-            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks, blk_rows_ptr);
+            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks, blk_slack_ptr);
     }
     CUDACHECK(cudaGetLastError());
 }
@@ -225,7 +225,8 @@ struct pglobals {
     using pre_tokens_pgl = pgl<gl<fp8e4m3, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
     using pre_scales_pgl = pgl<gl<float, 1, 1, -1, NSC, scale_vec>, NUM_DEVICES, false>;
     using flags_pgl      = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
-    using gathered_gl    = gl<fp8e4m3, 1, 1, -1, H, token_vec, cfg::A_tile>;
+    // A_tail_tile 描述符启用两级尾块的 A64 装载(sm120_common 编译期检测)
+    using gathered_gl    = gl<fp8e4m3, 1, 1, -1, H, token_vec, cfg::A_tile, cfg::A_tail_tile>;
     using gscales_gl     = gl<float, 1, 1, -1, NSC, scale_vec>;
     using weights_gl     = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;
     using w_scales_gl    = gl<float, 1, -1, -1, -1>;
@@ -359,7 +360,8 @@ __device__ inline void scatter_lane(const pglobals &G, int *__restrict__ pull_ne
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel_push(const __grid_constant__ pglobals G, const int *__restrict__ blk_expert,
                  int *__restrict__ task_next, const int num_tasks,
-                 int *__restrict__ push_next, int *__restrict__ pull_next) {
+                 int *__restrict__ push_next, int *__restrict__ pull_next,
+                 const int *__restrict__ blk_slack) {
     using cfg = gemm_config_fp8;
     if (blockIdx.x >= G.num_comp_sms) {
         const int cb = blockIdx.x - G.num_comp_sms;
@@ -386,7 +388,7 @@ void kernel_push(const __grid_constant__ pglobals G, const int *__restrict__ blk
     }
     grouped_gemm_sm120_fp8_dispenser(G, dispatch_gate_p{G}, noop_epilogue{},
                                      glu_store_policy<pglobals::outputs_gl>{G.outputs},
-                                     blk_expert, task_next, num_tasks);
+                                     blk_expert, task_next, num_tasks, blk_slack);
 }
 __global__ __launch_bounds__(256)
 void reset_kernel_p(const __grid_constant__ pglobals G) {
@@ -405,7 +407,8 @@ void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
            at::Tensor &push_next, at::Tensor &pull_next,
            kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_push_sms,
-           const int num_padded_local_tokens, const int num_tokens, const int seq) {
+           const int num_padded_local_tokens, const int num_tokens, const int seq,
+           const int two_level) {
     using cfg = gemm_config_fp8;
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
@@ -426,6 +429,8 @@ void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
     TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
     const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
     TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    TORCH_CHECK(slack.size(0) == nblk && slack.scalar_type() == at::kInt,
+                "slack must be int32 per row block");
     const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
     pglobals G {
         .pre_tokens = kittens::py::parallel_tensor_to_pgl<pglobals::pre_tokens_pgl>(pre_tokens),
@@ -457,7 +462,9 @@ void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
     CUDACHECK(cudaFuncSetAttribute(kernel_push, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     kernel_push<<<sm, cfg::NUM_THREADS, smem, stream>>>(
         G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
-        push_next.data_ptr<int>(), pull_next.data_ptr<int>());
+        push_next.data_ptr<int>(), pull_next.data_ptr<int>(),
+        // 两级 tile(docs/09 §4): slack 表即"每块 padding 行数", 与调度表同源
+        two_level ? slack.data_ptr<int>() : nullptr);
     CUDACHECK(cudaGetLastError());
     const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
     reset_kernel_p<<<rb, 256, 0, stream>>>(G);
@@ -568,7 +575,7 @@ struct globals {
     static constexpr int H = TK_HIDDEN;
     static constexpr int TOP_K = 8;
     using row_vec        = sv_bf<H>;
-    using activations_gl = gl<fp8e4m3, 1, 1, -1, -1, cfg::A_tile>;   // act fp8 (P, inter)
+    using activations_gl = gl<fp8e4m3, 1, 1, -1, -1, cfg::A_tile, cfg::A_tail_tile>;   // act fp8 (P, inter); A_tail 启用尾块 A64 装载
     using a_scales_gl    = gl<float, 1, 1, -1, -1>;                  // (P, inter/128)
     using weights_gl     = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;  // w2 (E, H, inter) = B^T
     using w_scales_gl    = gl<float, 1, -1, -1, -1>;                 // (E, H/128, inter/128)
@@ -786,14 +793,15 @@ __device__ inline void push_job(const globals &G, const int j,
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
             int *__restrict__ gemm_next,
-            const int *__restrict__ job_order, int *__restrict__ job_next) {
+            const int *__restrict__ job_order, int *__restrict__ job_next,
+            const int *__restrict__ blk_slack) {
     if (blockIdx.x < G.num_comp_sms) {
         const int col_blocks = static_cast<int>(G.weights.rows()) / gemm_config_fp8::COL_BLOCK;
         const int nblk = G.num_padded_local_tokens / gemm_config_fp8::ROW_BLOCK;
         grouped_gemm_sm120_fp8_dispenser(
             G, no_gate{}, signal_epilogue{G, col_blocks},
             wred_store_policy{G},
-            blk_expert, gemm_next, nblk * col_blocks);
+            blk_expert, gemm_next, nblk * col_blocks, blk_slack);
         kittens::group<gemm_config_fp8::NUM_WARPS>::sync(2);  // 专用命名 barrier(docs/04)
     }
     // push 流水: 双 buffer(2×8KB, 覆写 GEMM 已结束的 pipeline 区), 2 个 TMA
@@ -842,7 +850,7 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
            kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_padded_local_tokens,
            const int num_source_tokens, const int num_jobs, const int seq,
-           const int use_epired) {
+           const int use_epired, at::Tensor &slack, const int two_level) {
     using cfg = gemm_config_fp8;
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
@@ -865,6 +873,9 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
     TORCH_CHECK(num_comm_sms >= 1, "num_comm_sms >= 1");
     const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
     TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    TORCH_CHECK(slack.size(0) == nblk && slack.scalar_type() == at::kInt,
+                "slack must be int32 per row block");
+    TORCH_CHECK(!(two_level && use_epired), "two_level 尾块与 EPIRED 不兼容(wred tail 桩)");
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
     TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
     const int num_comp_sms = sm - num_comm_sms;
@@ -895,7 +906,8 @@ void entry(at::Tensor &act_fp8, at::Tensor &act_scales,
     CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
         G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(),
-        job_order.data_ptr<int>(), job_next.data_ptr<int>());
+        job_order.data_ptr<int>(), job_next.data_ptr<int>(),
+        two_level ? slack.data_ptr<int>() : nullptr);
     CUDACHECK(cudaGetLastError());
     const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
     reset_kernel<<<rb, 256, 0, stream>>>(G);

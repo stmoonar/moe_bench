@@ -376,14 +376,15 @@ template <bool RESCALE = true, typename Globals, typename Gate, typename Epilogu
 __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
         const Globals &G, const Gate &gate, const Epilogue &epilogue, const Store &store,
         const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks,
-        // 两级 tile(docs/09 §4): blk_rows[i] = 行块 i 的真实行数(<=ROW_BLOCK),
-        // nullptr = 全满块(既有行为逐指令不变)。真实行数 <= ROW_BLOCK/2 的
-        // "尾块"只由前半条带的 warp 计算/存储(stage 为 tensor 吞吐受限,
-        // Phase 0 实测 64 行任务成本 ~0.57x 128 任务); 其余 warp 跳过
-        // 计算但保持全部 wait/arrive 节奏(信号计数与全满块完全一致)。
+        // 两级 tile(docs/09 §4): blk_slack[i] = 行块 i 的 padding 行数
+        // (= ROW_BLOCK - 真实行数, 即调度表 slack, host golden/tpsched 已
+        // 逐比特对拍且每迭代重建), nullptr = 全满块(既有行为逐指令不变)。
+        // slack >= ROW_BLOCK/2 的"尾块"只由前半条带的 warp 计算/存储
+        // (stage 为 tensor 吞吐受限, 64 行任务成本实测 ~0.63x); 其余 warp
+        // 跳过计算但保持全部 wait/arrive 节奏(信号计数与全满块完全一致)。
         // 布局仍按 ROW_BLOCK 补齐, 尾块上半行保持 stale —— 与既有 padding
         // 行语义相同, 无下游消费者。
-        const int *__restrict__ blk_rows = nullptr) {
+        const int *__restrict__ blk_slack = nullptr) {
     using cfg = gemm_config_fp8;
     using consumers = kittens::group<cfg::CONSUMER_WARPS>;
 
@@ -443,8 +444,8 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 constexpr bool HAS_A64 = gl_has_tma<
                     std::remove_cv_t<decltype(G.activations)>,
                     typename cfg::A_tail_tile>::value;
-                const bool tail = HAS_A64 && blk_rows != nullptr &&
-                                  blk_rows[row_idx] <= cfg::ROW_BLOCK / 2;
+                const bool tail = HAS_A64 && blk_slack != nullptr &&
+                                  blk_slack[row_idx] >= cfg::ROW_BLOCK / 2;
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
@@ -496,8 +497,8 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
             // 两级 tile(docs/09 §4): 尾块(真实行数 <= ROW_BLOCK/2)只由前半
             // 条带的 warp 走完整计算路径, 其余 warp 走下方"信号伴走"分支。
             // 全满块所有 warp 都 active, 指令流与两级引入前逐条相同(零开销)。
-            const int rows_this = (blk_rows != nullptr &&
-                                   blk_rows[row_idx] <= cfg::ROW_BLOCK / 2)
+            const int rows_this = (blk_slack != nullptr &&
+                                   blk_slack[row_idx] >= cfg::ROW_BLOCK / 2)
                                       ? cfg::ROW_BLOCK / 2 : cfg::ROW_BLOCK;
             // 尾块用恒等 strip 映射(warp 0-3 → 条带 0-3): active warp 落在
             // 4 个不同 SMSP(warp_id%4)铺满全部 tensor 单元。沿用 store 交织
