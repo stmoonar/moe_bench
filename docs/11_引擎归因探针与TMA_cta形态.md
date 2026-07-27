@@ -89,6 +89,10 @@ TASK_Q 保持 2，此路关闭。（这同时弱化了"TMA syscall 卡 producer 
 REG:168 + STACK:56/64 只复现了带 CALL 必 spill。**真裁决 = cta 补丁后重编
 真 kernel 看 ptxas 是否允许 >168**——这决定 4×2 + COL=128 路线的生死。
 
+> **2026-07-27 裁决（docs/12 §5 E4）**：已重编（COL=128 压力编译，
+> CALL.ABS=0 前提）——ptxas 仍压 168 并 spill，**帽不随 CALL 消失解除**，
+> 4×2+COL=128 判死，COL=64 定案为平台强制最优（docs/10 §6 已加定案注）。
+
 注意：5d 的 cta 形态（swizzled tile，A/B 加载实际路径）当时没测，litmus
 已补 `ld5d_cta`，上机先编它。
 

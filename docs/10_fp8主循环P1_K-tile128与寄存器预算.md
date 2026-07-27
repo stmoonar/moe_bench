@@ -106,6 +106,14 @@ P1 修复版（A 双/B 单）仍慢：NCU 1.36ms vs 旧 924µs，REG:168 + STACK
 额外开销（CUTLASS 的 2D descriptor 可能走原生路径——后续杠杆之一：
 A/B 改 2D TMA descriptor 绕开 4d/5d syscall）。
 
+> **2026-07-27 E4 定案（docs/12 §5）**：cta 补丁使 CALL.ABS=0 之后，
+> 用 COL=128/stages=3 重编真 kernel——四个大 kernel 仍全部被 ptxas 压在
+> **168 reg 并 spill**（gg8::kernel 504B stack/816 spill stores，
+> kernel_push 448B，tppr8 504B；build.py 无 `-maxrregcount`，168 非自设）。
+> **168 帽与 ABI call 无因果**：本节"调用帧预留"只解释了数值来源
+> （224−56），去掉 call 并不解除。4×2+COL=128 路线判死，COL=64（§7）
+> 定案为平台强制最优。
+
 ## 7. P2：COL_BLOCK = 64（把需求压进 168）
 
 acc+sub = 128 regs 是 128 宽 tile（8 warp × 16×128）的数学下限，无解；

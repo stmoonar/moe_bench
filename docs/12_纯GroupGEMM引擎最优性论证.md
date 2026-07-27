@@ -21,8 +21,8 @@
    L0 76.8% / L1 88.2%（§2.1）。
 3. **差距有账、杠杆在册。** L0（锁频 110.6µs）= 重标定机制 70% +
    结构性 30%，杠杆：重标定切片交织（头号）、任务边界 store 后置
-   （~20µs）、4×2 warp 几何（等 E4 裁决）；L1 的 11.8% 来源（流量 vs
-   调度）待 E5。便宜旁路已全部实验判负（§4）。
+   （~20µs）；4×2+COL=128 几何已被 E4 判负（§5）。L1 的 11.8% 来源
+   （流量 vs 调度）待 E5。便宜旁路已全部实验判负（§4）。
 
 ## 2. 数据
 
@@ -64,7 +64,7 @@ L1 锁频：gg8 425.0µs/64.2% vs triton 537µs/50.2%（triton 受两颗 GEMM
 | K-tile = 128 = 量化块 | 旧 64 深 stage 的 2× mbarrier/LDSM 冗余（10 §1） |
 | 重标定每 128 K 一次 | 与 CUTLASS 87c blockwise promotion 同频同数学（10 §1） |
 | A/B 全双缓冲 + arrived wait 提前至末尾 QMMA 前 | load→use 串行暴露 LDSM 延迟（10 §3） |
-| COL_BLOCK=64，consumer ~156 reg 零 spill | 168 寄存器帽下 128 宽 tile 需求 ~230 无解（10 §6-7） |
+| COL_BLOCK=64，consumer ~156 reg 零 spill | 168 寄存器帽下 128 宽 tile 必 spill；E4 定案帽与 syscall 无因果，COL=64 平台强制（§5 E4、10 §7） |
 | 4 stage × 24KB = 96KB ≤ 99KB | sm120 smem 帽下最深流水（08 §6） |
 | TMA load `.shared::cta` 原生形态 | `.shared::cluster` 驱动 syscall，109 个 CALL.ABS→0（11 §6-7） |
 
@@ -76,6 +76,7 @@ L1 锁频：gg8 425.0µs/64.2% vs triton 537µs/50.2%（triton 受两颗 GEMM
 | EPIRED（epilogue 直推归约） | v2 向量原子仍输 108µs，L2 fp32 原子吞吐是硬墙 | docs/04 §2 |
 | scale 走 smem 流水 | stall 无 LDG 记分牌 signature，降级观察 | 11 §9 |
 | 全宽 B 双缓冲 / setmaxnreg | ptxas spill 4.7× 回退 / C7506 全数忽略 | 10 §2, §6 |
+| 4×2 warp 几何 + COL=128 | E4：CALL.ABS=0 后 ptxas 仍 168 帽，COL=128 四个大 kernel 全 spill，判负 | §5 E4、10 §7 |
 | L1 引擎优化曾判"关闭" | 重开：CUTLASS 同流量快 11.8%，待 E5 定方向 | 11 §2 |
 
 ## 5. 实验状态
@@ -84,32 +85,30 @@ L1 锁频：gg8 425.0µs/64.2% vs triton 537µs/50.2%（triton 受两颗 GEMM
 
 - **E3 triton 调优 ✅ 完成**：调优扫描未找到优于现役 config 的配置，
   triton 数字即其最优水位，结论 1 坐实，e2e 报数无需重报。
-- **E4（待跑，纯编译）**：COL=128 压力编译裁决 168 寄存器帽是否随
-  syscall 消失解除——决定 4×2+COL=128 路线（L0 结构性差距）生死。
-
-```bash
-sed -i 's/COL_BLOCK = 64/COL_BLOCK = 128/; s/PIPELINE_STAGES = 4/PIPELINE_STAGES = 3/' \
-  moe_bench/kernels/tileoverlap/common/sm120_common.cuh
-rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4 2>&1 | tee /tmp/build_col128.log
-grep -E 'registers|spill|STACK' /tmp/build_col128.log
-git -C moe_bench checkout kernels/tileoverlap/common/sm120_common.cuh && \
-  rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4   # 还原重建
-```
-
-  判据：consumer REG>168 且零 spill → 路线活；仍 168/spill →
-  "COL=64 平台强制"定案。编译报错则检出 P2 前提交编译。
+- **E4 ✅ 完成（2026-07-27）**：COL=128/stages=3 重编（build.py 无
+  `-maxrregcount`，168 非自设），在 CALL.ABS=0 前提下四个大 kernel 仍
+  全部被压 **168 reg 且 spill**（gg8::kernel 504B stack/816 spill
+  stores，kernel_push 448B，tppr8 504B，kernel_raw 56B；硬上限本是
+  224=65536/288 线程）。**定案**：① 168 帽与 ABI call 无因果——去
+  syscall 不解除，"224−56 调用帧"只解释数值来源；② **4×2+COL=128
+  判死，COL=64 是平台强制最优**；③ 已还原重建（L1 复测 371.6µs、
+  rel_err 1.68e-03 证实现役 .so 为 COL=64）。
 - **E1（待跑）**：cta 补丁后 NCU 锁频重定基，
   `bash moe_bench/tools/probe_engine.sh <空闲卡>`，§2.2 数字更新，
   rel_err 须仍 1.68e-03。
 - **E5（待跑，已升优先级）**：L1 差距来源裁决——tk 与 CUTLASS 各采一次
   `dram__bytes.sum`（L1 形状）。字节相近 → 差在延迟/调度（tk 可修）；
-  CUTLASS 更少 → 差在 L2 复用/栅格化顺序。
+  CUTLASS 更少 → 差在 L2 复用/栅格化顺序。命令（在 /workspace/work 下；
+  注意必须带 `--kernel-name-base demangled`，否则 regex 匹配不到命名空间，
+  会报 "No kernels were profiled"）：
 
 ```bash
-CUDA_VISIBLE_DEVICES=<空闲卡> ncu --kernel-name 'regex:gg8' --launch-skip 4 --launch-count 1 \
-  --metrics dram__bytes.sum python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 10
-CUDA_VISIBLE_DEVICES=<空闲卡> ncu --kernel-name 'regex:cutlass' --launch-skip 4 --launch-count 1 \
-  --metrics dram__bytes.sum ./tools/cutlass_probe/build/cutlass_fp8_grouped \
+CUDA_VISIBLE_DEVICES=<空闲卡> ncu --kernel-name-base demangled --kernel-name 'regex:gg8' \
+  --launch-skip 4 --launch-count 1 --metrics dram__bytes.sum \
+  python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 10
+CUDA_VISIBLE_DEVICES=<空闲卡> ncu --kernel-name-base demangled --kernel-name 'regex:cutlass' \
+  --launch-skip 4 --launch-count 1 --metrics dram__bytes.sum \
+  moe_bench/tools/cutlass_probe/build/cutlass_fp8_grouped \
   --groups=64 --m=256 --n=4096 --k=768 --iterations=10
 ```
 
