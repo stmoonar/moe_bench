@@ -7,9 +7,10 @@
   L1 exposure = t(L1 fused) - t(L1 GEMM alone)     (预归约/push 排空)
 
   python -m moe_bench.tools.time_tp_stages [ne] [iters] [tokens_per_rank]
+      [--dist balanced|uniform|skewed|single] [--skew-alpha A] [--active N]
 
 形状/精度取自主配置 configs/tp_rtx_pro5000_4gpu_fp8.yaml, 只覆盖 CLI 给的
-num_experts / num_tokens / 迭代数。每阶段取**各 rank 的最大值**(最慢者定门),
+num_experts / num_tokens / 迭代数 / token 路由分布(覆盖项会打印出来)。每阶段取**各 rank 的最大值**(最慢者定门),
 再对迭代取均值。阶段间的 cuda.synchronize 会轻微扰动重叠, 但融合 kernel
 本身是原样跑的。
 """
@@ -27,7 +28,7 @@ CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
                       "configs", "tp_rtx_pro5000_4gpu_fp8.yaml")
 
 
-def _worker(rank, world, init_method, ne, iters, tokens):
+def _worker(rank, world, init_method, ne, iters, tokens, routing):
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     torch.set_default_device(device)
@@ -35,14 +36,17 @@ def _worker(rank, world, init_method, ne, iters, tokens):
                             rank=rank, world_size=world, device_id=device)
     dist.all_reduce(torch.tensor([rank], device=device))
 
-    from moe_bench.config import MoEBenchConfig
+    from moe_bench.config import Distribution, MoEBenchConfig
     from moe_bench.context import DistContext
     from moe_bench.data import make_problem, make_weights
     from moe_bench.tk_tp_scheme import TKFusedTP
 
     cfg = MoEBenchConfig.from_file(CONFIG)
-    cfg = dataclasses.replace(cfg, num_experts=ne, num_tokens=[tokens],
-                              world_size=world, verify=False)
+    over = dict(num_experts=ne, num_tokens=[tokens], world_size=world,
+                verify=False)
+    if routing is not None:
+        over["routing"] = routing
+    cfg = dataclasses.replace(cfg, **over)
     ctx = DistContext(rank=rank, world_size=world, local_rank=rank,
                       device=device, group=None)
     weights = make_weights(cfg, rank)
@@ -148,8 +152,14 @@ def _worker(rank, world, init_method, ne, iters, tokens):
     t = torch.tensor([acc[k] / iters for k in stages], device=device)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     if rank == 0:
+        rt = cfg.routing
+        rdesc = rt.distribution.value
+        if rt.distribution == Distribution.SKEWED:
+            rdesc += f"(a={rt.skew_alpha})"
+        if rt.num_active_experts is not None:
+            rdesc += f",act={rt.num_active_experts}"
         print(f"\n== tktp stage attribution (fp8, NE={ne}, T={tokens}, "
-              f"iters={iters}, comm_sms={s.num_comm_sms}, "
+              f"dist={rdesc}, iters={iters}, comm_sms={s.num_comm_sms}, "
               f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.l0_push_sms}, "
               f"max over ranks, us) ==")
         for k, v in zip(stages, t.tolist()):
@@ -163,15 +173,40 @@ def _worker(rank, world, init_method, ne, iters, tokens):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    ne = int(args[0]) if len(args) > 0 else 64
-    iters = int(args[1]) if len(args) > 1 else 20
-    tokens = int(args[2]) if len(args) > 2 else 512
-    from moe_bench.config import MoEBenchConfig
-    world = MoEBenchConfig.from_file(CONFIG).world_size
+    flag_cast = {"--dist": str, "--skew-alpha": float, "--active": int}
+    argv, flags, pos = sys.argv[1:], {}, []
+    i = 0
+    while i < len(argv):
+        if argv[i] in flag_cast:
+            flags[argv[i]] = flag_cast[argv[i]](argv[i + 1])
+            i += 2
+        else:
+            pos.append(argv[i])
+            i += 1
+    ne = int(pos[0]) if len(pos) > 0 else 64
+    iters = int(pos[1]) if len(pos) > 1 else 20
+    tokens = int(pos[2]) if len(pos) > 2 else 512
+
+    from moe_bench.config import Distribution, MoEBenchConfig, RoutingConfig
+    cfg = MoEBenchConfig.from_file(CONFIG)
+    world = cfg.world_size
+    routing = None
+    if flags:
+        d, alpha, active = (flags.get("--dist"), flags.get("--skew-alpha"),
+                            flags.get("--active"))
+        routing = RoutingConfig(
+            distribution=Distribution(d) if d else cfg.routing.distribution,
+            skew_alpha=alpha if alpha is not None else cfg.routing.skew_alpha,
+            num_active_experts=active if active is not None
+            else cfg.routing.num_active_experts)
+        # 在 spawn 前触发 __post_init__ 校验(如 topk > active), 避免 4 个
+        # worker 各自炸一遍。
+        dataclasses.replace(cfg, num_experts=ne, routing=routing)
+        print(f"[time_tp_stages] config={os.path.basename(CONFIG)} "
+              f"routing overrides={flags}")
     from vllm.utils.network_utils import get_open_port
     init_method = f"tcp://localhost:{get_open_port()}"
-    mp.spawn(_worker, args=(world, init_method, ne, iters, tokens),
+    mp.spawn(_worker, args=(world, init_method, ne, iters, tokens, routing),
              nprocs=world, join=True)
 
 
