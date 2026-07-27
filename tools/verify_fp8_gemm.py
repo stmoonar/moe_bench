@@ -8,10 +8,12 @@
      指令代价占比 —— 这是判断 GEMM 引擎还有没有肉的第一根探针。
 
   单卡运行(设 CUDA_VISIBLE_DEVICES 选一张空闲卡):
-    python -m moe_bench.tools.verify_fp8_gemm [E] [rows_per_e] [K] [N] [iters]
+    python -m moe_bench.tools.verify_fp8_gemm [E] [rows_per_e] [K] [N] [iters] [row_block]
 
   默认 L0 形状:E=64, 256 行/expert(P=16384), K=4096, N=1536。
   L1 形状用:  python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096
+  row_block(默认 128): TK_ROW_BLOCK 编译宏, 传 64 测"64 行任务的单位
+  经济学"(docs/09 §4 两级 tile 立项判据; .so 按 rb 分开缓存, 互不污染)。
 """
 from __future__ import annotations
 
@@ -51,6 +53,10 @@ def main():
     K = int(args[2]) if len(args) > 2 else 4096
     N = int(args[3]) if len(args) > 3 else 1536
     iters = int(args[4]) if len(args) > 4 else 20
+    rb = int(args[5]) if len(args) > 5 else 128
+    assert rows_e % rb == 0, f"rows_per_e={rows_e} 必须整除 row_block={rb}"
+    if rb != 128:
+        print(f"[fp8 gemm] override row_block={rb} (默认 128)")
     device = "cuda"
     torch.manual_seed(0)
 
@@ -60,7 +66,7 @@ def main():
     spec = spec_from_file_location("_tk_build", build_py)
     bmod = module_from_spec(spec)
     spec.loader.exec_module(bmod)
-    tk = bmod.build_and_load(4, hidden=4096, row_block=128)
+    tk = bmod.build_and_load(4, hidden=4096, row_block=rb)
 
     P = E * rows_e
     A_bf = torch.randn(P, K, device=device, dtype=torch.bfloat16) / 8
@@ -73,7 +79,7 @@ def main():
 
     padded = torch.full((E,), rows_e, dtype=torch.int32, device=device)
     blk_expert = torch.arange(E, device=device, dtype=torch.int32) \
-        .repeat_interleave(rows_e // 128).contiguous()
+        .repeat_interleave(rows_e // rb).contiguous()
     task_next = torch.zeros(1, dtype=torch.int32, device=device)
     out = torch.zeros(P, N, device=device, dtype=torch.bfloat16)
 

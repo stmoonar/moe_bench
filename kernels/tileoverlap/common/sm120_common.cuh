@@ -477,14 +477,6 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 const int nxt = (stage + 1) % cfg::PIPELINE_STAGES;
                 #pragma unroll
                 for (int kk = 0; kk < KK; kk++) {
-                    if (kk + 1 < KK) {
-                        load_kk((kk + 1) & 1, stage, kk + 1);
-                    } else if (red_idx + 1 < num_iters) {
-                        // CUTLASS 序: 下一 stage 的 wait + 预取提到末尾 QMMA 前
-                        wait(inputs_arrived[nxt], get_phasebit<0>(phasebits, nxt));
-                        update_phasebit<0>(phasebits, nxt);
-                        load_kk(0, nxt, 0);
-                    }
                     if (RESCALE && kk == 0) {
                         // P3 交织(docs/11 §3/§9): 前一量化块的重标定按 16 列
                         // base-tile 切片, 与本块 kk0 的 QMMA 交错 ——
@@ -495,6 +487,12 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                         // K 升序→FFMA→清零→新块 QMMA K 升序) → 逐比特等价。
                         // mma_ABt_base = mma_ABt 对 (n=0,m=j,k=0) 的同一原子
                         // 调用(TK warp.cuh: d.tiles[0][m] 配 b.tiles[m][0])。
+                        // v2: load_kk(1) 移到交织块之后 —— v1 里它先发射,
+                        // a/b_reg[1] (~20 regs) 在整个交织期被迫存活, 把
+                        // gg8::kernel 顶到 168+spill(156→168, 8B, 实测判负
+                        // -5/-10.6µs); 后置让交织期只有单套 frag 存活,
+                        // kk1 LDSM 延迟由 kk0 的 8 条 QMMA 在 tensor 管线
+                        // 的积压掩护。
                         #pragma unroll
                         for (int j = 0; j < acc.width; j++) {
                             #pragma unroll
@@ -508,9 +506,18 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                             warp::mma_ABt_base(sub.tiles[0][j], a_reg[0].tiles[0][0],
                                                b_reg[0].tiles[j][0], sub.tiles[0][j]);
                         }
-                    } else {
-                        warp::mma_ABt(sub, a_reg[kk & 1], b_reg[kk & 1], sub);
+                        load_kk(1, stage, 1);
+                        continue;
                     }
+                    if (kk + 1 < KK) {
+                        load_kk((kk + 1) & 1, stage, kk + 1);
+                    } else if (red_idx + 1 < num_iters) {
+                        // CUTLASS 序: 下一 stage 的 wait + 预取提到末尾 QMMA 前
+                        wait(inputs_arrived[nxt], get_phasebit<0>(phasebits, nxt));
+                        update_phasebit<0>(phasebits, nxt);
+                        load_kk(0, nxt, 0);
+                    }
+                    warp::mma_ABt(sub, a_reg[kk & 1], b_reg[kk & 1], sub);
                 }
                 warp::arrive(inputs_finished[stage]);
                 stage = nxt;

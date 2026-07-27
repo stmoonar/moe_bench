@@ -46,13 +46,40 @@ BM) × cdiv(N, BN) = cdiv(16384+64·63, 64)×{12, 32} = 3828/10208，与 w13/w2
   几乎归零（2146 vs 2167）。
 - **结论：本形状整体换 RB64 判负**。小块的收益只该付给余数行。
 
-## 4. 后续方向：两级 tile（未立项）
+## 4. 两级 tile（2026-07-27 立项推进，分阶段）
 
-主体行块保 128（不付 B 重载税），每 expert 余数行（1-127）单独走 64 或
-32 的尾块模板。预期 padding 税 25%→<5%，balanced 零损失。落点：blk_expert
-表构建挂异构任务描述 + GEMM 模板加 64-M 实例 + dispenser 按任务型分发。
-在瓶颈排序中与本地 scatter/sched 竞争优先级；若报数口径改双分布
-（balanced + uniform），优先级应上调。
+主体行块保 128（不付 B 重载税——余数行本来就要多一个任务读一遍 B，
+两级不新增 B 读），每 expert 余数行（1-127）单独走 64 尾块任务。预期
+padding 税 25%→~5-8%（uniform e2e −250~300µs），balanced 零损失（无尾块）。
+
+**Phase 0（概念验证，零 kernel 代码）**：64 行任务的单位经济学。
+`verify_fp8_gemm` 已把 `row_block` 通到 CLI（第 6 个位置参数，走
+TK_ROW_BLOCK 编译宏，.so 按 rb 分开缓存）：
+
+```bash
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 4096 1536 20 64
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 20 64
+```
+
+判据：RB64（任务数 ×2、CONSUMER_WARPS=4、160 线程）总时间对比 RB128
+同形状——**若 ≈ 持平或仅慢 B 重载份额，则 64 任务成本 ≈ 半个 128 任务，
+两级 tile 上界兑现，立项**；若明显更慢（4 consumer warp 吃不满 tensor），
+收益打折重估。注意该对比含 2× B 读（悲观界），两级 tile 尾块不付此税。
+
+**Phase 1（立项后）设计裁决点**（按依赖序）：
+
+1. 任务描述加 M 型别（128/64）：blk_expert 表旁挂 blk_rows 或高位编码；
+   tpsched/torch 版/host golden 三层同步 + preflight 对拍扩展。
+2. producer：尾任务 A tile 用 64 行 TMA 描述（第二个 st 类型 + 描述符），
+   B 路径零改动。
+3. consumer：尾任务 warps 4-7 跳过 compute/store 但**照常 arrive 全部
+   信号**（inputs_finished/task_done 计数不变——死锁审计点）。
+4. store/epilogue：半高 store 路径（plain 直接半高；GLU 配对是列维
+   [gate32|up32]，行高减半不影响）。
+5. **最大裁决点——act/padded 布局粒度**：若下游布局仍按 128 补齐，只省
+   L0 的 QMMA（收益减半）；若整链改 64 粒度补齐，L1 GEMM/scatter/推流
+   同步受益，但所有 per-row-block 信号与调度表要过一遍死锁/正确性审计。
+   建议先做前者（L0-only，改动面小）拿一半收益，再评估后者。
 
 ## 5. 附带修复与口径说明
 

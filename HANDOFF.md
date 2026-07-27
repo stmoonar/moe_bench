@@ -3,7 +3,40 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 晚）：P3 重标定切片交织已实现（⚠️ 待上机验证）
+## 最新（2026-07-27 深夜）：P3 首测判定 + v2 修正；两级 tile Phase 0 就绪
+
+**P3v1 首测（GPU0）**：数值全过（verify 1.68e-03 两形状；e2e rel_err
+0.042817506939172745 与基线**逐位一致**，FAIL 是已知容差口径）。性能小幅
+判负：L0 fp8 654.1（基线 649.1，+5µs）、L1 361.6（351.0，+10.6µs）。
+ptxas 定位根因：gg8::kernel 156→**168 顶帽 + 8B spill**、tppr8 也见
+32B/20B spill——v1 里 `load_kk(1)` 在交织块之前发射，a/b_reg[1]（~20
+regs）在整个交织期被迫存活，顶穿预算、ptxas 失去调度自由。
+
+**P3v2（已提交，待上机 A/B）**：单变量修正——交织块移到 `load_kk(1)`
+之前（kk1 LDSM 延迟由 kk0 的 8 条 QMMA 在 tensor 管线的积压掩护），
+raw 路径逐指令不变。判据：ptxas 回落 ~156-158 零 spill；L0 < 649.1 /
+L1 < 351.0 才算赢；**仍输则 git revert P3 两个提交、负结果入 docs/04**
+（EPIRED 同款流程）。
+
+**uniform 劣化（+370µs, docs/09）**：两级 tile 立项推进，Phase 0 概念
+验证已就绪——`verify_fp8_gemm` 第 6 参传 row_block（TK_ROW_BLOCK 宏，
+.so 分开缓存）。RB64 vs RB128 判 64 行任务单位成本，判据与 Phase 1
+设计裁决点在 docs/09 §4。
+
+上机 runbook（先确认卡空闲）：
+
+```bash
+cd /workspace
+# A) P3v2 A/B
+rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4 2>&1 | grep -E 'registers|spill'
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 4096 1536 20
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 20
+# B) 两级 tile Phase 0 (RB64 单位经济学; 首次会现编 rb64 的 .so)
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 4096 1536 20 64
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 20 64
+```
+
+## 2026-07-27 晚：P3 重标定切片交织已实现（已被上一节首测结果取代）
 
 改动只有 `sm120_common.cuh` 消费者主循环：重标定 FFMA 从 stage 边界移进
 **下一 stage 的 kk0**，按 16 列 base-tile 切片与 QMMA 交错
