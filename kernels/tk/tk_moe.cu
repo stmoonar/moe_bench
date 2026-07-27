@@ -127,6 +127,15 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     }
     CUDACHECK(cudaGetLastError());
 }
+// 旧 10 参签名重载(无 blk_rows = 全满块): 未定义 tensor 只在 C++ 内部传递,
+// 不过 pybind caster 边界(未定义 tensor 作默认值会被映射成 None 再被拒)。
+void entry_notail(const at::Tensor &inputs, const at::Tensor &a_scales,
+                  const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
+                  const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
+                  at::Tensor &task_next, const int expert_offset, const bool raw) {
+    entry(inputs, a_scales, weights, w_scales, outputs, padded_tokens_per_expert,
+          blk_expert, task_next, expert_offset, raw, at::Tensor());
+}
 // 1×128 row-group 量化(docs/03): bf16 (rows, groups*128) -> fp8 + scales
 // (rows, groups)。torch 的五连发小 kernel 链要 ~80µs, 单 kernel 版 ~10-15µs。
 // L0 的 token 量化(groups=H/128)与 L1 的 act 量化(groups=inter/128)共用。
@@ -1207,14 +1216,9 @@ void sched_build_entry(const at::Tensor &packed_all, at::Tensor &padded,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_TK_PARALLEL_TENSOR(m);
     m.def("pcie_device_barrier", &disp::barrier_entry);
-    m.def("grouped_gemm_fp8", &gg8::entry,
-          pybind11::arg("inputs"), pybind11::arg("a_scales"), pybind11::arg("weights"),
-          pybind11::arg("w_scales"), pybind11::arg("outputs"), pybind11::arg("padded"),
-          pybind11::arg("blk_expert"), pybind11::arg("task_next"),
-          pybind11::arg("expert_offset"), pybind11::arg("raw"),
-          // 默认值必须是"已定义的空 tensor": 未定义 at::Tensor() 会被 caster
-          // 映射成 None, 省参调用时 None -> at::Tensor 反向转换直接被拒
-          pybind11::arg("blk_rows") = at::empty({0}, at::kInt));
+    // 双重载: 11 参(带 blk_rows, 两级 tile) + 旧 10 参(全满块), pybind 按序匹配
+    m.def("grouped_gemm_fp8", &gg8::entry);
+    m.def("grouped_gemm_fp8", &gg8::entry_notail);
     m.def("rowgroup_quant_fp8", &gg8::rowgroup_quant_entry);
     m.def("moe_tp_dispatch_gemm_fp8_push", &tpdisp8::entry_push);
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
