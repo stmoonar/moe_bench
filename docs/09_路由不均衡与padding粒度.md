@@ -81,6 +81,18 @@ CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 25
 RB64 的 160 线程口径**没有 168 寄存器帽**（gg8 178 reg 零 spill、tppr8
 184——ptxas 上限 65536/160=409），尾块模板的寄存器预算天然宽裕。
 
+**Phase 1a 实现与首测（2026-07-27，GPU0）**：dispenser 尾块任务落地
+（`blk_rows` 表 + 前半条带 warp 完整路径 / 后半"信号伴走"，布局零改动，
+balanced 零开销双路结构，死锁审计零新增等待点）。tail=32 探针
+（每 expert 2 满块+1 尾块）：**正确性 full/2level 双双 1.68e-03 OK**；
+性能 v1 = L0 −6.7% / L1 −5.0%（预期 −14/−13），反推尾块成本 ~0.80×
+而非 0.57×。**归因：v1 的 producer 仍给尾块装满 128 行 A tile**（stage
+喂料 24KB 不减），尾块 stage 被 TMA 托底。**v2 = A64 装载**：利用 TK st
+布局等价性（swizzle_bytes=128 单 panel → st<128,128> 前 64 行与
+st<64,128> 逐字节相同），producer 对尾块只装 8KB A tile（stage 24K→16K，
+expect_bytes 同步），consumer 零改动；编译期 requires 检测 gl 是否带
+A_tail_tile 描述符，未接入的 fused kernel 自动回退全量装载。
+
 **Phase 1（立项后）设计裁决点**（按依赖序）：
 
 1. 任务描述加 M 型别（128/64）：blk_expert 表旁挂 blk_rows 或高位编码；

@@ -40,7 +40,8 @@ using namespace tileoverlap;
 namespace gg8 {
 struct globals {
     using cfg = gemm_config_fp8;
-    using activations_gl = gl<fp8e4m3, 1, 1, -1, -1, cfg::A_tile>;
+    // A_tail_tile 描述符启用两级尾块的 A64 装载(sm120_common 编译期检测)
+    using activations_gl = gl<fp8e4m3, 1, 1, -1, -1, cfg::A_tile, cfg::A_tail_tile>;
     using weights_gl     = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;
     using a_scales_gl    = gl<float, 1, 1, -1, -1>;
     using w_scales_gl    = gl<float, 1, -1, -1, -1>;

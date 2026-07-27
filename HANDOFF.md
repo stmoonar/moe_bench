@@ -3,7 +3,21 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 深夜 3）：两级 tile Phase 1a 已实现（⚠️ 待上机验证）
+## 最新（2026-07-27 深夜 4）：Phase 1a 首测通过（−6.7%/−5.0%）+ A64 装载 v2（待验证）
+
+Phase 1a 首测（GPU0）：**正确性全过**（默认路径无回退 660.5/359.5 +
+rel_err 1.68e-03；tail=32 探针 full/2level 双双 OK；四卡回归 rel_err
+逐位一致）。性能 v1 = L0 −6.7% / L1 −5.0%（预期 −14/−13）→ 尾块成本
+~0.80× 而非 0.57×，归因 = v1 producer 仍装满 128 行 A tile，尾块 stage
+被 TMA 喂料托底。**v2 已提交**：A64 装载——TK st 布局等价性（128 列
+fp8 → swizzle_bytes=128 单 panel → st<128,128> 前 64 行与 st<64,128>
+逐字节同）使 consumer 零改动；producer 对尾块 expect/装载 16KB（A64 8K
++ B 8K），编译期 requires 检测 gl 的 A_tail_tile 描述符（gg8 已挂，
+fused 未接入自动回退）。死锁审计：expect 与实际字节严格相等、两侧 tail
+判定同源 blk_rows；无新增等待点。复测：runbook 步 2-3 同款（默认路径
+仍须 1.68e-03 + ~649/351；tail=32 预期向 −11~14% 靠拢）。
+
+## 2026-07-27 深夜 3：两级 tile Phase 1a 已实现（首测见上节）
 
 dispenser 支持"尾块任务"（docs/09 §4）：`blk_rows[i]` = 行块真实行数，
 ≤64 的尾块只由前半条带 warp（store_strip<4，即 warp {0,4,1,5}）走完整

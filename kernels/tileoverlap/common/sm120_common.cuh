@@ -244,6 +244,11 @@ struct gemm_config_fp8 {
 
     using A_tile = st_fp8e4m3<ROW_BLOCK, RED_BLOCK>; // 16KB (RB=128)
     using B_tile = st_fp8e4m3<COL_BLOCK, RED_BLOCK>; // 8KB, B^T (N-major)
+    // 两级尾块的半高 A tile(docs/09 §4)。布局等价性(TK st.cuh idx()):
+    // RED_BLOCK=128 列 fp8 → swizzle_bytes=128 → 单 panel(outer_idx≡0),
+    // 地址 = base + r*128 + swizzle(c) 与总行数无关 → st<128,128> 的前
+    // 64 行与 st<64,128> 逐字节相同, consumer 的 subtile 读取零改动。
+    using A_tail_tile = st_fp8e4m3<ROW_BLOCK / 2, RED_BLOCK>; // 8KB
 
     struct pipeline_inputs {
         A_tile A;
@@ -423,9 +428,31 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 if (row_idx < 0) break;
                 gate(row_idx);
                 const int e = blk_expert[row_idx];
+                // 两级尾块 A64 装载: 仅当 globals 的 activations gl 带
+                // A_tail_tile 的 TMA 描述符时启用(编译期检测; fused 各自
+                // Phase 接入前自动回退全量装载, 尾块只省算不省 A 字节)。
+                constexpr bool HAS_A64 = requires {
+                    G.activations.template get_tma<typename cfg::A_tail_tile, 2>();
+                };
+                const bool tail = HAS_A64 && blk_rows != nullptr &&
+                                  blk_rows[row_idx] <= cfg::ROW_BLOCK / 2;
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
+                    if constexpr (HAS_A64) {
+                        if (tail) {
+                            // 尾块: A 只装前 64 行(stage 字节 24K→16K), B 不变。
+                            // expect 与实际传输字节严格相等(死锁审计: 两侧 tail
+                            // 判定同源 blk_rows, 字节多/少都会卡死或早到)。
+                            tma::expect_bytes(inputs_arrived[stage],
+                                sizeof(typename cfg::A_tail_tile) + sizeof(typename cfg::B_tile));
+                            auto &a64 = reinterpret_cast<typename cfg::A_tail_tile&>(inputs[stage].A);
+                            tma_cta::load_async(a64, G.activations, {row_idx * 2, red_idx}, inputs_arrived[stage]);
+                            tma_cta::load_async(inputs[stage].B, G.weights, {e, col_idx, red_idx}, inputs_arrived[stage]);
+                            stage = (stage + 1) % cfg::PIPELINE_STAGES;
+                            continue;
+                        }
+                    }
                     tma::expect_bytes(inputs_arrived[stage], sizeof(typename cfg::pipeline_inputs));
                     tma_cta::load_async(inputs[stage].A, G.activations, {row_idx, red_idx}, inputs_arrived[stage]);
                     // B^T: (E, N, K) 布局, tile 坐标 {N 块, K 块}
