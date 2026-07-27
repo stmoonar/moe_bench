@@ -3,6 +3,43 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
+## 最新（2026-07-27 晚）：P3 重标定切片交织已实现（⚠️ 待上机验证）
+
+改动只有 `sm120_common.cuh` 消费者主循环：重标定 FFMA 从 stage 边界移进
+**下一 stage 的 kk0**，按 16 列 base-tile 切片与 QMMA 交错
+（`FFMA(片j)→清零(片j)→QMMA(片j)`，用 `warp::mma_ABt_base` 单原子调用，
+TK 的 `d.tiles[0][m]↔b.tiles[m][0]` 配对与 fp8 base tile 16×32 已对源码
+核实）；首块用 s0=s1=0 走同一路径（fma(+0,+0,+0)=+0 逐比特无操作，免
+分支），尾块在循环外收尾。依据：E1/E5 定案——重标定暴露 107µs（锁频
+L0）/68.4µs（boost）是剩余差距唯一大头，stall_wait 第一大 stall + 发射
+槽 60% 空闲（docs/11 §3、docs/12）。
+
+- **数值**：每元素运算次序与串行版完全一致（旧块 QMMA K 升序→FFMA→清零
+  →新块 QMMA）→ 逐比特等价。验收：verify rel_err 必须仍 1.68e-03，
+  e2e rel_err 与基线逐位一致（0.042817…）。
+- **死锁审计（红线）**：无新增/修改等待点。全部 wait/arrive（task_ready/
+  inputs_arrived/inputs_finished/task_done）位置与次序不变，移动的只有
+  寄存器本地 FFMA/清零指令；生产者与跨 rank 协议零改动。
+- **寄存器**：+2 浮点（s0/s1 跨 stage 存活），预期 ~158，零 spill；
+  若 ptxas 超 168 或 spill 即回退。
+- **预期**：L0 fp8 795.4→~720（锁频，tensor 68.7%→75%+）/ 649→~610
+  （boost），向 raw（688.4/580.7）靠拢；L1 同理（438.4→~405）。
+
+上机 runbook（先确认卡空闲）：
+
+```bash
+cd /workspace
+# 1) 重编看 ptxas: 预期零 spill, gg8::kernel REG ~156-160
+rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4 2>&1 | grep -E 'registers|spill|STACK'
+# 2) 单卡正确性门(两形状, rel_err 必须仍 1.68e-03)+ boost 计时
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 4096 1536 20
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 20
+# 3) NCU 锁频对照 E1(可选先跳过): probe_engine.sh <空闲卡>
+# 4) 四卡全链路(融合 kernel 同引擎): 正确性门 + e2e
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --no-verify
+```
+
 ## 最新（2026-07-27）：gg8 最优性论证（docs/12）+ CUTLASS 同卡复测推翻"L1 反超"
 
 新增 [`docs/12`](docs/12_纯GroupGEMM引擎最优性论证.md) 并当日按同卡 boost
