@@ -499,7 +499,13 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
             const int rows_this = (blk_rows != nullptr &&
                                    blk_rows[row_idx] <= cfg::ROW_BLOCK / 2)
                                       ? cfg::ROW_BLOCK / 2 : cfg::ROW_BLOCK;
-            const bool active = store_strip * 16 < rows_this;
+            // 尾块用恒等 strip 映射(warp 0-3 → 条带 0-3): active warp 落在
+            // 4 个不同 SMSP(warp_id%4)铺满全部 tensor 单元。沿用 store 交织
+            // 映射时 active = {0,4,1,5} → SMSP {0,0,1,1}, 半数 tensor 单元
+            // 闲置(v2 实测尾块成本 ~0.73-0.80 的主要残差)。满块保持交织
+            // 映射(group store 需要); 尾块 store 是单 warp 版, 不受此约束。
+            const int strip = (rows_this != cfg::ROW_BLOCK) ? warp_id : store_strip;
+            const bool active = strip * 16 < rows_this;
 
             if (active) {
             rt_fl<16, cfg::COL_BLOCK> acc;    // 重标定后的主累加器
@@ -507,7 +513,7 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
             warp::zero(acc);
             warp::zero(sub);
             // rt 行布局: data[偶] → 行 r0, data[奇] → r0+8(global_to_register)
-            const int r0 = row_idx * cfg::ROW_BLOCK + store_strip * 16 + (lane_id >> 2);
+            const int r0 = row_idx * cfg::ROW_BLOCK + strip * 16 + (lane_id >> 2);
 
             // scale 预取(docs/03: 首测耗时降低 21.3%, 边界处的 3 个 global scale 读
             // 在关键路径上, 32 个边界 × L2 延迟 ≈ 40% 气泡)。边界只消费
@@ -529,7 +535,7 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
             rt_fp8e4m3<16, cfg::MMA_K> a_reg[2];
             rt_fp8e4m3<cfg::COL_BLOCK, cfg::MMA_K> b_reg[2];
             auto load_kk = [&](int buf, int st, int kk) {
-                auto a_sub = inputs[st].A.template subtile<16, cfg::MMA_K>({store_strip, kk});
+                auto a_sub = inputs[st].A.template subtile<16, cfg::MMA_K>({strip, kk});
                 warp::load(a_reg[buf], a_sub);
                 // B^T 行布局加载(ldmatrix 路径; col-layout fp8 加载在 TK
                 // 里没写完), mma_ABt 的 fp8 特化做 (M,K)x(N,K)^T
@@ -586,7 +592,7 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 else store(sub, row_idx, col_idx);   // raw 探针: 存未标定值
             } else {
                 // 尾块: 单 warp 存自己的 16 行条带(16 行为单位的全局坐标)
-                const int row16 = row_idx * (cfg::ROW_BLOCK / 16) + store_strip;
+                const int row16 = row_idx * (cfg::ROW_BLOCK / 16) + strip;
                 if constexpr (RESCALE) store.tail(acc, row16, col_idx);
                 else store.tail(sub, row16, col_idx);
             }

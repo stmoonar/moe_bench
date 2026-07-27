@@ -90,8 +90,17 @@ balanced 零开销双路结构，死锁审计零新增等待点）。tail=32 探
 喂料 24KB 不减），尾块 stage 被 TMA 托底。**v2 = A64 装载**：利用 TK st
 布局等价性（swizzle_bytes=128 单 panel → st<128,128> 前 64 行与
 st<64,128> 逐字节相同），producer 对尾块只装 8KB A tile（stage 24K→16K，
-expect_bytes 同步），consumer 零改动；编译期 requires 检测 gl 是否带
-A_tail_tile 描述符，未接入的 fused kernel 自动回退全量装载。
+expect_bytes 同步），consumer 零改动；编译期 gl_has_tma trait 检测 gl 是
+否带 A_tail_tile 描述符（TK get_tma 非 SFINAE，requires 检测恒真，须对
+gl 模板参数列表偏特化匹配），未接入的 fused kernel 自动回退全量装载。
+
+**v2 实测（GPU0）**：L0 −8.9% / L1 −6.7%（v1 −6.7/−5.0），raw −8.3/−8.8。
+尾块成本 ~0.73-0.80，仍距 0.57。**v3 = 尾块恒等 strip 映射**：残差主因
+是 active warp 沿用 store 交织映射选出 {0,4,1,5} → 按 warp_id%4 聚在
+SMSP {0,0,1,1}，**半数 tensor 单元整个尾块任务闲置**（RB64 实验 4 个
+warp 恰好铺满 4 个 SMSP，故能到 0.57）。尾块 store 是单 warp 版不受
+group store 交织约束 → 改恒等映射（warp 0-3 → 条带 0-3，SMSP 0-3 全
+铺满），满块路径不变。
 
 **Phase 1（立项后）设计裁决点**（按依赖序）：
 
