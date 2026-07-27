@@ -3,7 +3,47 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 深夜 2）：P3 判负 revert；两级 tile Phase 0 定案、进入 Phase 1
+## 最新（2026-07-27 深夜 3）：两级 tile Phase 1a 已实现（⚠️ 待上机验证）
+
+dispenser 支持"尾块任务"（docs/09 §4）：`blk_rows[i]` = 行块真实行数，
+≤64 的尾块只由前半条带 warp（store_strip<4，即 warp {0,4,1,5}）走完整
+计算路径，其余 warp 走独立"信号伴走"分支（同节奏 wait arrived / arrive
+finished，计数与全满块一致）。**布局零改动**：A/act 仍 128 补齐，尾块
+上半行保持 stale（与既有 padding 行语义相同）；producer 逐指令不变。
+全满块路径指令流与改动前逐条相同（active 分支即原代码），balanced 零
+开销。store 尾块走单 warp 版（plain/glu 已实现；wred 非 EPIRED 走
+warp store、EPIRED 桩 trap——L1 Phase 1c 前不发尾块）。gg8 入口加可选
+`blk_rows` tensor（pybind 默认空 → nullptr → 既有行为）；融合 kernel
+调用点零改动（默认参数）。
+
+- 死锁审计（红线）：**无新增等待点**。伴走分支只同节奏消费/到达既有
+  arrived/finished，每信号计数与全满块完全一致（生产者视角不可区分）；
+  task_ready/task_done/sync 在分支外全 warp 照常；跨 rank 零改动。
+- 探针：`verify_fp8_gemm` 第 7 参 `tail_rows`（1-64）= uniform 税形状
+  （每 expert 真实行 rows_e+tail → 多一个近空尾块），一次跑出
+  full/2level 正确性 + A/B 计时。
+
+上机 runbook（先确认卡空闲）：
+
+```bash
+cd /workspace
+# 1) 重编 ptxas: 预期与基线一致量级(gg8 ~156/tppr8 ~158), 零 spill
+rm -rf moe_bench/kernels/tk/build && python moe_bench/kernels/tk/build.py 4 2>&1 | grep -E 'registers|spill'
+# 2) 回归门: 默认路径 rel_err 1.68e-03, 时间 ~649/351 (不得回退)
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 4096 1536 20
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 20
+# 3) 两级裁决(tail=32): full/2level 两个 rel_err 均 OK; 2level 预期快 ~12-14%
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 4096 1536 20 128 32
+CUDA_VISIBLE_DEVICES=<空闲卡> python -m moe_bench.tools.verify_fp8_gemm 64 256 768 4096 20 128 32
+# 4) 四卡回归(fused 传 nullptr, 行为应零变化)
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m moe_bench.tools.run_tktp --iters 10
+```
+
+判据：步 3 的 2level fp8 ≈ full × (2+0.57)/3 ≈ −14%（L0）/−13%（L1）则
+机制兑现 → Phase 1b（调度表发尾块 + L0 fused 接入）；正确性任一 FAIL
+或步 2/4 回退 → 停下找我。
+
+## 2026-07-27 深夜 2：P3 判负 revert；两级 tile Phase 0 定案、进入 Phase 1
 
 **P3 交织判负定案（docs/04 §2）**：v2（load_kk(1) 后置）ptxas 读数与
 性能均与 v1 纹丝不动（仍 168+8B spill；654.4/359.7 vs 基线 649.1/351.0）

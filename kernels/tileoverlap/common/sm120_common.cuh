@@ -272,6 +272,13 @@ struct plain_store_policy {
                                       int row_idx, int col_idx) const {
         kittens::group<gemm_config_fp8::CONSUMER_WARPS>::store(out, acc, {row_idx, col_idx});
     }
+    /** 两级 tile 尾块(docs/09 §4): 单 warp 存自己的 16 行条带,
+     *  row16 = 16 行为单位的全局行块坐标。 */
+    template <int COL = gemm_config_fp8::COL_BLOCK>
+    __device__ inline void tail(rt_fl<16, COL> &acc,
+                                int row16, int col_idx) const {
+        kittens::group<1>::store(out, acc, {row16, col_idx});
+    }
 };
 
 /** SwiGLU store: weights are column-INTERLEAVED so each output tile holds
@@ -305,6 +312,26 @@ struct glu_store_policy {
         }
         kittens::group<gemm_config_fp8::CONSUMER_WARPS>::store(out, act, {row_idx, col_idx});
     }
+    /** 两级 tile 尾块: 单 warp 版 GLU store(列维配对不受行高影响)。 */
+    template <int COL = gemm_config_fp8::COL_BLOCK>
+    __device__ inline void tail(rt_fl<16, COL> &acc,
+                                int row16, int col_idx) const {
+        constexpr int HW = COL / 32;
+        rt_fl<16, COL / 2> act;
+        #pragma unroll
+        for (int j = 0; j < HW; j++) {
+            #pragma unroll
+            for (int k = 0; k < acc.tiles[0][j].packed_per_thread; k++) {
+                const float2 g = acc.tiles[0][j].data[k];
+                const float2 u = acc.tiles[0][j + HW].data[k];
+                float2 r;
+                r.x = (g.x / (1.0f + __expf(-g.x))) * u.x;
+                r.y = (g.y / (1.0f + __expf(-g.y))) * u.y;
+                act.tiles[0][j].data[k] = r;
+            }
+        }
+        kittens::group<1>::store(out, act, {row16, col_idx});
+    }
 };
 
 /**
@@ -334,7 +361,15 @@ template <bool RESCALE = true, typename Globals, typename Gate, typename Epilogu
 // 分配退回 168 + acc spill。
 __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
         const Globals &G, const Gate &gate, const Epilogue &epilogue, const Store &store,
-        const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks) {
+        const int *__restrict__ blk_expert, int *__restrict__ task_next, const int num_tasks,
+        // 两级 tile(docs/09 §4): blk_rows[i] = 行块 i 的真实行数(<=ROW_BLOCK),
+        // nullptr = 全满块(既有行为逐指令不变)。真实行数 <= ROW_BLOCK/2 的
+        // "尾块"只由前半条带的 warp 计算/存储(stage 为 tensor 吞吐受限,
+        // Phase 0 实测 64 行任务成本 ~0.57x 128 任务); 其余 warp 跳过
+        // 计算但保持全部 wait/arrive 节奏(信号计数与全满块完全一致)。
+        // 布局仍按 ROW_BLOCK 补齐, 尾块上半行保持 stale —— 与既有 padding
+        // 行语义相同, 无下游消费者。
+        const int *__restrict__ blk_rows = nullptr) {
     using cfg = gemm_config_fp8;
     using consumers = kittens::group<cfg::CONSUMER_WARPS>;
 
@@ -420,13 +455,21 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
             const int col_idx = task_desc[q].y;
             if (row_idx < 0) break;
             const int e = blk_expert[row_idx];
+            constexpr int WG = cfg::CONSUMER_WARPS;
+            const int store_strip = (WG % 4 == 0) ? (warp_id / 4 + (warp_id % 4) * (WG / 4)) : warp_id;
+            // 两级 tile(docs/09 §4): 尾块(真实行数 <= ROW_BLOCK/2)只由前半
+            // 条带的 warp 走完整计算路径, 其余 warp 走下方"信号伴走"分支。
+            // 全满块所有 warp 都 active, 指令流与两级引入前逐条相同(零开销)。
+            const int rows_this = (blk_rows != nullptr &&
+                                   blk_rows[row_idx] <= cfg::ROW_BLOCK / 2)
+                                      ? cfg::ROW_BLOCK / 2 : cfg::ROW_BLOCK;
+            const bool active = store_strip * 16 < rows_this;
 
+            if (active) {
             rt_fl<16, cfg::COL_BLOCK> acc;    // 重标定后的主累加器
             rt_fl<16, cfg::COL_BLOCK> sub;    // 单个量化块(K=128)的子累加器
             warp::zero(acc);
             warp::zero(sub);
-            constexpr int WG = cfg::CONSUMER_WARPS;
-            const int store_strip = (WG % 4 == 0) ? (warp_id / 4 + (warp_id % 4) * (WG / 4)) : warp_id;
             // rt 行布局: data[偶] → 行 r0, data[奇] → r0+8(global_to_register)
             const int r0 = row_idx * cfg::ROW_BLOCK + store_strip * 16 + (lane_id >> 2);
 
@@ -502,8 +545,33 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 }
             }
 
-            if constexpr (RESCALE) store(acc, row_idx, col_idx);
-            else store(sub, row_idx, col_idx);   // raw 探针: 存未标定值
+            if (rows_this == cfg::ROW_BLOCK) {
+                if constexpr (RESCALE) store(acc, row_idx, col_idx);
+                else store(sub, row_idx, col_idx);   // raw 探针: 存未标定值
+            } else {
+                // 尾块: 单 warp 存自己的 16 行条带(16 行为单位的全局坐标)
+                const int row16 = row_idx * (cfg::ROW_BLOCK / 16) + store_strip;
+                if constexpr (RESCALE) store.tail(acc, row16, col_idx);
+                else store.tail(sub, row16, col_idx);
+            }
+            } else {
+                // 尾块信号伴走(仅尾块任务的后半条带 warp 到达): 不碰数据,
+                // 与 active 路径同节奏消费 arrived 相位并 arrive finished ——
+                // 每个信号的计数与全满块完全一致(死锁审计: 无新增等待点,
+                // 生产者视角不可区分)。
+                (void)e;
+                wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                update_phasebit<0>(phasebits, stage);
+                for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                    const int nxt = (stage + 1) % cfg::PIPELINE_STAGES;
+                    if (red_idx + 1 < num_iters) {
+                        wait(inputs_arrived[nxt], get_phasebit<0>(phasebits, nxt));
+                        update_phasebit<0>(phasebits, nxt);
+                    }
+                    warp::arrive(inputs_finished[stage]);
+                    stage = nxt;
+                }
+            }
             consumers::sync(0);
             epilogue(row_idx, col_idx);
             warp::arrive(task_done[q]);

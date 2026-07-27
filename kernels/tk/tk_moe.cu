@@ -58,24 +58,27 @@ struct globals {
 struct no_gate { __device__ inline void operator()(int) const {} };
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
-            int *__restrict__ task_next, const int num_tasks) {
+            int *__restrict__ task_next, const int num_tasks,
+            const int *__restrict__ blk_rows) {
     grouped_gemm_sm120_fp8_dispenser(G, no_gate{}, noop_epilogue{},
                                      plain_store_policy<globals::outputs_gl>{G.outputs},
-                                     blk_expert, task_next, num_tasks);
+                                     blk_expert, task_next, num_tasks, blk_rows);
 }
 // 裸 mma 吞吐探针(docs/03): 跳过重标定, 结果错, 只测 fp8+f32acc 硬上限
 __global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
 void kernel_raw(const __grid_constant__ globals G, const int *__restrict__ blk_expert,
-                int *__restrict__ task_next, const int num_tasks) {
+                int *__restrict__ task_next, const int num_tasks,
+                const int *__restrict__ blk_rows) {
     grouped_gemm_sm120_fp8_dispenser<false>(
         G, no_gate{}, noop_epilogue{},
         plain_store_policy<globals::outputs_gl>{G.outputs},
-        blk_expert, task_next, num_tasks);
+        blk_expert, task_next, num_tasks, blk_rows);
 }
 void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
            const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
            const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
-           at::Tensor &task_next, const int expert_offset, const bool raw) {
+           at::Tensor &task_next, const int expert_offset, const bool raw,
+           const at::Tensor &blk_rows) {
     using cfg = gemm_config_fp8;
     // 布局(docs/02): weights = B^T (E, N, K)(w1 原始布局, 免转置),
     // w_scales (E, N/128, K/128); mma_ABt + row-layout 加载。
@@ -102,6 +105,13 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     };
     const int nblk = static_cast<int>(inputs.size(0)) / cfg::ROW_BLOCK;
     TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert must have one entry per row block");
+    // 两级 tile(docs/09 §4): blk_rows 可选, 空 tensor = 全满块(既有行为)。
+    const int *blk_rows_ptr = nullptr;
+    if (blk_rows.defined() && blk_rows.numel() > 0) {
+        TORCH_CHECK(blk_rows.size(0) == nblk && blk_rows.dtype() == torch::kInt32,
+                    "blk_rows must be int32 with one entry per row block");
+        blk_rows_ptr = blk_rows.data_ptr<int>();
+    }
     const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -109,11 +119,11 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     if (raw) {
         CUDACHECK(cudaFuncSetAttribute(kernel_raw, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel_raw<<<sm, cfg::NUM_THREADS, smem, stream>>>(
-            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks);
+            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks, blk_rows_ptr);
     } else {
         CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
-            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks);
+            G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks, blk_rows_ptr);
     }
     CUDACHECK(cudaGetLastError());
 }
@@ -648,6 +658,14 @@ struct wred_store_policy {
                              :: "l"(dst), "f"(v.x * w), "f"(v.y * w) : "memory");
             }
         }
+    }
+    /** 两级 tile 尾块桩: L1 在 Phase 1c 前不发尾块(blk_rows=nullptr),
+     *  此路径不可达; EPIRED 分支未实现, 误达即 trap 硬失败。 */
+    template <int COL = gemm_config_fp8::COL_BLOCK>
+    __device__ inline void tail(rt_fl<16, COL> &acc,
+                                int row16, int col_idx) const {
+        if (G.use_epired) asm volatile("trap;");
+        kittens::group<1>::store(G.outputs, acc, {row16, col_idx});
     }
 };
 // TMA store 完成确认后的收尾(本地计数 + 选举发 watermark)。语义与旧串行版
@@ -1189,7 +1207,12 @@ void sched_build_entry(const at::Tensor &packed_all, at::Tensor &padded,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_TK_PARALLEL_TENSOR(m);
     m.def("pcie_device_barrier", &disp::barrier_entry);
-    m.def("grouped_gemm_fp8", &gg8::entry);
+    m.def("grouped_gemm_fp8", &gg8::entry,
+          pybind11::arg("inputs"), pybind11::arg("a_scales"), pybind11::arg("weights"),
+          pybind11::arg("w_scales"), pybind11::arg("outputs"), pybind11::arg("padded"),
+          pybind11::arg("blk_expert"), pybind11::arg("task_next"),
+          pybind11::arg("expert_offset"), pybind11::arg("raw"),
+          pybind11::arg("blk_rows") = at::Tensor());
     m.def("rowgroup_quant_fp8", &gg8::rowgroup_quant_entry);
     m.def("moe_tp_dispatch_gemm_fp8_push", &tpdisp8::entry_push);
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
