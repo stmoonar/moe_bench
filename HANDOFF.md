@@ -23,8 +23,12 @@ config 的配置——triton 现有数字即其最优水位，"同类最优"主�
 `dram__bytes.sum` tk 313.4MB vs CUTLASS 317.9MB——**流量相同，11.8%
 差距在延迟/调度**，L1 引擎重开、杠杆与 L0 同类（交织/任务边界）；NCU
 签名顺带实锤 CUTLASS 87c 用 4×2 几何 + SM90_TMA_LOAD 2D + 384 线程。
-**剩余实验**：E1 `probe_engine.sh` cta 补丁后 NCU 锁频重定基 → E2 可选
-补 CUTLASS 当前卡 NCU tensor%。§2.1 的卡号/iterations 元数据待补。另：`time_tp_stages.py`
+**E1 已跑（07-27，GPU0，probe_20260727_040652）**：boost ×3 极稳——
+L0 fp8 649.1/raw 580.7，L1 fp8 351.0/raw 330.7，rel_err 1.68e-03；vs
+cta 前 raw −1.7%、fp8 持平；litmus 补验 ld5d_cta 原生。docs/12 §2.1 已
+按 ×3 刷新（L0 78.0% / L1 89.9% of CUTLASS）。**尾项**：四份 NCU 锁频
+报告读数回填 §2.2（命令在 docs/12 §5 E1）→ E2 可选补 CUTLASS tensor%。
+之后引擎侧进入实施：重标定切片交织（L0/L1 通用头号杠杆）。另：`time_tp_stages.py`
 已支持 `--dist/--skew-alpha/--active` 覆盖 token 路由分布（与 run_tktp
 同口径）。
 

@@ -27,18 +27,20 @@
 
 ## 2. 数据
 
-### 2.1 gg8 vs CUTLASS：同卡 boost wall-clock（2026-07-27，正式横比，卡号待补）
+### 2.1 gg8 vs CUTLASS：同卡 boost wall-clock（2026-07-27，正式横比；gg8 = probe_20260727_040652，GPU0，×3 稳定，cta 补丁后）
 
 | 层 | gg8（TFLOP/s） | CUTLASS 87c（TFLOP/s） | gg8/CUTLASS |
 |---|---:|---:|---:|
-| L0 (K=4096, N=1536) | 659.4µs (312.7) | **506.1µs (407.3)** | 76.8% |
-| L1 (K=768, N=4096) | 357.8µs (288.1) | **315.7µs (326.5)** | 88.2% |
+| L0 (K=4096, N=1536) | 649.1µs (317.6) | **506.1µs (407.3)** | 78.0% |
+| L1 (K=768, N=4096) | 351.0µs (293.7) | **315.7µs (326.5)** | 89.9% |
 
-时钟缩放互证：锁频→boost，CUTLASS 加速 1.31×（= 时钟比，纯算力受限），
-gg8 仅 1.17× → 差距主体是**固定延迟 stall**（不随频率缩放），与 NCU
-stall_wait 第一名（docs/11 §3）一致——重标定切片交织正是吃这块的杠杆。
+raw（无重标定探针，boost）：L0 580.7µs（重标定代价 +11.8%）、
+L1 330.7µs（+6.2%）。时钟缩放互证：锁频→boost，CUTLASS 加速 1.31×
+（= 时钟比，纯算力受限），gg8 L0 仅 1.19×（774.6 cta 前锁频→649.1）→
+差距主体是**固定延迟 stall**（不随频率缩放），与 NCU stall_wait 第一名
+（docs/11 §3）一致——重标定切片交织正是吃这块的杠杆。
 
-### 2.2 gg8 vs triton：NCU 锁频（kernel replay，triton 为调优水位）
+### 2.2 gg8 vs triton：NCU 锁频（kernel replay，triton 为调优水位；gg8 数字为 cta 补丁前，cta 后四份报告已在 probe_20260727_040652，读数待回填）
 
 | L0 | Duration | tensor | Duration×tensor |
 |---|---:|---:|---:|
@@ -94,9 +96,21 @@ L1 锁频：gg8 425.0µs/64.2% vs triton 537µs/50.2%（triton 受两颗 GEMM
   syscall 不解除，"224−56 调用帧"只解释数值来源；② **4×2+COL=128
   判死，COL=64 是平台强制最优**；③ 已还原重建（L1 复测 371.6µs、
   rel_err 1.68e-03 证实现役 .so 为 COL=64）。
-- **E1（待跑）**：cta 补丁后 NCU 锁频重定基，
-  `bash moe_bench/tools/probe_engine.sh <空闲卡>`，§2.2 数字更新，
-  rel_err 须仍 1.68e-03。
+- **E1 ✅ 完成（2026-07-27，GPU0，probe_20260727_040652）**：boost ×3
+  极稳——L0 fp8 649.1µs/raw 580.7（重标定 +11.8%）；L1 fp8 351.0/raw
+  330.7（+6.2%）；rel_err 全部 1.68e-03。对比 cta 前基线（L0 646/591，
+  L1 353/336）：**raw −1.7%，fp8 持平**——syscall 移除主要惠及 load
+  侧，fp8 路径仍被重标定 stall 主导，与 docs/11 §8"收益为正但幅度小"
+  预期一致。litmus 补验 **ld5d_cta = 原生 UTMALDG.5D 无 CALL**（cta
+  补丁的最后一块拼图，load 全形态原生实锤）。§2.1 已按 ×3 数字刷新。
+  **待回填**：四份 NCU 锁频报告的 Duration/tensor%（刷新 §2.2），
+  读数命令：
+
+```bash
+for f in moe_bench/tp_test_results/probe_20260727_040652_engine/*.ncu-rep; do
+  echo "== $f"; ncu --import "$f" --page details 2>/dev/null | grep -iE 'duration|tensor'
+done
+```
 - **E5 ✅ 完成（2026-07-27，GPU0）**：L1 `dram__bytes.sum` —— tk
   **313.44MB** vs CUTLASS **317.89MB**（差 1.4%，CUTLASS 反而略多）。
   **定案：L1 的 11.8% 差距不在流量，在延迟/调度**——同流量下有效 DRAM
