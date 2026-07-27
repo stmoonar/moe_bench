@@ -3,17 +3,23 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27）：gg8 最优性论证文档 + 待跑实验清单（docs/12）
+## 最新（2026-07-27）：gg8 最优性论证（docs/12）+ CUTLASS 同卡复测推翻"L1 反超"
 
-新增 [`docs/12`](docs/12_纯GroupGEMM引擎最优性论证.md)：把"纯 grouped GEMM
-是最优实现"拆成三层可证伪主张（L1 已达可达上限 / L0 同类最优、距纯 GEMM
-上界 14% 且有账 / 便宜旁路已判负），汇总 docs/08/10/11 的横比证据。
-**待上机实验（按序）**：E4 COL=128 压力编译裁决 168 寄存器帽（纯编译不占卡）
-→ E1 `probe_engine.sh` cta 补丁后重定基 → E2 CUTLASS 锚点当前卡复测
-（`git checkout 9b847be^ -- tools/cutlass_probe`，cutlass/ 源码已在工作树）
-→ E3 `tune_triton_moe.py` 调优水位（最耗时，影响 e2e 报数）→ E5（可选）
-L1 带宽墙 roofline。命令与判据全在 docs/12 §5。另：`time_tp_stages.py` 已
-支持 `--dist/--skew-alpha/--active` 覆盖 token 路由分布（与 run_tktp 同口径）。
+新增 [`docs/12`](docs/12_纯GroupGEMM引擎最优性论证.md) 并当日按同卡 boost
+复测数据更新：**CUTLASS 87c 两层都快于我们——L0 506.1µs vs 659.4（我们
+76.8%）、L1 315.7µs vs 357.8（88.2%）**。docs/11 §2 的"L1 已反超 CUTLASS"
+证伪：旧 453µs 是跨卡（GPU4）锁频锚点，按时钟比折算本身偏慢 ~9%；"L1
+引擎关闭"降级为暂缓（已在 docs/11 §2 加更正）。gg8 boost 随频缩放仅
+1.17×（CUTLASS 1.31× 线性）——固定延迟 stall 不随频率缩放，重标定切片
+交织的优先级进一步上调。当前成立的主张：**同类（路由感知 + blockwise FP8
++ 可通算融合）中最优**（对照 triton，调优水位待 E3）。
+**剩余实验（按序）**：E4 COL=128 压力编译裁决 168 寄存器帽（纯编译不占卡）
+→ E1 `probe_engine.sh` cta 补丁后 NCU 锁频重定基 → E5（已升优先级）tk vs
+CUTLASS 双方 L1 dram__bytes 对比，裁决 11.8% 差距是流量还是调度 → E3
+`tune_triton_moe.py` 调优水位（最耗时，影响 e2e 报数）→ E2 可选补 CUTLASS
+当前卡 NCU tensor%。命令与判据全在 docs/12 §5；§3.1 的卡号/iterations
+元数据待补。另：`time_tp_stages.py` 已支持 `--dist/--skew-alpha/--active`
+覆盖 token 路由分布（与 run_tktp 同口径）。
 
 ## 2026-07-26 晚间：修复 tdtp `setup` 接口参数错位（待复跑正确性门）
 
