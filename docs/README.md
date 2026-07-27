@@ -17,6 +17,8 @@ slim 分支从工作树移除，仍完整保留在 git 历史中（详见"信息
 | [08_NCU单kernel计算效率_gg8_vs_triton.md](08_NCU单kernel计算效率_gg8_vs_triton.md) | 单 kernel 计算效率对比 gg8/triton/CUTLASS 的锁频归因 |
 | [09_路由不均衡与padding粒度.md](09_路由不均衡与padding粒度.md) | 路由不均衡劣化归因与 ROW_BLOCK padding 粒度负结果 |
 | [10_fp8主循环P1_K-tile128与寄存器预算.md](10_fp8主循环P1_K-tile128与寄存器预算.md) | fp8 GEMM 主循环结构改造、寄存器预算与 spill 事故 |
+| [11_引擎归因探针与TMA_cta形态.md](11_引擎归因探针与TMA_cta形态.md) | 引擎差距归因框架（tensor-busy 不变量）与 TMA syscall→cta 修复 |
+| [12_纯GroupGEMM引擎最优性论证.md](12_纯GroupGEMM引擎最优性论证.md) | gg8 最优性三层主张、横比证据与待补实验清单 |
 
 ## 信息优先级
 

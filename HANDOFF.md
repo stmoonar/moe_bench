@@ -3,7 +3,19 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-26 晚间）：修复 tdtp `setup` 接口参数错位（待复跑正确性门）
+## 最新（2026-07-27）：gg8 最优性论证文档 + 待跑实验清单（docs/12）
+
+新增 [`docs/12`](docs/12_纯GroupGEMM引擎最优性论证.md)：把"纯 grouped GEMM
+是最优实现"拆成三层可证伪主张（L1 已达可达上限 / L0 同类最优、距纯 GEMM
+上界 14% 且有账 / 便宜旁路已判负），汇总 docs/08/10/11 的横比证据。
+**待上机实验（按序）**：E4 COL=128 压力编译裁决 168 寄存器帽（纯编译不占卡）
+→ E1 `probe_engine.sh` cta 补丁后重定基 → E2 CUTLASS 锚点当前卡复测
+（`git checkout 9b847be^ -- tools/cutlass_probe`，cutlass/ 源码已在工作树）
+→ E3 `tune_triton_moe.py` 调优水位（最耗时，影响 e2e 报数）→ E5（可选）
+L1 带宽墙 roofline。命令与判据全在 docs/12 §5。另：`time_tp_stages.py` 已
+支持 `--dist/--skew-alpha/--active` 覆盖 token 路由分布（与 run_tktp 同口径）。
+
+## 2026-07-26 晚间：修复 tdtp `setup` 接口参数错位（待复跑正确性门）
 
 首次上机已完成 Gloo/NCCL/NVSHMEM 初始化，但在 scheme setup 阶段报
 `TDTFusedTP.setup() missing 1 required positional argument: 'ctx'`。根因是实现误写为
