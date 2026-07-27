@@ -170,3 +170,8 @@ docs/09 的粒度税模型，balanced 下每 expert 恰好 256 行、抬大 BM �
 baseline 的不均衡敏感度会从 +5.1% 涨向我们的水平。因此：balanced / uniform
 各调一份 config 并各自记录，正式报数注明 serial 用的是哪一份（docs/05 §4 早
 就要求"注明 serial 是否使用调优配置"，此前一直是"否"）。
+
+> **2026-07-27 定案**：`tune_triton_moe.py` 调优扫描已跑，**未找到优于
+> 兜底 config 的配置**——上段"调优后会净变快"的预期未兑现，现有 triton
+> 数字（§2/§5 表）即其调优水位，e2e 领先无需重报。gg8 对 triton 的
+> "同类最优"主张由此坐实（docs/12 §1）。
