@@ -97,17 +97,21 @@ def check_builders(mod, ROW_BLOCK=128):
     fails = []
     world, T, topk = 4, 512, 8
     # local_first (docs/14) 的表和 canonical 表一起裁决: 同一份路由、同一批
-    # 不变量, 只是布局分成本地/远端两段。
+    # 不变量, 只是布局分成本地/远端两段。thr5 = 分段的边际成本阈值(0 = 只分
+    # 免费的那批, 99 = 全分段上界档)。
+    canon_cost = {}
     for dist_kind in ("balanced", "skewed"):
         for ne in (64, 256):
-            for rank, local_first in ((0, False), (3, False), (0, True), (3, True)):
+            for rank, local_first, thr5 in ((0, False, 0), (3, False, 0),
+                                            (0, True, 0), (3, True, 0),
+                                            (0, True, 2), (3, True, 99)):
                 all_ids, all_w = _make_topk(world, T, ne, topk, dist_kind, 0)
                 _STATE["ids"], _STATE["w"] = all_ids, all_w
                 with RequireExplicitDevice():
                     (padded_g, slots_g, w_g, slack_g, pull_g, job_g, pusho_g,
                      blk_g, sjob_g, sw_g, P) = mod._build_tp_schedules(
                          all_ids[rank], all_w[rank], T, world, ne, rank, "cpu",
-                         local_first=local_first)
+                         local_first=local_first, seg_thr5=thr5)
                 N = world * T * topk
                 packed_all = torch.stack(
                     [all_ids, all_w.contiguous().view(torch.int32)], dim=-1).contiguous()
@@ -125,8 +129,10 @@ def check_builders(mod, ROW_BLOCK=128):
                 }
                 with RequireExplicitDevice():
                     mod._build_tp_schedules_gpu(packed_all, world, ne, rank, out,
-                                                local_first=local_first)
-                tag = f"NE={ne} {dist_kind} rank={rank} lf={int(local_first)}"
+                                                local_first=local_first,
+                                                seg_thr5=thr5)
+                tag = (f"NE={ne} {dist_kind} rank={rank} "
+                       f"lf={int(local_first)}/thr{thr5}")
                 for name, got, ref in [("padded", out["padded"], padded_g),
                                        ("tp_slots", out["tp_slots"], slots_g),
                                        ("prered_w", out["prered_w"], w_g),
@@ -156,15 +162,40 @@ def check_builders(mod, ROW_BLOCK=128):
                 if not torch.equal(torch.bincount(blkl, minlength=ne),
                                    padded_g.long() // ROW_BLOCK):
                     fails.append(f"[{tag}] blk_expert counts != padded/ROW_BLOCK")
+                # 两级 tile 口径的总块成本(满块 1 / 真实行<=RB/2 的尾块 0.6)
+                tail_m = slack_g >= ROW_BLOCK // 2
+                cost = float((~tail_m).sum()) + 0.6 * float(tail_m.sum())
+                ckey = (ne, dist_kind, rank)
+                if not local_first:
+                    canon_cost[ckey] = cost
+                elif thr5 == 0 and cost > canon_cost[ckey] + 1e-9:
+                    # thr5=0 的承诺是**严格帕累托**: 只分边际成本 <= 0 的
+                    # expert, 总成本不得高于 canonical(docs/14 §4)。
+                    fails.append(f"[{tag}] thr5=0 not free: cost {cost:.1f} > "
+                                 f"canonical {canon_cost[ckey]:.1f}")
                 if local_first:
-                    # 方案的核心正确性(docs/14 §2): 本 rank 的 assignment 全部
-                    # 落在远端 assignment 之前 —— 段 1 的行块因此只由本卡
-                    # scatter(src == dev_idx 直读 pre_tokens)喂, 零到达等待。
+                    # 方案的核心正确性(docs/14 §2): 段 1 的行块**一条远端行都
+                    # 不能有** —— 这是"零到达等待"的充要条件(它们只由本卡
+                    # scatter 的 src == dev_idx 直读分支喂), 而 dispenser 按行块
+                    # id 升序发任务, 所以段 1 必须坐在 [0, nb_local)。
+                    # 段 1 的块数由分段决策重算(不能用"纯本地块"反推 —— 段 2
+                    # 里也可能偶然出现只有本地行的 expert 块)。
                     own = torch.zeros(world * T, dtype=torch.bool, device="cpu")
                     own[rank * T:(rank + 1) * T] = True
                     own_f = own.repeat_interleave(topk)
-                    if int(flat[own_f].max()) >= int(flat[~own_f].min()):
-                        fails.append(f"[{tag}] local segment not strictly first")
+                    nb = P // ROW_BLOCK
+                    has_rem = torch.zeros(nb, dtype=torch.bool, device="cpu")
+                    has_rem[flat[~own_f] // ROW_BLOCK] = True
+                    c_all = torch.bincount(all_ids.reshape(-1).long(), minlength=ne)
+                    c_loc = torch.bincount(all_ids[rank].reshape(-1).long(),
+                                           minlength=ne)
+                    seg = mod._local_seg_mask(c_loc, c_all - c_loc, c_all, thr5)
+                    nb_local = int((((c_loc + ROW_BLOCK - 1) // ROW_BLOCK)
+                                    * seg).sum())
+                    if nb_local and bool(has_rem[:nb_local].any()):
+                        fails.append(f"[{tag}] segment-1 block carries a remote row")
+                    if thr5 == 0 and nb_local == 0 and dist_kind != "balanced":
+                        fails.append(f"[{tag}] thr5=0 yielded no local block")
                 if flat.unique().numel() != N or int(flat.min()) < 0 or int(flat.max()) >= P:
                     fails.append(f"[{tag}] tp_slots not a bijection onto [0,P)")
                 # slot_job/slot_w = tp_slots/prered_w 的逆映射 (EPIRED 查表)
@@ -187,15 +218,26 @@ def check_builders(mod, ROW_BLOCK=128):
                         fails.append(f"[{tag}] {name} not a permutation")
                     elif not bool((key[o][1:] > key[o][:-1]).all()):
                         fails.append(f"[{tag}] {name} not sorted by its key")
-                # push_order: per-source permutation of [0,T), sorted by min slot,
-                # and CANONICAL — identical whichever rank builds it (TP-T1).
+                # push_order: per-source permutation of [0,T), sorted by
+                # (min expert, src_tok), and CANONICAL — identical whichever
+                # rank builds it and whichever segmentation is in effect (TP-T1;
+                # 正确性其实不依赖它 —— push 落点/flag 都由 src_dev*T+src_tok
+                # 定死 —— 但"源按目的卡消费序推"是流水启发式, 丢了会掉性能)。
                 mins2 = slots_g.min(dim=1).values.view(world, T)
+                key2 = all_ids.min(dim=2).values.long()          # (world, T)
                 for srow in range(world):
                     o = pusho_g[srow].long()
                     if o.unique().numel() != T:
                         fails.append(f"[{tag}] push_order[{srow}] not a permutation")
-                    elif not bool((mins2[srow][o][1:] > mins2[srow][o][:-1]).all()):
-                        fails.append(f"[{tag}] push_order[{srow}] not sorted")
+                    elif not bool((  # 全序键 = (min expert, src_tok)
+                            (key2[srow] * T + torch.arange(T))[o][1:] >
+                            (key2[srow] * T + torch.arange(T))[o][:-1]).all()):
+                        fails.append(f"[{tag}] push_order[{srow}] not sorted by "
+                                     f"(min expert, src_tok)")
+                    elif not local_first and not bool(
+                            (mins2[srow][o][1:] > mins2[srow][o][:-1]).all()):
+                        # canonical 布局下新键必须与旧的 min-slot 序逐位等价
+                        fails.append(f"[{tag}] push_order[{srow}] != min-slot order")
                 if rank == 0:
                     canon = pusho_g.clone()
                 elif not torch.equal(pusho_g, canon):
@@ -203,7 +245,7 @@ def check_builders(mod, ROW_BLOCK=128):
     return fails
 
 
-def check_dataflow(mod, local_first=False):
+def check_dataflow(mod, local_first=False, seg_thr5=0):
     """Small-shape fused-dataflow simulation vs naive TP reference (fp32)."""
     torch.manual_seed(0)
     world, T, topk = 4, 96, 8
@@ -231,7 +273,8 @@ def check_dataflow(mod, local_first=False):
     for r in range(world):
         (_padded, tp_slots, tp_w, _slack, _po, _jo, _pso, blk_expert, _sj, _sw,
          P) = mod._build_tp_schedules(ids[r], w[r], T, world, E, r, "cpu",
-                                      local_first=local_first)
+                                      local_first=local_first,
+                                      seg_thr5=seg_thr5)
         gathered = torch.zeros(P, H, device="cpu")
         gathered[tp_slots.view(-1).long()] = X.repeat_interleave(topk, dim=0)
         expert_out = torch.zeros(P, H, device="cpu")
@@ -248,7 +291,7 @@ def check_dataflow(mod, local_first=False):
             staging[s][r] = part[s * T:(s + 1) * T]
     out = torch.cat([staging[r].sum(dim=0) for r in range(world)])
     rel = (out - ref).norm() / ref.norm()
-    tag = f" (local_first)" if local_first else ""
+    tag = f" (local_first thr5={seg_thr5})" if local_first else ""
     return [] if rel < 1e-5 else [f"dataflow{tag} rel_err {float(rel):.2e} >= 1e-5"]
 
 
@@ -257,7 +300,8 @@ def main():
     mod = _load_tk_tp_scheme()
     fails = check_builders(mod)
     fails += check_dataflow(mod, local_first=False)
-    fails += check_dataflow(mod, local_first=True)
+    fails += check_dataflow(mod, local_first=True)      # thr5=0 (选择性分段)
+    fails += check_dataflow(mod, local_first=True, seg_thr5=99)   # 全分段
     for f in fails:
         print("  " + f)
     print(f"[preflight_tp_cpu] {'OK' if not fails else f'FAIL ({len(fails)})'}")

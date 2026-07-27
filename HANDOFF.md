@@ -11,32 +11,46 @@
 那 64 行虽然 scatter 时走 `src==dev_idx` 直读 `pre_tokens`（连 staging 都不落），
 仍要陪着另外 64 行等 peer 的到达 flag。
 
-**做法（docs/14）**：gathered 布局改 rank-dependent 两段式——行块 `[0, E)` 只装
-本 rank 自己的 assignment，其后是远端段。dispenser 按行块 id 升序发任务，于是
-**头 `E×col_blocks` 个 GEMM 任务完全不依赖通信**，整个 AllGather 窗口都有满负荷
-的活干。开关 `TK_LOCAL_FIRST`（默认 0，零风险接入）。
+**做法（docs/14）**：gathered 布局改 rank-dependent 两段式——领头的行块只装本
+rank 自己的 assignment，其后是其余一切。dispenser 按行块 id 升序发任务，于是
+**头 `nb_local×col_blocks` 个 GEMM 任务完全不依赖通信**。开关 `TK_LOCAL_FIRST`
+（默认 0，零风险接入）。
+
+**⚠️ 口径变更（用户 2026-07-27 指示）**：此后一律以**路由不均匀**为准
+（uniform/skewed），balanced 只作完美对齐的上界参照。这直接改变了本方案的设计：
+均匀路由下每个 expert 的分段代价相同（要么全免费要么全收费），不均匀路由下代价
+沿 expert 散开，于是**"只分免费的那批 expert"成为可能**。分段决策因此改成
+**逐 expert 按边际块成本**（`_local_seg_mask`，阈值 `TK_LOCAL_SEG_THR5`，默认 0
+= 严格帕累托）。实测（真实路由生成器 + 真实调度表）：
+
+| 路由 | T | thr5=0 代价 | 零等待工作量 | thr5=99(全分段)代价 |
+|---|---:|---:|---:|---:|
+| uniform | 512 | **+0.0%** | 7.5% | +13.2% |
+| uniform | 1024 | **+0.0%** | 14.2% | +6.3% |
+| skewed | 512 | **+0.0%** | 9.0% | +15.7% |
+| skewed | 1024 | **+0.0%** | 16.6% | +5.8% |
+
+即 **thr5=0 在四个不均匀档全部零代价，同时白拿 7.5%~16.6% 的零等待工作量**——
+严格的帕累托改进，即使 gate 等待很小也不可能亏。thr5=1/2 是可扫的收益-代价曲线
+（skewed T=1024：+0.8% 买到 19.2%）。全分段（原朴素方案）不应作默认。
 
 关键前提均已核实：① dispenser 的行块→expert 完全走 `blk_expert` 查表，没有
 "同 expert 行块必须连续"的约束；② `padded` 的**值**从未被任何 kernel 读（只用
 `.size(0)` 取 E）；③ P2 push 数据面允许 rank-dependent 布局——push 落点是 staging
-的 `src_dev*T+src_tok` 行、与 gathered 布局无关，scatter 读**本地** `tp_slots`，
-且 `push_order` 仍跨 rank 一致（docs/14 §3 给了证明，preflight 的 canonical 断言
-继续通过）；④ `pull_order` 按 min slot 排 → 本地 token 自动排最前，公式不用改。
+的 `src_dev*T+src_tok` 行、与 gathered 布局无关，scatter 读**本地** `tp_slots`；
+④ `pull_order` 按 min slot 排 → 本地行自动排最前，公式不用改。
 
-**代价（用 bench 真实路由生成器实算，docs/14 §4）**：
-
-| 路由 | T | Δ成本(两级 tile 口径) | Δ行数 |
-|---|---:|---:|---:|
-| balanced | **1024** | **+0.0%** | **+0%** |
-| balanced | 512 | +10.0% | +50% |
-| uniform | 1024 / 512 | +6.3% / +13.2% | +10% / +21% |
-
-**T=1024 代价严格为零**（每 expert 每 rank 恰好 128 行 = 一个满块），是主判决档；
-T=512 恰好踩在半块上，是最坏点，预期为负（+118µs 税 vs 收益上界 = gate 等待）。
+**`push_order` 换了排序键**（这是选择性分段暴露出来的）：原键"本地表的 min slot"
+在选择性分段下失效——本卡 token 可能落进段 1（行块排最前），本地 min slot 序就
+不再等于目的卡看到的消费序。改用 **(min expert, src_tok)**，与建表的卡无关，
+canonical 下与旧键**逐位等价**（preflight 有专门的等价断言 + 步 1 回归门实测）。
+正确性本不依赖它（push 落点/flag 都由 `src_dev*T+src_tok` 定死），但"源按目的卡
+消费序推"是流水启发式。
 
 **新增探针 `TK_L0_NOGATE=1`**：L0 GEMM 跳过行块到达等待（**输出数值是错的**，
-只读时间），`L0_fused − L0_fused@NOGATE` = gate 等待的真实成本 = 本方案收益的
-硬上界。**先跑它**，若 < 40µs 则 T=512 档直接判负、只看 T=1024。
+只读时间），`L0_fused − L0_fused@NOGATE` = gate 等待的真实成本。由于 thr5=0 档
+代价实测为零，探针不再是"要不要做"的关卡，而是"能拿回多少"的标尺；若它本身
+接近 0，说明 min-slot pull 序已把等待消化掉，应转去扫 `TK_COMM_SMS`。
 
 - **死锁审计（红线）**：**无新增、无修改等待点**。段 1 的行块计数由本卡 scatter
   直接喂（`src==dev_idx` 分支根本不进 flag 自旋），段 2 与现状逐字同源；
@@ -46,18 +60,22 @@ T=512 恰好踩在半块上，是最坏点，预期为负（+118µs 税 vs 收�
 - **正确性强判据**：布局重排不改变任何一行的运算序（每行 GEMM 独立、K 维累加序
   不变；L1 预归约按 kpos 顺序；final reduce 按 rank 顺序）→ **`TK_LOCAL_FIRST`
   on/off 的 e2e rel_err 必须逐位一致**（0.042817506939172745）。不一致即 bug。
-- **已在本地验证**：`preflight_tp_cpu` 全绿，两种布局 × balanced/skewed ×
-  NE=64/256 × rank 0/3 —— host golden ↔ torch GPU 版逐元素一致、新增
-  "blk_expert == 该行块每条 assignment 的 expert"语义判据（取代 canonical 专用的
-  单调性断言）、"本地段严格在前"判据、CPU 数据流仿真（改为按行块走）。
+- **已在本地验证**：`preflight_tp_cpu` 全绿，6 个布局档（canonical / lf×thr5 ∈
+  {0,2,99}）× balanced/skewed × NE=64/256 × rank 0/3 —— host golden ↔ torch GPU
+  版逐元素一致，外加四条新不变量：① "blk_expert == 该行块每条 assignment 的
+  expert"（语义判据，取代 canonical 专用的单调性断言）；② **thr5=0 的成本不得
+  高于 canonical**（帕累托承诺的机器化）；③ 段 1 的行块一条远端行都不能有
+  （零等待的充要条件，按行块表述——段 2 里可能偶然出现纯本地块）；④ canonical
+  下新 `push_order` 键与旧 min-slot 序逐位等价。CPU 数据流仿真改为按行块走，
+  跑 canonical / thr5=0 / thr5=99 三档。
 - **口径修正**：`time_tp_stages` 的 `L0/L1_gemm_alone` 参考现在跟随
   `TK_TWO_LEVEL` 传 slack——否则参考走全满块而 fused 走尾块，exposure 被系统性
   低估。balanced 下 slack 全 0，行为与旧口径逐指令相同，**历史数字不受影响**。
 - **未做（留 Phase 2）**：① 融合 sched kernel（tpsched）只实现了 canonical 单段
   compaction，`TK_LOCAL_FIRST=1` 时自动回退 torch 版（sched +~120µs）→ **裁决
   看 time_tp_stages 分阶段数字，不看 e2e**；② docs/14 §4.1 的 L1 风险：本地 job
-  全部集中在段 1，跨卡 RS 的可用窗口从 ~384µs 收窄到 ~280µs（要推 12.6MB ≈
-  247µs，余量 1.55×→1.13×），若 `L1_fused` 明显回退，解法是给 dispenser 加可选
+  集中在段 1，跨卡 RS 的可用窗口按段 1 占比缩水（thr5=0 下余量 1.35~1.5×，比
+  全分段的 1.13× 安全得多，但仍要盯 `L1_fused`），解法是给 dispenser 加可选
   `row_perm` 行块访问序表让 L1 先算段 2。
 
 上机 runbook 见 [docs/14 §7](docs/14_L0本地优先分段与AG重叠.md)（先确认卡空闲；
