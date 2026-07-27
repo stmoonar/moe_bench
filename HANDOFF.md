@@ -3,7 +3,49 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 深夜 9）：分支 `ag_local_overlap` —— L0 本地优先分段已实现（待上机）
+## 最新（2026-07-27 深夜 10）：uniform 劣化的归因被推翻 —— 不是 padding 税（docs/15）
+
+用户实测：uniform 下 T=512 劣化 +374µs（24.4%）、**T=4096 劣化 +2134µs（19.5%）**，
+而 serial 只有 +3.9% / +0.7%。反常点：token 放大 8 倍后我们的劣化几乎没摊薄。
+
+**padding 税已出局**（实算，两级 tile 口径 vs 无 padding 理想）：uniform T=512 是
+14.5%，**T=4096 只有 1.6%**（μ=2048、σ≈45，相对抖动 2.2%）≈ 140µs，解释不了 2134µs。
+docs/09 的"padding 粒度税"归因只对 T=512 成立，**不能外推**。
+
+**新根因：TopK 依赖让 combine 的就绪时刻塌缩到尾部。** L1 的 job 必须等它全部 8 个
+slot 的 W2 输出都算完，而 GEMM 按行块 id 升序推进 → job 就绪进度 ≈ max(8 个 expert
+id)/E。要命的是 **balanced 的 round-robin 生成器给每个 token 的是连续的 8 个
+expert**（`(t·9+[0..8))%64`，max=min+7），job 就绪均匀线性铺开、push 全程铺满；
+uniform 下 8 个 expert 随机散布，max 的期望 56.5/64，**87.9% 的 token 的 max
+expert ≥ 50** → 几乎所有 job 都在 GEMM 90% 之后才就绪。
+
+| 路由 | T | 50% job 就绪于 GEMM 进度 | push 尾部暴露（release-time 下界） |
+|---|---:|---:|---:|
+| balanced | 4096 | 60.9% | 204µs |
+| **uniform** | 4096 | **92.1%** | **1125µs** |
+
+即 uniform 多出 ~921µs 纯尾部暴露 vs padding 的 140µs。**serial 不受影响**是因为
+它本就串行、没有流水可破坏——**我们相对 serial 的全部优势来自流水重叠，而随机路由
+恰好摧毁了流水的前提**。这也是结构性的：处理了 f 比例的 expert 后一个 token 全部
+8 个 expert 都就绪的概率是 f⁸，**改 job_order / 行块顺序都无解**。
+
+**模型只解释了一半**（140+921+55 ≈ 1116 vs 实测 2134），剩余 ~1000µs 最大嫌疑是
+**内存局部性**（uniform 下 8 个 slot 随机散布在 537MB，scatter 的 TMA store 和预
+归约的 8 行读全退化成随机访问）——**未验证，不要当结论**。
+
+**下一步（先验证再动手，docs/15 §6）**：跑
+`time_tp_stages 64 20 {512,4096} --dist {balanced,uniform}` 读分阶段数字：
+① 若 `L1 exposure` 在 uniform 下暴涨（T=4096 预期 +900µs 量级）→ 根因坐实，按
+docs/15 §5 的杠杆序动手；② 若是 `L*_gemm_alone` 自己涨了 → 主因是访存局部性，
+转 NCU 做访存归因，杠杆完全不同。**分不清之前不要改 kernel。**
+
+杠杆排序（估算，待校准）：① **combine partial 改 FP8**（尾部是 wire-bound，流量
+减半 → T=4096 估算省 ~850µs）；② **重开 EPIRED**（docs/04 的判负口径是 balanced，
+那里 expert_out 重读是顺序的、job 就绪本就均匀，uniform 下收益结构完全不同）；
+③ 分批 push **已算不可行**（wire 余量只有 1.41×，流量翻倍反而更差）；
+④ L0 的 `TK_LOCAL_FIRST` 只值 13~99µs，**优先级降到 L1 之后**。
+
+## 2026-07-27 深夜 9：分支 `ag_local_overlap` —— L0 本地优先分段已实现（待上机）
 
 目标：让**本地已有、不用通信就能拿到的 token** 的 W1 GEMM 不等 AllGather。
 现状里没有任何行块是纯本地的——canonical 布局下 expert e 的 256 行是

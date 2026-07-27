@@ -21,6 +21,7 @@ slim 分支从工作树移除，仍完整保留在 git 历史中（详见"信息
 | [12_纯GroupGEMM引擎最优性论证.md](12_纯GroupGEMM引擎最优性论证.md) | gg8 最优性三层主张、横比证据与待补实验清单 |
 | [13_COMET_EP复刻实现计划.md](13_COMET_EP复刻实现计划.md) | COMET 复刻可行性裁决与 cmep（EP 形态）五阶段实现计划 |
 | [14_L0本地优先分段与AG重叠.md](14_L0本地优先分段与AG重叠.md) | L0 本地优先分段（`TK_LOCAL_FIRST`）：让本地 token 的 W1 GEMM 不等 AllGather |
+| [15_真实路由下通算流水的失效.md](15_真实路由下通算流水的失效.md) | uniform 劣化的新归因：不是 padding 税，是 TopK 依赖导致的 combine 就绪塌缩 |
 
 ## 信息优先级
 
