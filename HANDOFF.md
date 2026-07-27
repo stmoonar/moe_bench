@@ -3,7 +3,18 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 深夜 6）：两级 tile Phase 1b 已接线（⚠️ 待上机验证）
+## 最新（2026-07-27 深夜 7）：Phase 1b 验收通过 —— uniform e2e −45µs，正确性逐位等价
+
+四步全过（卡组 0-3，docs/09 §6）：① balanced 回归 rel_err 逐位一致 +
+e2e 1530.9 零回退；② uniform 下 two_level on/off 四 rank rel_err/
+max_abs_err **全部逐位相同**（尾块逐比特等价在真实路由坐实）；③
+uniform e2e **1903.1 vs 1946.0 = −43~48µs**（劣化 415→372µs）；④ ptxas
+全零 spill。低于预估 100-180 的账：真实 uniform 尾块占比仅 ~20%（探针
+33%）+ L0 省时部分被 AG 重叠窗口 comm-bound 吃掉。**两级 tile 全线收官，
+TK_TWO_LEVEL 默认开**。残余方向（未立项）：uniform 口径重扫
+TK_COMM_SMS；64 粒度 act 布局。正式报数建议 balanced+uniform 双口径。
+
+## 2026-07-27 深夜 6：两级 tile Phase 1b 已接线（验收见上节）
 
 v3 定案后（L0 −12.2%/L1 −9.9%，尾块成本 0.63/0.70）Phase 1b 接入 fused
 两层。**关键简化：blk_rows ≡ ROW_BLOCK − slack**，调度表的 slack 已有

@@ -108,6 +108,26 @@ group store 交织约束 → 改恒等映射（warp 0-3 → 条带 0-3，SMSP 0-
 残差为每任务固定开销量级。**Phase 1a 引擎机制收敛，进 Phase 1b**
 （调度表按每 expert 余数发尾块 + fused 两层接入 + uniform e2e 报数）。
 
+## 6. Phase 1b 定案（2026-07-27，卡组 0-3）：uniform e2e −45µs，正确性逐位等价
+
+接入方式：blk_rows ≡ ROW_BLOCK − slack，直接复用调度表 slack（golden/
+tpsched 已对拍、每迭代重建）→ 调度链零改动；两层 fused 挂 A_tail_tile
+描述符启用 A64；开关 `TK_TWO_LEVEL`（默认 1）。
+
+- **正确性（最强判据）**：balanced rel_err 与基线逐位一致
+  （0.042817506939172745）；uniform 下 two_level on/off 四 rank 的
+  rel_err/max_abs_err **全部逐位相同** → 尾块路径与满块逐比特等价在
+  真实路由坐实。balanced e2e 1530.9 零回退。
+- **性能**：uniform e2e **1903.1（on） vs 1946.0（off）= −43~48µs**，
+  劣化 415→372µs（对 balanced 1531）。低于探针折算 ~90µs 的原因：
+  ① 真实 uniform 尾块占比仅 ~20%（~32/160 块，探针形状 33%）；
+  ② L0 的 GEMM 省时部分被 AG 重叠窗口的通信约束吃掉（GEMM 变快后该
+  窗口 comm-bound，省时不全兑现 e2e）。
+- 残余方向（未立项）：uniform 口径下重扫 `TK_COMM_SMS`（GEMM 变快后
+  让渡平衡点移动）；64 粒度 act 布局（省 scatter/推流 padding 流量，
+  裁决点 5 后者）。正式报数建议 balanced+uniform 双口径、TWO_LEVEL
+  默认开。
+
 **Phase 1（立项后）设计裁决点**（按依赖序）：
 
 1. 任务描述加 M 型别（128/64）：blk_expert 表旁挂 blk_rows 或高位编码；
