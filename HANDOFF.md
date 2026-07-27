@@ -26,9 +26,13 @@ config 的配置——triton 现有数字即其最优水位，"同类最优"主�
 **E1 已跑（07-27，GPU0，probe_20260727_040652）**：boost ×3 极稳——
 L0 fp8 649.1/raw 580.7，L1 fp8 351.0/raw 330.7，rel_err 1.68e-03；vs
 cta 前 raw −1.7%、fp8 持平；litmus 补验 ld5d_cta 原生。docs/12 §2.1 已
-按 ×3 刷新（L0 78.0% / L1 89.9% of CUTLASS）。**尾项**：四份 NCU 锁频
-报告读数回填 §2.2（命令在 docs/12 §5 E1）→ E2 可选补 CUTLASS tensor%。
-之后引擎侧进入实施：重标定切片交织（L0/L1 通用头号杠杆）。另：`time_tp_stages.py`
+按 ×3 刷新（L0 78.0% / L1 89.9% of CUTLASS），NCU 锁频读数已回填 §2.2
+（L0 fp8 795.4µs/68.7%、raw 688.4/80.9%；L1 438.4/61.7%、390.7/69.7%）。
+**关键新信号**：cta 后 raw 改善但 fp8 略升——load 瓶颈拆除使重标定链
+成为更裸的关键路径，fp8−raw 从 76.9 涨到 **107µs**，交织账面收益变大。
+**实验矩阵 E1/E3/E4/E5 全部闭环**（E2 可选：CUTLASS 当前卡锁频 tensor%，
+可坐实结构性 ~24µs 残差）。引擎侧下一步进入实施：**重标定切片交织**
+（L0/L1 通用头号杠杆，验收 = SASS 交错 + rel_err 1.68e-03 逐比特不变）。另：`time_tp_stages.py`
 已支持 `--dist/--skew-alpha/--active` 覆盖 token 路由分布（与 run_tktp
 同口径）。
 

@@ -19,11 +19,12 @@
    参照，不是可替换实现。
 2. **未达厂商纯 GEMM 上界，不做"已达上限"表述。** 同卡 boost 下
    L0 76.8% / L1 88.2%（§2.1）。
-3. **差距有账、杠杆在册。** L0（锁频 110.6µs）= 重标定机制 70% +
-   结构性 30%，杠杆：重标定切片交织（头号）、任务边界 store 后置
-   （~20µs）；4×2+COL=128 几何已被 E4 判负（§5）。L1 的 11.8% 已由
-   E5 裁决为**延迟/调度**（DRAM 流量两边相同），与 L0 同类杠杆。
-   便宜旁路已全部实验判负（§4）。
+3. **差距有账、杠杆在册。** L0 锁频差 = 重标定机制 **107µs**（fp8−raw
+   实测，cta 后 load 瓶颈拆除使其成为更裸的关键路径）+ 结构性 ~24µs
+   （raw vs CUTLASS 旧锚点）。杠杆：重标定切片交织（头号）、任务边界
+   store 后置（~20µs）；4×2+COL=128 几何已被 E4 判负（§5）。L1 的
+   10.1% 已由 E5 裁决为**延迟/调度**（DRAM 流量两边相同），与 L0 同类
+   杠杆。便宜旁路已全部实验判负（§4）。
 
 ## 2. 数据
 
@@ -40,16 +41,21 @@ L1 330.7µs（+6.2%）。时钟缩放互证：锁频→boost，CUTLASS 加速 1.
 差距主体是**固定延迟 stall**（不随频率缩放），与 NCU stall_wait 第一名
 （docs/11 §3）一致——重标定切片交织正是吃这块的杠杆。
 
-### 2.2 gg8 vs triton：NCU 锁频（kernel replay，triton 为调优水位；gg8 数字为 cta 补丁前，cta 后四份报告已在 probe_20260727_040652，读数待回填）
+### 2.2 gg8 vs triton：NCU 锁频（kernel replay；gg8 = cta 补丁后 probe_20260727_040652，triton = 调优水位）
 
 | L0 | Duration | tensor | Duration×tensor |
 |---|---:|---:|---:|
-| gg8 fp8 | 774.6µs | 71.2% | 551µs |
-| gg8 raw（无重标定探针） | 697.7µs | 79.4% | 554µs |
+| gg8 fp8 | 795.4µs | 68.7% | 546µs |
+| gg8 raw（无重标定探针） | 688.4µs | 80.9% | 557µs |
 | triton fused_moe | 834µs | 66.7% | 556µs |
 
-L1 锁频：gg8 425.0µs/64.2% vs triton 537µs/50.2%（triton 受两颗 GEMM
-共用一个 config 的结构上限，docs/08 §6）。
+L1 锁频：gg8 fp8 438.4µs/61.7%、raw 390.7µs/69.7% vs triton
+537µs/50.2%（triton 受两颗 GEMM 共用一个 config 的结构上限，docs/08 §6）。
+
+cta 补丁的锁频形态：raw 改善（697.7→688.4，syscall 移除兑现在结构侧），
+fp8 反而略升（774.6→795.4）——load 瓶颈拆掉后**重标定链成为更裸的关键
+路径**（fp8−raw 从 76.9 涨到 107.0µs），交织的账面收益进一步变大。
+不变量（L0 546-557µs / L1 270-272µs）跨 session 复现，分解框架有效。
 
 - **tensor-busy 不变量**：同形状下 Duration×tensor% ≈ 常数——QMMA 总量
   与速率各实现完全相同，差距 100% 是 tensor 空转，"更快的乘法"不存在，
@@ -102,15 +108,9 @@ L1 锁频：gg8 425.0µs/64.2% vs triton 537µs/50.2%（triton 受两颗 GEMM
   L1 353/336）：**raw −1.7%，fp8 持平**——syscall 移除主要惠及 load
   侧，fp8 路径仍被重标定 stall 主导，与 docs/11 §8"收益为正但幅度小"
   预期一致。litmus 补验 **ld5d_cta = 原生 UTMALDG.5D 无 CALL**（cta
-  补丁的最后一块拼图，load 全形态原生实锤）。§2.1 已按 ×3 数字刷新。
-  **待回填**：四份 NCU 锁频报告的 Duration/tensor%（刷新 §2.2），
-  读数命令：
-
-```bash
-for f in moe_bench/tp_test_results/probe_20260727_040652_engine/*.ncu-rep; do
-  echo "== $f"; ncu --import "$f" --page details 2>/dev/null | grep -iE 'duration|tensor'
-done
-```
+  补丁的最后一块拼图，load 全形态原生实锤）。§2.1 已按 ×3 数字刷新；
+  NCU 锁频读数已回填 §2.2（L0 795.4/68.7%、raw 688.4/80.9%；L1
+  438.4/61.7%、raw 390.7/69.7%；不变量跨 session 复现）。
 - **E5 ✅ 完成（2026-07-27，GPU0）**：L1 `dram__bytes.sum` —— tk
   **313.44MB** vs CUTLASS **317.89MB**（差 1.4%，CUTLASS 反而略多）。
   **定案：L1 的 11.8% 差距不在流量，在延迟/调度**——同流量下有效 DRAM
