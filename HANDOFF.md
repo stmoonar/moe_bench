@@ -3,7 +3,21 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 深夜 7）：Phase 1b 验收通过 —— uniform e2e −45µs，正确性逐位等价
+## 最新（2026-07-27 深夜 8）：COMET 复刻可行性裁决 + cmep（EP 形态）实现计划已立（docs/13）
+
+对照 `docs/paper_row/` 两篇论文裁决：**可以用本仓库 PK 原语层
+（pcie_sync + TKParallelTensor + tma_cta + gg8 dispenser）实现 COMET
+风格 MoE 层**，计划全文见 [`docs/13`](docs/13_COMET_EP复刻实现计划.md)。
+要点：① tktp 已是 COMET 两大机制（线程块特化 + shared tensor 依赖解析）
+的 TP 形态落地，增量价值 = **EP 形态新 scheme `cmep`**（dispatch/combine
+由路由驱动，COMET 原生场景）；② 三处平台强制偏离有既有判负背书——
+NVSHMEM/UVA→P2 源端 push、L1 N 维分解→M 维行块预归约（Comet-N 判负）、
+预编译 n_c 库→运行时 CM_COMM_SMS；③ 五阶段 M0-M5（EP 基线→host 调度
+golden/preflight→L0 单步隔离首测→L1+故障注入→定标→论文三组复刻实验），
+死锁审计表已预填。**未动任何代码**，下一步从 M0（EP serial 基线 +
+gg8 EP 形状探路）开始。
+
+## 2026-07-27 深夜 7：Phase 1b 验收通过 —— uniform e2e −45µs，正确性逐位等价
 
 四步全过（卡组 0-3，docs/09 §6）：① balanced 回归 rel_err 逐位一致 +
 e2e 1530.9 零回退；② uniform 下 two_level on/off 四 rank rel_err/
