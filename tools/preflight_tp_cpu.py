@@ -96,15 +96,18 @@ def _make_topk(world, T, ne, topk, dist_kind, seed):
 def check_builders(mod, ROW_BLOCK=128):
     fails = []
     world, T, topk = 4, 512, 8
+    # local_first (docs/14) 的表和 canonical 表一起裁决: 同一份路由、同一批
+    # 不变量, 只是布局分成本地/远端两段。
     for dist_kind in ("balanced", "skewed"):
         for ne in (64, 256):
-            for rank in (0, 3):
+            for rank, local_first in ((0, False), (3, False), (0, True), (3, True)):
                 all_ids, all_w = _make_topk(world, T, ne, topk, dist_kind, 0)
                 _STATE["ids"], _STATE["w"] = all_ids, all_w
                 with RequireExplicitDevice():
                     (padded_g, slots_g, w_g, slack_g, pull_g, job_g, pusho_g,
                      blk_g, sjob_g, sw_g, P) = mod._build_tp_schedules(
-                         all_ids[rank], all_w[rank], T, world, ne, rank, "cpu")
+                         all_ids[rank], all_w[rank], T, world, ne, rank, "cpu",
+                         local_first=local_first)
                 N = world * T * topk
                 packed_all = torch.stack(
                     [all_ids, all_w.contiguous().view(torch.int32)], dim=-1).contiguous()
@@ -121,8 +124,9 @@ def check_builders(mod, ROW_BLOCK=128):
                     "slot_w": torch.zeros(P, dtype=torch.float32, device="cpu"),
                 }
                 with RequireExplicitDevice():
-                    mod._build_tp_schedules_gpu(packed_all, world, ne, rank, out)
-                tag = f"NE={ne} {dist_kind} rank={rank}"
+                    mod._build_tp_schedules_gpu(packed_all, world, ne, rank, out,
+                                                local_first=local_first)
+                tag = f"NE={ne} {dist_kind} rank={rank} lf={int(local_first)}"
                 for name, got, ref in [("padded", out["padded"], padded_g),
                                        ("tp_slots", out["tp_slots"], slots_g),
                                        ("prered_w", out["prered_w"], w_g),
@@ -135,14 +139,32 @@ def check_builders(mod, ROW_BLOCK=128):
                                        ("slot_w", out["slot_w"], sw_g)]:
                     if got.shape != ref.shape or not torch.equal(got, ref):
                         fails.append(f"[{tag}] {name} host/GPU MISMATCH")
-                # blk_expert invariants (dispenser GEMM 的 B tile 索引)
+                # blk_expert invariants (dispenser GEMM 的 B tile 索引)。
+                # 语义判据(对两种布局都完备): 每个行块里的每一条真实
+                # assignment 的 expert 必须等于 blk_expert[该行块] —— 行块与
+                # expert 的对应才是 dispenser 取 B tile 的依据, 单调性只是
+                # canonical 布局的副产品。
                 blkl = blk_g.long()
-                if not bool((blkl[1:] >= blkl[:-1]).all()):
-                    fails.append(f"[{tag}] blk_expert not non-decreasing")
+                flat = slots_g.reshape(-1).long()
+                eid_flat = all_ids.reshape(-1).long()
+                if not torch.equal(blkl[flat // ROW_BLOCK], eid_flat):
+                    fails.append(f"[{tag}] blk_expert != assignment's expert")
+                nseg = int((blkl[1:] < blkl[:-1]).sum())
+                if nseg > (1 if local_first else 0):
+                    fails.append(f"[{tag}] blk_expert has {nseg} descents "
+                                 f"(expected <= {1 if local_first else 0})")
                 if not torch.equal(torch.bincount(blkl, minlength=ne),
                                    padded_g.long() // ROW_BLOCK):
                     fails.append(f"[{tag}] blk_expert counts != padded/ROW_BLOCK")
-                flat = slots_g.reshape(-1).long()
+                if local_first:
+                    # 方案的核心正确性(docs/14 §2): 本 rank 的 assignment 全部
+                    # 落在远端 assignment 之前 —— 段 1 的行块因此只由本卡
+                    # scatter(src == dev_idx 直读 pre_tokens)喂, 零到达等待。
+                    own = torch.zeros(world * T, dtype=torch.bool, device="cpu")
+                    own[rank * T:(rank + 1) * T] = True
+                    own_f = own.repeat_interleave(topk)
+                    if int(flat[own_f].max()) >= int(flat[~own_f].min()):
+                        fails.append(f"[{tag}] local segment not strictly first")
                 if flat.unique().numel() != N or int(flat.min()) < 0 or int(flat.max()) >= P:
                     fails.append(f"[{tag}] tp_slots not a bijection onto [0,P)")
                 # slot_job/slot_w = tp_slots/prered_w 的逆映射 (EPIRED 查表)
@@ -181,7 +203,7 @@ def check_builders(mod, ROW_BLOCK=128):
     return fails
 
 
-def check_dataflow(mod):
+def check_dataflow(mod, local_first=False):
     """Small-shape fused-dataflow simulation vs naive TP reference (fp32)."""
     torch.manual_seed(0)
     world, T, topk = 4, 96, 8
@@ -204,33 +226,38 @@ def check_dataflow(mod):
             act = torch.nn.functional.silu(gate) * up
             ref += wf[:, kpos:kpos + 1] * torch.einsum("ni,nhi->nh", act, W2[r][e])
 
+    RB = mod.ROW_BLOCK
     staging = [torch.zeros(world, T, H, device="cpu") for _ in range(world)]
     for r in range(world):
-        (padded, tp_slots, tp_w, _slack, _po, _jo, _pso, _blk, _sj, _sw,
-         P) = mod._build_tp_schedules(ids[r], w[r], T, world, E, r, "cpu")
+        (_padded, tp_slots, tp_w, _slack, _po, _jo, _pso, blk_expert, _sj, _sw,
+         P) = mod._build_tp_schedules(ids[r], w[r], T, world, E, r, "cpu",
+                                      local_first=local_first)
         gathered = torch.zeros(P, H, device="cpu")
         gathered[tp_slots.view(-1).long()] = X.repeat_interleave(topk, dim=0)
         expert_out = torch.zeros(P, H, device="cpu")
-        base = 0
-        for e in range(E):
-            pe = int(padded[e])
-            gu = gathered[base:base + pe] @ W1[r][e].T.float()
+        # 按行块走(dispenser 的真实语义), 不假设同一 expert 的行块连续 ——
+        # local_first 布局下它们分处两段。
+        for blk in range(P // RB):
+            e = int(blk_expert[blk])
+            rows = slice(blk * RB, (blk + 1) * RB)
+            gu = gathered[rows] @ W1[r][e].T.float()
             a = torch.nn.functional.silu(gu[:, :inter]) * gu[:, inter:]
-            expert_out[base:base + pe] = a @ W2[r][e].T  # (pe,inter)@(inter,H)
-            base += pe
+            expert_out[rows] = a @ W2[r][e].T          # (RB,inter)@(inter,H)
         part = (tp_w.unsqueeze(-1) * expert_out[tp_slots.long()]).sum(dim=1)  # (world*T, H)
         for s in range(world):
             staging[s][r] = part[s * T:(s + 1) * T]
     out = torch.cat([staging[r].sum(dim=0) for r in range(world)])
     rel = (out - ref).norm() / ref.norm()
-    return [] if rel < 1e-5 else [f"dataflow rel_err {float(rel):.2e} >= 1e-5"]
+    tag = f" (local_first)" if local_first else ""
+    return [] if rel < 1e-5 else [f"dataflow{tag} rel_err {float(rel):.2e} >= 1e-5"]
 
 
 def main():
     torch.distributed.all_gather_into_tensor = _fake_all_gather_into_tensor
     mod = _load_tk_tp_scheme()
     fails = check_builders(mod)
-    fails += check_dataflow(mod)
+    fails += check_dataflow(mod, local_first=False)
+    fails += check_dataflow(mod, local_first=True)
     for f in fails:
         print("  " + f)
     print(f"[preflight_tp_cpu] {'OK' if not fails else f'FAIL ({len(fails)})'}")

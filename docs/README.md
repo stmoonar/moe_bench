@@ -19,6 +19,8 @@ slim 分支从工作树移除，仍完整保留在 git 历史中（详见"信息
 | [10_fp8主循环P1_K-tile128与寄存器预算.md](10_fp8主循环P1_K-tile128与寄存器预算.md) | fp8 GEMM 主循环结构改造、寄存器预算与 spill 事故 |
 | [11_引擎归因探针与TMA_cta形态.md](11_引擎归因探针与TMA_cta形态.md) | 引擎差距归因框架（tensor-busy 不变量）与 TMA syscall→cta 修复 |
 | [12_纯GroupGEMM引擎最优性论证.md](12_纯GroupGEMM引擎最优性论证.md) | gg8 最优性三层主张、横比证据与待补实验清单 |
+| [13_COMET_EP复刻实现计划.md](13_COMET_EP复刻实现计划.md) | COMET 复刻可行性裁决与 cmep（EP 形态）五阶段实现计划 |
+| [14_L0本地优先分段与AG重叠.md](14_L0本地优先分段与AG重叠.md) | L0 本地优先分段（`TK_LOCAL_FIRST`）：让本地 token 的 W1 GEMM 不等 AllGather |
 
 ## 信息优先级
 

@@ -41,10 +41,11 @@ ROW_BLOCK = 128
 
 
 def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
-                        num_experts, rank, device):
+                        num_experts, rank, device, local_first=False):
     """Host golden TP schedule (setup only, not timed). Produces:
       - padded (num_experts,) int32: per-expert ROW_BLOCK-padded token counts
-        over the FULL world*T batch (identical on every rank);
+        over the FULL world*T batch (identical on every rank; under
+        local_first = the SUM of the expert's two segments' padded counts);
       - tp_slots (world*T, TOP_K) int32: gathered slot of every assignment,
         row j = src_dev*T + src_tok, column = kpos. This ONE table drives both
         layer0 (dispatch scatters the pulled token row to slots) and layer1
@@ -70,9 +71,19 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
       - num_padded_total: gathered rows (= sum(padded)).
 
     Slot order within an expert is CANONICAL (src_dev, src_tok, kpos) —
-    identical on every rank. The push data plane requires a layout all ranks
-    agree on (a per-rank ring order would make push_order rank-dependent), and
-    "own shard first" was measured useless (docs/04).
+    identical on every rank.
+
+    local_first (TK_LOCAL_FIRST, docs/14) splits the layout into TWO segments
+    per rank: row blocks [0, E) hold expert e's OWN-rank assignments only, the
+    rest hold every other rank's. Segment 1 needs no arrival flag at all
+    (scatter_lane's src == dev_idx branch reads pre_tokens directly), and the
+    dispenser hands out row blocks in id order, so the GEMM's first
+    E*col_blocks tasks are completely independent of the AllGather. The layout
+    becomes rank-dependent, which the P2 push data plane allows: push targets
+    staging row src_dev*T+src_tok (never a gathered slot) and scatter reads the
+    LOCAL tp_slots; push_order stays canonical (docs/14 §3 proof). The generic
+    code path below indexes a group table of size G = 2E (local, remote) or
+    G = E (canonical), so both layouts share one implementation.
     """
     top_k = topk_ids.shape[1]
     all_topk = torch.empty(world_size, num_tokens, top_k, device=device,
@@ -85,15 +96,27 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     all_w_cpu = all_w.cpu()
 
     counts = torch.bincount(all_topk.view(-1), minlength=num_experts).cpu().long()
-    padded = (counts + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK
-    num_padded_total = int(padded.sum())
+    # group g = segment*E + expert. canonical: one segment (G=E); local_first:
+    # segment 0 = this rank's own assignments, segment 1 = every other rank's.
+    if local_first:
+        counts_loc = torch.bincount(all_topk[rank].reshape(-1),
+                                    minlength=num_experts).cpu().long()
+        counts_g = torch.cat([counts_loc, counts - counts_loc])
+    else:
+        counts_g = counts
+    padded_g = (counts_g + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK
+    # per-expert padded rows (the two segments' blocks are NOT adjacent, but no
+    # kernel reads this table's values — only its length, = E)
+    padded = (padded_g[:num_experts] + padded_g[num_experts:] if local_first
+              else padded_g)
+    num_padded_total = int(padded_g.sum())
 
     # NOTE: explicit device="cpu" everywhere — the distributed worker runs under
     # torch.set_default_device(cuda), which would silently move these host-side
     # tables (and turn the fill loop into 16k+ single-element GPU writes).
     write_pos = torch.cat([
         torch.zeros(1, dtype=torch.int64, device="cpu"),
-        torch.cumsum(padded[:-1], dim=0)
+        torch.cumsum(padded_g[:-1], dim=0)
     ]).tolist()
     S = world_size * num_tokens
     tp_slots = torch.full((S, top_k), -1, dtype=torch.int32, device="cpu")
@@ -101,11 +124,12 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     slot_job = torch.full((num_padded_total,), -1, dtype=torch.int32, device="cpu")
     slot_w = torch.zeros(num_padded_total, dtype=torch.float32, device="cpu")
     for src_dev in range(world_size):  # canonical: src_dev ascending on EVERY rank
+        seg = num_experts if (local_first and src_dev != rank) else 0
         for src_tok in range(num_tokens):
             j = src_dev * num_tokens + src_tok
             for kpos, eid in enumerate(all_topk_cpu[src_dev, src_tok].tolist()):
-                slot = write_pos[eid]
-                write_pos[eid] += 1
+                slot = write_pos[seg + eid]
+                write_pos[seg + eid] += 1
                 tp_slots[j, kpos] = slot
                 wjk = float(all_w_cpu[src_dev, src_tok, kpos])
                 tp_w[j, kpos] = wjk
@@ -115,10 +139,10 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     nblk = num_padded_total // ROW_BLOCK
     slack = torch.zeros(nblk, dtype=torch.int32, device="cpu")
     blk = 0
-    for e in range(num_experts):
-        real_e = int(counts[e])
-        for b in range(int(padded[e]) // ROW_BLOCK):
-            real_in = max(0, min(ROW_BLOCK, real_e - b * ROW_BLOCK))
+    for g in range(counts_g.shape[0]):
+        real_g = int(counts_g[g])
+        for b in range(int(padded_g[g]) // ROW_BLOCK):
+            real_in = max(0, min(ROW_BLOCK, real_g - b * ROW_BLOCK))
             slack[blk] = ROW_BLOCK - real_in
             blk += 1
 
@@ -130,16 +154,20 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     pull_order = torch.argsort(mins * S + torch.arange(S, device="cpu")).to(torch.int32)
     maxs = tp_slots.max(dim=1).values.long()
     job_order = torch.argsort(maxs * S + torch.arange(S, device="cpu")).to(torch.int32)
-    # per-source push order = that source's tokens by min slot. The canonical
-    # layout makes this identical on all ranks (min slots are unique within a
-    # row, argsort stability irrelevant).
+    # per-source push order = that source's tokens by min slot, identical on
+    # every rank (min slots are unique within a row, argsort stability
+    # irrelevant). Canonical: trivially, the layout itself is shared. Under
+    # local_first: both segments lay experts out in ascending order, so the key
+    # reduces to (min expert, src_tok) for a fixed source either way —
+    # rank-independent (docs/14 §3).
     push_order = torch.argsort(mins.view(world_size, num_tokens), dim=1).to(torch.int32)
 
-    # row block -> expert id: first expert whose cumulative row-block end
-    # exceeds the block index.
-    rb_end = torch.cumsum(padded // ROW_BLOCK, dim=0)
-    blk_expert = torch.searchsorted(
-        rb_end, torch.arange(nblk, device="cpu"), right=True).to(torch.int32)
+    # row block -> group -> expert id: first group whose cumulative row-block
+    # end exceeds the block index (local_first: group g covers expert g % E).
+    rb_end = torch.cumsum(padded_g // ROW_BLOCK, dim=0)
+    blk_expert = (torch.searchsorted(
+        rb_end, torch.arange(nblk, device="cpu"), right=True)
+        % num_experts).to(torch.int32)
 
     return (padded.to(torch.int32).to(device), tp_slots.to(device),
             tp_w.to(device), slack.to(device), pull_order.to(device),
@@ -147,7 +175,8 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
             slot_job.to(device), slot_w.to(device), num_padded_total)
 
 
-def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
+def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out,
+                            local_first=False):
     """GPU-vectorized rebuild of the TP schedule tables, element-for-element
     identical to the host `_build_tp_schedules` golden (tools/preflight_tp_cpu
     adjudicates). Called each run() and counted in timing — the fair analogue of
@@ -173,26 +202,36 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     top_k = packed_all.shape[2]
     N = world_size * T * top_k
 
+    n_idx = torch.arange(N, device=device)
     eid = packed_all[..., 0].reshape(N).long()
-    # canonical order within an expert = (src_dev, src_tok, kpos) = flat index n
-    # (all ranks must build the SAME layout for the push dispatch).
-    # key 用 int32(值域 E*N ≤ 256*131072 < 2^31, 排序结果与 int64 逐元素
+    # group g = segment*E + expert. canonical: G = E (one segment). local_first
+    # (docs/14): G = 2E, segment 0 = this rank's own assignments (row blocks
+    # [0, E) — no arrival flag needed), segment 1 = every other rank's.
+    # Order within a group = (src_dev, src_tok, kpos) = flat index n.
+    if local_first:
+        grp = (n_idx // (T * top_k) != rank).long() * num_experts + eid
+        G = 2 * num_experts
+    else:
+        grp = eid
+        G = num_experts
+    # key 用 int32(值域 G*N ≤ 512*32768 < 2^31, 排序结果与 int64 逐元素
     # 相同, host/GPU 对拍不变), argsort 提速 ~30-40%。
-    key = (eid * N + torch.arange(N, device=device)).to(torch.int32)
+    key = (grp * N + n_idx).to(torch.int32)
     order = torch.argsort(key)
-    eid_s = eid[order]
+    grp_s = grp[order]
 
-    # per-expert counts + padding (scatter_add: capture-safe, unlike bincount)
-    counts = torch.zeros(num_experts, dtype=torch.long, device=device)
-    counts.scatter_add_(0, eid, torch.ones_like(eid))
+    # per-group counts + padding (scatter_add: capture-safe, unlike bincount)
+    counts = torch.zeros(G, dtype=torch.long, device=device)
+    counts.scatter_add_(0, grp, torch.ones_like(grp))
     padded = (counts + ROW_BLOCK - 1) // ROW_BLOCK * ROW_BLOCK
-    out["padded"].copy_(padded.to(torch.int32))
-    grp_start = torch.zeros(num_experts, dtype=torch.long, device=device)
+    out["padded"].copy_((padded[:num_experts] + padded[num_experts:]
+                         if local_first else padded).to(torch.int32))
+    grp_start = torch.zeros(G, dtype=torch.long, device=device)
     grp_start[1:] = torch.cumsum(counts, dim=0)[:-1]
-    pos_in_expert = torch.arange(N, device=device) - grp_start[eid_s]
-    padded_base = torch.zeros(num_experts, dtype=torch.long, device=device)
+    pos_in_expert = n_idx - grp_start[grp_s]
+    padded_base = torch.zeros(G, dtype=torch.long, device=device)
     padded_base[1:] = torch.cumsum(padded, dim=0)[:-1]
-    slot_sorted = padded_base[eid_s] + pos_in_expert
+    slot_sorted = padded_base[grp_s] + pos_in_expert
 
     # tp_slots: scatter each sorted assignment's slot back to its original flat
     # index n = (src_dev*T + src_tok)*top_k + kpos == row/col of the table.
@@ -213,10 +252,10 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     out["slot_w"].zero_()
     out["slot_w"].scatter_(0, slot_by_n.long(), out["prered_w"].reshape(N))
 
-    # slack: only the tail block of each expert carries (padded - real); scatter
-    # via a trash slot for empty experts (capture-safe, no boolean compaction).
+    # slack: only the tail block of each group carries (padded - real); scatter
+    # via a trash slot for empty groups (capture-safe, no boolean compaction).
     nb_total = out["slack"].shape[0]
-    tail_blk = (padded_base + padded) // ROW_BLOCK - 1          # (E,)
+    tail_blk = (padded_base + padded) // ROW_BLOCK - 1          # (G,)
     slackv = (padded - counts).to(torch.int32)
     idx = torch.where(padded > 0, tail_blk, torch.full_like(tail_blk, nb_total))
     tmp = torch.zeros(nb_total + 1, dtype=torch.int32, device=device)
@@ -236,12 +275,13 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out):
     out["push_order"].copy_(
         torch.argsort(mins.view(world_size, T), dim=1).to(torch.int32))
 
-    # row block -> expert (dispenser GEMM B-tile index). searchsorted keeps
-    # shapes fixed (capture-safe), mirrors the host golden formula.
+    # row block -> group -> expert (dispenser GEMM B-tile index). searchsorted
+    # keeps shapes fixed (capture-safe), mirrors the host golden formula.
     nblk = out["blk_expert"].shape[0]
     rb_end = torch.cumsum(padded // ROW_BLOCK, dim=0)
-    out["blk_expert"].copy_(torch.searchsorted(
-        rb_end, torch.arange(nblk, device=device), right=True).to(torch.int32))
+    out["blk_expert"].copy_((torch.searchsorted(
+        rb_end, torch.arange(nblk, device=device), right=True)
+        % num_experts).to(torch.int32))
 
 
 class TKFusedTP(DistributedScheme):
@@ -287,11 +327,19 @@ class TKFusedTP(DistributedScheme):
         _spec.loader.exec_module(_bmod)
         self.tk = _bmod.build_and_load(world, hidden=H, row_block=ROW_BLOCK)
 
+        # 本地优先分段(TK_LOCAL_FIRST, docs/14): gathered 行块 [0, E) 只装本
+        # rank 自己的 assignment —— 这些行 scatter 走 src==dev_idx 直读
+        # pre_tokens, 不等任何到达 flag, 而 dispenser 按行块 id 升序发任务,
+        # 于是 GEMM 的头 E*col_blocks 个任务完全不依赖 AllGather。代价是两段
+        # 各自补齐带来的 padding(balanced T=512 是最坏点 +10% GEMM/+50% 行数;
+        # T=1024 每 expert 每 rank 恰好 128 行 → 零代价), 账见 docs/14 §4。
+        self.local_first = int(os.environ.get("TK_LOCAL_FIRST", "0"))
+
         # ---- host golden schedule (not timed) ----
         (padded, tp_slots, tp_w, slack, pull_order, job_order, push_order,
          blk_expert, slot_job, slot_w, num_padded_total) = _build_tp_schedules(
             problem.topk_ids, problem.topk_weights, num_tokens, world,
-            num_experts, ctx.rank, device)
+            num_experts, ctx.rank, device, local_first=bool(self.local_first))
         self.padded = padded
         self.tp_slots = tp_slots.contiguous()
         self.prered_w = tp_w.contiguous()
@@ -354,8 +402,13 @@ class TKFusedTP(DistributedScheme):
             _smem_need = (4 * num_padded_total
                           + 4 * max(world * num_tokens, 1024 * world)
                           + 264 * 4 * 3 + 1024 * 4 + 512)
+            # 融合 sched kernel 只实现了 canonical 单段布局(tpsched 的
+            # per-expert compaction), local_first 下回退 torch 向量化版
+            # —— sched 阶段会慢 ~120µs, A/B 必须用 time_tp_stages 的分阶段
+            # 数字裁决 L0, e2e 只在 local_first 定案后再补融合版(docs/14)。
             self._sched_fused = (os.environ.get("TK_SCHED_FUSED", "1") == "1"
-                                 and _smem_need <= 101376)
+                                 and _smem_need <= 101376
+                                 and not self.local_first)
             self._sched_graph = None  # captured lazily on first run()
 
         # ---- weights ----
@@ -446,6 +499,9 @@ class TKFusedTP(DistributedScheme):
         # balanced 下无尾块 → 满块路径逐指令不变, 零开销。EPIRED 的 wred
         # tail 是 trap 桩, 互斥(L1 侧自动降级为关)。
         self.two_level = int(os.environ.get("TK_TWO_LEVEL", "1"))
+        # 归因探针(TK_L0_NOGATE, docs/14 §5): L0 GEMM 不等行块到达计数 ——
+        # **输出数值是错的**, 只用于把 gate 等待从 L0 exposure 里拆出来。
+        self.l0_no_gate = int(os.environ.get("TK_L0_NOGATE", "0"))
         # peer-writable combine staging: plane d (rows [d*T, d*T+T)) is written
         # only by card d (single writer, no atomics).
         self.combine_staging = TK((world * num_tokens, H), dtype=torch.bfloat16,
@@ -464,9 +520,16 @@ class TKFusedTP(DistributedScheme):
         self._l0_seq = 0
         self._l1_seq = 0
 
+    def _sched_torch_call(self):
+        """torch 向量化调度表构建(preflight 已裁决其与 host golden 一致)。"""
+        _build_tp_schedules_gpu(self._packed_all, self.ctx.world_size,
+                                self._num_experts, self.ctx.rank,
+                                self._sched_out,
+                                local_first=bool(self.local_first))
+
     def _sched_fused_call(self):
         """单 kernel 调度表构建(与 _build_tp_schedules_gpu 逐元素一致,
-        首跑对拍)。"""
+        首跑对拍)。canonical 布局专用 —— local_first 下 setup 已关掉它。"""
         self.tk.tp_sched_build(
             self._packed_all, self.padded, self.tp_slots, self.prered_w,
             self.slack, self.pull_order, self.job_order, self.push_order,
@@ -491,9 +554,7 @@ class TKFusedTP(DistributedScheme):
                     # 首跑对拍(此时 packed_all 已有真实路由): torch 向量化版
                     # (基准, preflight 已裁决其与 golden 一致) vs 融合 kernel,
                     # 逐表 torch.equal, 不过直接 raise, 不静默退化。
-                    _build_tp_schedules_gpu(self._packed_all,
-                                            self.ctx.world_size, self._num_experts,
-                                            self.ctx.rank, self._sched_out)
+                    self._sched_torch_call()
                     snap = {k: v.clone() for k, v in self._sched_out.items()}
                     self._sched_fused_call()
                     torch.cuda.synchronize()
@@ -504,15 +565,11 @@ class TKFusedTP(DistributedScheme):
                     with torch.cuda.graph(g):
                         self._sched_fused_call()
                 else:
-                    _build_tp_schedules_gpu(self._packed_all,
-                                            self.ctx.world_size, self._num_experts,
-                                            self.ctx.rank, self._sched_out)  # warmup
+                    self._sched_torch_call()                       # warmup
                     torch.cuda.synchronize()
                     g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g):
-                        _build_tp_schedules_gpu(self._packed_all,
-                                                self.ctx.world_size, self._num_experts,
-                                                self.ctx.rank, self._sched_out)
+                        self._sched_torch_call()
                 self._sched_graph = g
             else:
                 self._sched_graph.replay()
@@ -541,7 +598,7 @@ class TKFusedTP(DistributedScheme):
             self.gemm_next, self.push_next, self.pull_next,
             self.barrier_l0, self.num_comm_sms, self.l0_push_sms,
             self.num_padded_total, self.num_tokens, self._l0_seq,
-            self.two_level)
+            self.two_level, self.l0_no_gate)
 
         # layer1: act 量化 -> W2 GEMM ⊕ 本地预归约 ⊕ push(稠密 ReduceScatter),
         # 然后源卡侧对 world 个 partial plane 做最终归约。

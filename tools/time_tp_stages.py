@@ -106,7 +106,8 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
                 s.tp_slots, s.slack, s.pull_order, s.push_order,
                 s.blk_expert, s.gemm_next, s.push_next, s.pull_next,
                 s.barrier_l0, s.num_comm_sms, s.l0_push_sms,
-                s.num_padded_total, s.num_tokens, s._l0_seq, s.two_level)
+                s.num_padded_total, s.num_tokens, s._l0_seq, s.two_level,
+                s.l0_no_gate)
         timed("L0_fused", st_l0)
 
         def st_l1():
@@ -133,19 +134,24 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
         # 参考: 同样的 GEMM, 没有通信/预归约(gathered / act 已经是填好的)。
         # gg8 是 plain store(输出 (P, 2I)), 少了 GLU epilogue —— 实测 GLU 在
         # GEMM 级零开销, 参考仍然苹果对苹果。
-        def st_l0_alone():
+        # 两级 tile 必须跟着 fused 一起开, 否则参考走全满块而 fused 走尾块,
+        # exposure 会被系统性低估(balanced 无尾块 → slack 全 0, 行为与旧口径
+        # 逐指令相同, 历史数字不受影响; uniform / local_first 下才有差别)。
+        def _gemm_alone(a, asc, w, wsc, out):
             ref_task_next.zero_()
-            s.tk.grouped_gemm_fp8(s.gathered, s.gathered_scales,
-                                  s.w_gateup_fp8, s.w1_il_scales, ref_gateup,
-                                  s.padded, s.blk_expert, ref_task_next, 0, False)
-        timed("L0_gemm_alone", st_l0_alone)
+            if s.two_level:
+                s.tk.grouped_gemm_fp8(a, asc, w, wsc, out, s.padded,
+                                      s.blk_expert, ref_task_next, 0, False,
+                                      s.slack)
+            else:
+                s.tk.grouped_gemm_fp8(a, asc, w, wsc, out, s.padded,
+                                      s.blk_expert, ref_task_next, 0, False)
 
-        def st_l1_alone():
-            ref_task_next.zero_()
-            s.tk.grouped_gemm_fp8(s.act_fp8, s.act_scales, s.w2_fp8,
-                                  s.w2_scales, ref_expout, s.padded,
-                                  s.blk_expert, ref_task_next, 0, False)
-        timed("L1_gemm_alone", st_l1_alone)
+        timed("L0_gemm_alone", lambda: _gemm_alone(
+            s.gathered, s.gathered_scales, s.w_gateup_fp8, s.w1_il_scales,
+            ref_gateup))
+        timed("L1_gemm_alone", lambda: _gemm_alone(
+            s.act_fp8, s.act_scales, s.w2_fp8, s.w2_scales, ref_expout))
 
         timed("full_run", s.run)
 
@@ -161,6 +167,8 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
         print(f"\n== tktp stage attribution (fp8, NE={ne}, T={tokens}, "
               f"dist={rdesc}, iters={iters}, comm_sms={s.num_comm_sms}, "
               f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.l0_push_sms}, "
+              f"two_level={s.two_level}, local_first={s.local_first}, "
+              f"no_gate={s.l0_no_gate}, P={s.num_padded_total}, "
               f"max over ranks, us) ==")
         for k, v in zip(stages, t.tolist()):
             print(f"  {k:14} {v:10.1f}")

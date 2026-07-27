@@ -259,10 +259,15 @@ struct pglobals {
     const int num_comp_sms;
     const int num_push_sms;
     const int seq;
+    const int no_gate;      // 探针(TK_L0_NOGATE, docs/14 §5): 见 dispatch_gate_p
 };
 struct dispatch_gate_p {
     const pglobals &G;
     __device__ inline void operator()(int row_idx) const {
+        // 归因探针: 跳过到达等待 —— GEMM 读到未 scatter 的行, **数值是错的**,
+        // 只用于计时。t(L0_fused) - t(L0_fused, NOGATE) = gate 等待的真实成本,
+        // 也就是"让本地行块免 gate"(TK_LOCAL_FIRST)的收益硬上界。
+        if (G.no_gate) return;
         int v;
         asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}" : "=r"(v) : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
         PCIE_SPIN_GUARD_DECL;
@@ -408,7 +413,7 @@ void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
            kittens::py::TKParallelTensor &barrier,
            const int num_comm_sms, const int num_push_sms,
            const int num_padded_local_tokens, const int num_tokens, const int seq,
-           const int two_level) {
+           const int two_level, const int no_gate) {
     using cfg = gemm_config_fp8;
     const int dev_idx = barrier.local_rank_;
     const int num_local_experts = static_cast<int>(padded_tokens_per_expert.size(0));
@@ -451,7 +456,7 @@ void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
         .dev_idx = dev_idx,
         .num_padded_local_tokens = num_padded_local_tokens, .num_tokens = num_tokens,
         .s_max = s_max, .num_comp_sms = sm - num_comm_sms,
-        .num_push_sms = num_push_sms, .seq = seq
+        .num_push_sms = num_push_sms, .seq = seq, .no_gate = no_gate
     };
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int smem = pglobals::SLOTS *

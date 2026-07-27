@@ -3,7 +3,67 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-27 深夜 8）：COMET 复刻可行性裁决 + cmep（EP 形态）实现计划已立（docs/13）
+## 最新（2026-07-27 深夜 9）：分支 `ag_local_overlap` —— L0 本地优先分段已实现（待上机）
+
+目标：让**本地已有、不用通信就能拿到的 token** 的 W1 GEMM 不等 AllGather。
+现状里没有任何行块是纯本地的——canonical 布局下 expert e 的 256 行是
+`[r0 64][r1 64] | [r2 64][r3 64]`，每个 128 行块都混了两个 src_dev，于是本卡
+那 64 行虽然 scatter 时走 `src==dev_idx` 直读 `pre_tokens`（连 staging 都不落），
+仍要陪着另外 64 行等 peer 的到达 flag。
+
+**做法（docs/14）**：gathered 布局改 rank-dependent 两段式——行块 `[0, E)` 只装
+本 rank 自己的 assignment，其后是远端段。dispenser 按行块 id 升序发任务，于是
+**头 `E×col_blocks` 个 GEMM 任务完全不依赖通信**，整个 AllGather 窗口都有满负荷
+的活干。开关 `TK_LOCAL_FIRST`（默认 0，零风险接入）。
+
+关键前提均已核实：① dispenser 的行块→expert 完全走 `blk_expert` 查表，没有
+"同 expert 行块必须连续"的约束；② `padded` 的**值**从未被任何 kernel 读（只用
+`.size(0)` 取 E）；③ P2 push 数据面允许 rank-dependent 布局——push 落点是 staging
+的 `src_dev*T+src_tok` 行、与 gathered 布局无关，scatter 读**本地** `tp_slots`，
+且 `push_order` 仍跨 rank 一致（docs/14 §3 给了证明，preflight 的 canonical 断言
+继续通过）；④ `pull_order` 按 min slot 排 → 本地 token 自动排最前，公式不用改。
+
+**代价（用 bench 真实路由生成器实算，docs/14 §4）**：
+
+| 路由 | T | Δ成本(两级 tile 口径) | Δ行数 |
+|---|---:|---:|---:|
+| balanced | **1024** | **+0.0%** | **+0%** |
+| balanced | 512 | +10.0% | +50% |
+| uniform | 1024 / 512 | +6.3% / +13.2% | +10% / +21% |
+
+**T=1024 代价严格为零**（每 expert 每 rank 恰好 128 行 = 一个满块），是主判决档；
+T=512 恰好踩在半块上，是最坏点，预期为负（+118µs 税 vs 收益上界 = gate 等待）。
+
+**新增探针 `TK_L0_NOGATE=1`**：L0 GEMM 跳过行块到达等待（**输出数值是错的**，
+只读时间），`L0_fused − L0_fused@NOGATE` = gate 等待的真实成本 = 本方案收益的
+硬上界。**先跑它**，若 < 40µs 则 T=512 档直接判负、只看 T=1024。
+
+- **死锁审计（红线）**：**无新增、无修改等待点**。段 1 的行块计数由本卡 scatter
+  直接喂（`src==dev_idx` 分支根本不进 flag 自旋），段 2 与现状逐字同源；
+  `dispatch_gate_p` 的 `PCIE_SPIN_GUARD`、scatter 的 5e8 自旋上界、`guarded_wait`、
+  `pcie_barrier_all` 全部原样保留。跨 rank 依赖链仍是 `GEMM ← scatter ← flag ←
+  peer push`，无环。NOGATE 探针只**移除**一个等待点。逐条表见 docs/14 §9。
+- **正确性强判据**：布局重排不改变任何一行的运算序（每行 GEMM 独立、K 维累加序
+  不变；L1 预归约按 kpos 顺序；final reduce 按 rank 顺序）→ **`TK_LOCAL_FIRST`
+  on/off 的 e2e rel_err 必须逐位一致**（0.042817506939172745）。不一致即 bug。
+- **已在本地验证**：`preflight_tp_cpu` 全绿，两种布局 × balanced/skewed ×
+  NE=64/256 × rank 0/3 —— host golden ↔ torch GPU 版逐元素一致、新增
+  "blk_expert == 该行块每条 assignment 的 expert"语义判据（取代 canonical 专用的
+  单调性断言）、"本地段严格在前"判据、CPU 数据流仿真（改为按行块走）。
+- **口径修正**：`time_tp_stages` 的 `L0/L1_gemm_alone` 参考现在跟随
+  `TK_TWO_LEVEL` 传 slack——否则参考走全满块而 fused 走尾块，exposure 被系统性
+  低估。balanced 下 slack 全 0，行为与旧口径逐指令相同，**历史数字不受影响**。
+- **未做（留 Phase 2）**：① 融合 sched kernel（tpsched）只实现了 canonical 单段
+  compaction，`TK_LOCAL_FIRST=1` 时自动回退 torch 版（sched +~120µs）→ **裁决
+  看 time_tp_stages 分阶段数字，不看 e2e**；② docs/14 §4.1 的 L1 风险：本地 job
+  全部集中在段 1，跨卡 RS 的可用窗口从 ~384µs 收窄到 ~280µs（要推 12.6MB ≈
+  247µs，余量 1.55×→1.13×），若 `L1_fused` 明显回退，解法是给 dispenser 加可选
+  `row_perm` 行块访问序表让 L1 先算段 2。
+
+上机 runbook 见 [docs/14 §7](docs/14_L0本地优先分段与AG重叠.md)（先确认卡空闲；
+步 3 是 local_first 布局首测，单步隔离）。
+
+## 2026-07-27 深夜 8：COMET 复刻可行性裁决 + cmep（EP 形态）实现计划已立（docs/13）
 
 对照 `docs/paper_row/` 两篇论文裁决：**可以用本仓库 PK 原语层
 （pcie_sync + TKParallelTensor + tma_cta + gg8 dispenser）实现 COMET
