@@ -261,6 +261,15 @@ struct gemm_config_fp8 {
                   "fp8 pipeline 4x24KB=96KB, 须给静态 smem 留余量(sm120 上限 101376)");
 };
 
+/* gl 是否带某 ST 的 TMA 描述符(两级尾块 A64 装载的编译期开关)。
+ * 不能用 requires{get_tma<ST>()}: TK 的 get_tma 模板总能匹配, 类型不在
+ * 列表时是实例化期 static_assert(非 SFINAE), requires 恒真 → 直接对
+ * gl<T,b,d,r,c,TMA_Types...> 的类型列表做匹配。 */
+template <typename GL, typename ST> struct gl_has_tma : std::false_type {};
+template <typename T, int B, int D, int R, int C, typename... TMAs, typename ST>
+struct gl_has_tma<kittens::gl<T, B, D, R, C, TMAs...>, ST>
+    : std::bool_constant<(std::is_same_v<ST, TMAs> || ...)> {};
+
 /* ---- output store policies -----------------------------------------------
  * The consumer group's register->global store is a policy so layer0 can fuse
  * the SwiGLU activation into the GEMM epilogue instead of a separate torch
@@ -429,11 +438,11 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 gate(row_idx);
                 const int e = blk_expert[row_idx];
                 // 两级尾块 A64 装载: 仅当 globals 的 activations gl 带
-                // A_tail_tile 的 TMA 描述符时启用(编译期检测; fused 各自
-                // Phase 接入前自动回退全量装载, 尾块只省算不省 A 字节)。
-                constexpr bool HAS_A64 = requires {
-                    G.activations.template get_tma<typename cfg::A_tail_tile, 2>();
-                };
+                // A_tail_tile 的 TMA 描述符时启用(编译期 gl_has_tma 检测;
+                // fused 各自 Phase 接入前自动回退全量装载, 只省算不省 A 字节)。
+                constexpr bool HAS_A64 = gl_has_tma<
+                    std::remove_cv_t<decltype(G.activations)>,
+                    typename cfg::A_tail_tile>::value;
                 const bool tail = HAS_A64 && blk_rows != nullptr &&
                                   blk_rows[row_idx] <= cfg::ROW_BLOCK / 2;
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
