@@ -9,3 +9,7 @@ kernels/tk/build/
 kernels/tk/sm120_common.cuh
 tmp/
 tp_test_results/
+
+.vscode
+
+MY_PLAN.md
