@@ -27,12 +27,17 @@ import dataclasses
 import datetime
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 
 CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "configs", "tp_rtx_pro5000_4gpu_fp8.yaml")
-STEP_TIMEOUT_S = 1800   # 单步兜底超时(kernel trap ~32s 自杀, 这里只兜 harness)
+# 单步兜底超时。kernel 侧协议挂死 ~40s 内 spin guard 自爆; 这里兜的是
+# host 侧挂死(如某 rank 早退后其余卡死在 NCCL 集合通信里)。首跑含 nvcc
+# 重编时可用 RUN_TKTD_TIMEOUT 放宽。
+STEP_TIMEOUT_S = int(os.environ.get("RUN_TKTD_TIMEOUT", "1200"))
 
 
 def _arg(flag, default, cast=str):
@@ -92,18 +97,51 @@ def _run_step(name: str, outdir: str, scheme: str, extra_args: list[str],
     print(f"[run_tktd] step '{name}': scheme={scheme} args={extra_args} "
           f"env_over={env_over}")
     with open(log_path, "w", encoding="utf-8") as lf:
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, env=env)
+        # start_new_session: 子进程自成进程组 —— 超时/收割时 killpg 连
+        # mp.spawn 的 4 个 worker 一起带走(否则残留 worker 的 NCCL/自旋
+        # kernel 会把 GPU 顶在 100%, 2026-07-28 实测踩过)。
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env,
+                                start_new_session=True)
+
+        def _pump():
             for line in proc.stdout:            # 透传 + 落盘
                 sys.stdout.write(line)
+                sys.stdout.flush()
                 lf.write(line)
+                lf.flush()
+
+        # 读管道放后台线程: 主线程的 wait(timeout) 才能真正生效(直接在主
+        # 线程 for line in stdout 会在子进程挂住时永远阻塞, 超时形同虚设)。
+        pump = threading.Thread(target=_pump, daemon=True)
+        pump.start()
+        def _kill_group():
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            proc.wait()
+            pump.join(timeout=5)
+
+        try:
             ret = proc.wait(timeout=STEP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            lf.write(f"\n[run_tktd] step '{name}' TIMEOUT {STEP_TIMEOUT_S}s\n")
-            print(f"[run_tktd] step '{name}' TIMEOUT")
+            _kill_group()
+            lf.write(f"\n[run_tktd] step '{name}' TIMEOUT {STEP_TIMEOUT_S}s, "
+                     f"进程组已 SIGKILL; 用 nvidia-smi 确认 util 归零"
+                     f"(spin guard ~40s 内应自行 trap)再重跑\n")
+            print(f"[run_tktd] step '{name}' TIMEOUT {STEP_TIMEOUT_S}s, "
+                  f"进程组已 SIGKILL — 等 ~1 分钟看 nvidia-smi 是否归零")
             return False, None
+        except KeyboardInterrupt:
+            # Ctrl-C 只打到父进程 —— 不带走 worker 会把自旋 kernel 留在卡上
+            # (GPU 100% 残留)。收割整组后再抛。
+            _kill_group()
+            lf.write(f"\n[run_tktd] step '{name}' 被中断, 进程组已 SIGKILL\n")
+            print(f"[run_tktd] 中断: 进程组已 SIGKILL — 等 ~1 分钟看 "
+                  f"nvidia-smi 是否归零后再重跑")
+            raise
+        pump.join(timeout=5)
     if ret != 0:
         print(f"[run_tktd] step '{name}' FAILED (exit {ret}), log: {log_path}")
         return False, None
