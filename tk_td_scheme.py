@@ -457,6 +457,19 @@ class TKTDFusedTP(DistributedScheme):
                 _final()
                 _dbg2("L1c final")
             return self.combine_out
+        # 发射顺序 = TD 原版的序(fp8_moe_reduce_rs.run: GEMM 先于 RS):
+        # **等待者(RS, 自旋 chunk_done)必须晚于被等者(GEMM)发射**。反过来
+        # (RS 先发射常驻自旋、GEMM 后发射)在 2026-07-28 首测实测死锁 →
+        # 32s guard trap: 只要执行栈任何一层把"后发射"排在"先发射的完成"
+        # 之后, 就构成 RS↔GEMM 等待环(TKTD_L1_SERIAL=2/3 二分坐实, 档 3
+        # = 安全序通过, 档 2 = 反序死锁)。L0 的 producer/GEMM 天然是
+        # 安全序(等待者 GEMM 晚发射), 故无此问题。overlap 不受损: GEMM
+        # 网格 = sm - rs_sms, 给 RS 留着 SM。
+        tk.moe_td_gemm_nchunk(
+            self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
+            self.expert_out, self.padded, self.blk_expert, self.gemm_next_l1,
+            self.chunk_cnt, self.chunk_done, self.n_chunks, self.rs_sms,
+            self.num_padded_total, self._l1_seq, self.slack, self.two_level)
         with torch.cuda.stream(self.comm_stream):
             # comm stream 上排在 producer 之后; 对 GEMM 的依赖走 chunk_done
             # flag(seq 门), 无需 stream 级同步。
@@ -466,11 +479,6 @@ class TKTDFusedTP(DistributedScheme):
                 self.barrier_l1, self.n_chunks, self.rs_sms,
                 self.num_tokens, self._l1_seq)
             self._ev_end.record(self.comm_stream)
-        tk.moe_td_gemm_nchunk(
-            self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
-            self.expert_out, self.padded, self.blk_expert, self.gemm_next_l1,
-            self.chunk_cnt, self.chunk_done, self.n_chunks, self.rs_sms,
-            self.num_padded_total, self._l1_seq, self.slack, self.two_level)
         tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
                                  self.recv_from, self.combine_out,
                                  self.barrier_l1, self.num_tokens, self._l1_seq)
