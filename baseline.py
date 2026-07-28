@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
 from .config import ParallelMode
 from .data import MoEProblem
+from .routing_stats import BlockConfig, vllm_triton_block_config
 
 
 class MoEImplementation(ABC):
@@ -42,6 +43,13 @@ class MoEImplementation(ABC):
     @abstractmethod
     def run(self, problem: MoEProblem) -> torch.Tensor:
         raise NotImplementedError
+
+    def block_config(self, problem: MoEProblem) -> BlockConfig | None:
+        """本实现计算用的行(token)维 BLOCK 口径, 供每次运行前打印。
+
+        返回 ``None`` = 报不出固定的行维 tile 粒度, 打印时记 n/a。
+        """
+        return None
 
 
 class NaiveFusedExperts(MoEImplementation):
@@ -74,6 +82,10 @@ class NaiveFusedExperts(MoEImplementation):
             expert_map=expert_map,
             quant_config=problem.quant_config,
         )
+
+    def block_config(self, problem: MoEProblem) -> BlockConfig | None:
+        # 单卡 compute-only 口径: 喂进 fused_experts 的就是这份 token shard。
+        return vllm_triton_block_config(problem, problem.num_tokens)
 
 
 # Registry of available implementations, keyed by ``--impl`` name.

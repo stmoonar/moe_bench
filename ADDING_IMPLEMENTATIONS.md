@@ -59,6 +59,37 @@ graph, so it must be:
 Do one-time work (weight reshaping, kernel selection, autotuning) in `setup`,
 which runs once per token count and is not timed.
 
+## Reporting your BLOCK config (optional)
+
+Every run prints the routing distribution (per-expert token counts) and the
+row-dimension block layout right after `setup`, before timing — see
+[docs/05 §7](docs/05_测试与调试指南.md). The counts come from the problem; the
+**BLOCK_M** granularity has to come from your implementation, because each one
+tiles the token dimension differently (`tktp`'s compile-time `ROW_BLOCK`, the
+serial baseline's triton `BLOCK_SIZE_M`). Report it by overriding
+`block_config` — `DistributedScheme.block_config(self)` for a scheme,
+`MoEImplementation.block_config(self, problem)` for a compute-only impl:
+
+```python
+from .routing_stats import BlockConfig
+
+    def block_config(self) -> BlockConfig:
+        return BlockConfig(
+            block_m=MY_ROW_BLOCK,               # padding / M-tile granularity
+            desc="my kernel's ROW_BLOCK",       # where the number comes from
+            detail=f"P={self.padded_total}",    # optional: tile shapes, knobs
+            padded_rows=self.padded.tolist(),   # optional: per-expert padded rows
+            block_slack=self.slack.tolist(),    # optional: padding rows per block
+        )
+```
+
+`padded_rows` / `block_slack` are what make the printed layout exact rather than
+inferred: without them the harness assumes the canonical
+`ceil(count / block_m)` layout, which is wrong for any implementation that
+splits an expert across several segments (e.g. `TK_LOCAL_FIRST`). The default
+implementation returns `None` and the line prints `n/a`, so this is entirely
+optional.
+
 ## Correctness is checked automatically
 
 Because every implementation sees byte-identical inputs, the harness verifies

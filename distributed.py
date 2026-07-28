@@ -32,6 +32,11 @@ from .context import DistContext
 from .data import make_golden_problem, make_logical_weights, make_problem, make_weights
 from .reference import reference_moe, verify_output
 from .report import print_report, write_json
+from .routing_stats import (
+    enabled as routing_stats_enabled,
+    expert_token_counts,
+    print_routing_stats,
+)
 from .schemes import DistributedScheme, get_scheme
 
 
@@ -104,6 +109,24 @@ def _run_rank(
         problem = make_problem(config, num_tokens, rank=ctx.rank, weights=weights)
         scheme = get_scheme(scheme_name)
         scheme.setup(problem, ctx)
+
+        # 路由分布 + BLOCK 布局(计时区外)。counts 取全局口径 —— 每张卡都要算
+        # 整批 gathered token, 所以 all-reduce 要**所有 rank 参与**, 打印只在
+        # rank 0 出一份。
+        if routing_stats_enabled():
+            counts = expert_token_counts(
+                problem.topk_ids, config.num_experts, group=ctx.group
+            )
+            if ctx.is_rank0:
+                total_tokens = num_tokens * ctx.world_size
+                print_routing_stats(
+                    counts,
+                    scheme.block_config(),
+                    f"{scheme_name} (distributed), E={config.num_experts}, "
+                    f"topk={config.topk}, T={num_tokens}/rank × {ctx.world_size} "
+                    f"= {total_tokens} tokens, "
+                    f"dist={config.routing.distribution.value}",
+                )
 
         stats = _time_scheme(scheme, config)
 

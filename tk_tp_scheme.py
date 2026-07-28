@@ -32,6 +32,7 @@ import torch
 from .config import ParallelMode
 from .context import DistContext
 from .data import MoEProblem
+from .routing_stats import BlockConfig
 from .schemes import DistributedScheme
 
 # 每个 GEMM tile 的 token 行数, 同时是 expert 的 padding 单位。必须与
@@ -588,6 +589,27 @@ class TKFusedTP(DistributedScheme):
                                                   str(self.num_comm_sms)))
         self._l0_seq = 0
         self._l1_seq = 0
+
+    def block_config(self) -> BlockConfig:
+        """行维 BLOCK 口径 = kernel 的 ``ROW_BLOCK``(见模块顶部常量)。
+
+        块布局不从 counts 反推, 直接交出调度表本身: ``padded`` 是每 expert 补
+        齐后的行数, ``slack`` 是每个行块的 padding 行数。local_first 下一个
+        expert 占两段(本地段 + 其余), 只有这两张表才是真实布局。
+        """
+        return BlockConfig(
+            block_m=ROW_BLOCK,
+            desc="TK kernel ROW_BLOCK = expert padding 单位 = GEMM 的 M tile",
+            detail=(
+                f"P(gathered rows)={self.num_padded_total} "
+                f"L0 GEMM N={2 * self.inter} K={self.H} | "
+                f"L1 GEMM N={self.H} K={self.inter}, "
+                f"two_level={self.two_level} local_first={self.local_first}"
+                + (f"(thr5={self.local_seg_thr5})" if self.local_first else "")
+            ),
+            padded_rows=self.padded.tolist(),
+            block_slack=self.slack.tolist(),
+        )
 
     def _sched_torch_call(self):
         """torch 向量化调度表构建(preflight 已裁决其与 host golden 一致)。"""

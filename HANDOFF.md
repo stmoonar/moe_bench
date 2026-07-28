@@ -3,6 +3,41 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
+## 2026-07-28：每次运行打印"每 expert token 数 + BLOCK 配置"（工具改动，不改任何结论，⚠ 未上机）
+
+新增 `moe_bench/routing_stats.py`，三个入口（`bench.py` 单卡 / `distributed.py`
+分布式 / `tools/time_tp_stages.py`）都在 `setup()` 之后、计时之前打印一屏：
+
+```
+== 路由 / BLOCK 布局 (tktp (distributed), E=64, topk=8, T=512/rank × 4 = 2048 tokens, dist=uniform) ==
+  每 expert token 数 (assignments=16384, min=206, max=288, mean=256.0, max/mean=1.12x):
+    [264, 249, 260, 254, 286, ... 共 E 个 ...]
+  BLOCK 配置: BLOCK_M=128 (TK kernel ROW_BLOCK = expert padding 单位 = GEMM 的 M tile; ...)
+  每 expert BLOCK 数 (blocks=163, padded_rows=20864, padding=4480 行 +27.3%, 尾块 64 (其中半块 35, 空块 0)):
+    [3, 2, 3, 2, 3, 2, ... 共 E 个 ...]
+```
+
+- counts 是 **assignment** 数（不是 token 数），分布式下取**全局**口径（一次
+  all-reduce），与 `tk_tp_scheme` 建表的 `bincount(all_topk)` 同源。
+- `BLOCK_M` 由实现自报（新接口 `DistributedScheme.block_config()` /
+  `MoEImplementation.block_config(problem)`，默认 `None` → 打 `n/a`）：`tktp`
+  报 `ROW_BLOCK` 并**直接交出调度表**（`padded` + `slack`），所以
+  `TK_LOCAL_FIRST` 的分段布局也是精确值而不是 `ceil(counts/128)` 猜的；`serial`
+  报 vLLM triton 的 `BLOCK_SIZE_M`，并标明"查表/兜底"还是"兜底(未查表)"——
+  `VLLM_TUNED_CONFIG_FOLDER` 挂没挂现在一眼可见（docs/08 §6 那个长期口径问题）。
+- padding 行数 / 尾块 / 半块就是 docs/09 粒度税的原始数据，半块 = 两级 tile 的受益块。
+- 关闭：`MOE_BENCH_ROUTING_STATS=0`。打印和那次 all-reduce 都在计时区外。
+- 读法与新实现的接入方式：[docs/05 §7](docs/05_测试与调试指南.md)、
+  `ADDING_IMPLEMENTATIONS.md`。
+
+**验证状态**：开发机（Windows，无 CUDA/vLLM）上跑了三组离线验证——统计与格式化
+逐项对拍（balanced/uniform/local_first 分段/空 expert）、vLLM config 探测的三条
+分支（stub 顶掉 vllm，含签名不兼容退兜底、两条都没有返回 None）、接线检查（真
+import 全包验无循环、AST 核对 `block_config` 只读 `setup` 赋过的属性、打印点在
+`setup` 之后计时之前）。**GPU 上一次都没跑过**，上机第一件事是跑一次
+`run_tktp --scheme tktp` 和一次 `--scheme serial` 看这一屏是否正常打印、
+serial 的 BLOCK_SIZE_M 是否与 docs/08 §6 记录的兜底值 64 一致。
+
 ## 最新（2026-07-27 深夜 11）：uniform 归因**已实测坐实** + EPIRED 二次判负（docs/15 §4）
 
 四档分阶段实测（卡组 0-3，iters=20）把 docs/15 的假说钉死了，且比模型预测更彻底：
