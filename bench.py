@@ -30,7 +30,7 @@ from .config import (
 from .data import MoEProblem, make_problem, make_weights
 from .reference import reference_moe, verify_output
 from .report import print_report, write_json
-from .routing_stats import expert_token_counts, print_routing_stats
+from .routing_stats import expert_token_counts, print_expert_tokens
 
 # Invocations captured per CUDA graph. Replaying a bundle and dividing
 # amortizes the fixed graph-launch overhead out of the per-op number
@@ -113,15 +113,13 @@ def run_sweep(
         problem = make_problem(config, num_tokens, rank=0, weights=weights)
         impl.setup(problem)
 
-        # 路由分布 + BLOCK 布局(计时区外)。单卡 compute-only 口径, counts 就是
+        # 每 expert 的 token 数(计时区外)。单卡 compute-only 口径, counts 就是
         # 这份 token shard 自己的。
-        print_routing_stats(
+        print_expert_tokens(
             expert_token_counts(
                 problem.topk_ids, config.num_experts, global_counts=False
             ),
-            impl.block_config(problem),
-            f"{impl.name}, E={config.num_experts}, topk={config.topk}, "
-            f"T={num_tokens}, dist={config.routing.distribution.value}",
+            f"{impl.name}, E={config.num_experts}, T={num_tokens}",
         )
 
         # Compute the ground-truth output once, up front, before timing — so the

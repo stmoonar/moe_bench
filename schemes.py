@@ -35,7 +35,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 from .config import ParallelMode
 from .context import DistContext
 from .data import MoEProblem
-from .routing_stats import BlockConfig, vllm_triton_block_config
 
 
 class DistributedScheme(ABC):
@@ -57,14 +56,6 @@ class DistributedScheme(ABC):
     def run(self) -> torch.Tensor:
         """Full layer on this rank; returns ``(num_tokens, hidden)``."""
         raise NotImplementedError
-
-    def block_config(self) -> BlockConfig | None:
-        """本 scheme 计算用的行(token)维 BLOCK 口径, 供每次运行前打印。
-
-        调用发生在 :meth:`setup` 之后、计时之前。返回 ``None`` = 该实现没有
-        (或报不出)固定的行维 tile 粒度, 打印时记 n/a。
-        """
-        return None
 
     def close(self) -> None:
         """Optional teardown (free streams/buffers)."""
@@ -150,12 +141,6 @@ class SerialNaive(DistributedScheme):
         # --- combine: ReduceScatter per-token results back to each rank ---
         dist.reduce_scatter_tensor(self.output, result, group=group)
         return self.output
-
-    def block_config(self) -> BlockConfig | None:
-        # fused_experts 吃的是 AllGather 之后的整批, M = world_size × T。
-        return vllm_triton_block_config(
-            self.problem, self.problem.num_tokens * self.ctx.world_size
-        )
 
 
 # Registry of distributed schemes, keyed by ``--scheme`` name.

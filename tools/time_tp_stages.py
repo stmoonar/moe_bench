@@ -42,7 +42,7 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
     from moe_bench.routing_stats import (
         enabled as routing_stats_enabled,
         expert_token_counts,
-        print_routing_stats,
+        print_expert_tokens,
     )
     from moe_bench.tk_tp_scheme import TKFusedTP
 
@@ -59,16 +59,13 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
     s = TKFusedTP()
     s.setup(problem, ctx)
 
-    # 路由分布 + BLOCK 布局。counts 是全局口径, all-reduce 要所有 rank 参与,
+    # 每 expert 的 token 数。counts 是全局口径, all-reduce 要所有 rank 参与,
     # 打印只在 rank 0。
     if routing_stats_enabled():
         counts = expert_token_counts(problem.topk_ids, cfg.num_experts)
         if rank == 0:
-            print_routing_stats(
-                counts, s.block_config(),
-                f"tktp stages, E={ne}, topk={cfg.topk}, T={tokens}/rank × "
-                f"{world} = {tokens * world} tokens, "
-                f"dist={cfg.routing.distribution.value}")
+            print_expert_tokens(
+                counts, f"tktp, E={ne}, T={tokens}/rank × {world}")
 
     # scratch for GEMM-alone references (same shapes as the fused calls)
     ref_gateup = torch.empty(s.num_padded_total, 2 * s.inter, device=device,

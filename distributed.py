@@ -35,7 +35,7 @@ from .report import print_report, write_json
 from .routing_stats import (
     enabled as routing_stats_enabled,
     expert_token_counts,
-    print_routing_stats,
+    print_expert_tokens,
 )
 from .schemes import DistributedScheme, get_scheme
 
@@ -110,7 +110,7 @@ def _run_rank(
         scheme = get_scheme(scheme_name)
         scheme.setup(problem, ctx)
 
-        # 路由分布 + BLOCK 布局(计时区外)。counts 取全局口径 —— 每张卡都要算
+        # 每 expert 的 token 数(计时区外)。counts 取全局口径 —— 每张卡都要算
         # 整批 gathered token, 所以 all-reduce 要**所有 rank 参与**, 打印只在
         # rank 0 出一份。
         if routing_stats_enabled():
@@ -118,14 +118,10 @@ def _run_rank(
                 problem.topk_ids, config.num_experts, group=ctx.group
             )
             if ctx.is_rank0:
-                total_tokens = num_tokens * ctx.world_size
-                print_routing_stats(
+                print_expert_tokens(
                     counts,
-                    scheme.block_config(),
-                    f"{scheme_name} (distributed), E={config.num_experts}, "
-                    f"topk={config.topk}, T={num_tokens}/rank × {ctx.world_size} "
-                    f"= {total_tokens} tokens, "
-                    f"dist={config.routing.distribution.value}",
+                    f"{scheme_name}, E={config.num_experts}, "
+                    f"T={num_tokens}/rank × {ctx.world_size}",
                 )
 
         stats = _time_scheme(scheme, config)
