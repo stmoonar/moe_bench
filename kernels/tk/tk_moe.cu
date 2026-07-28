@@ -1268,6 +1268,541 @@ void sched_build_entry(const at::Tensor &packed_all, at::Tensor &padded,
 }
 } // namespace tpsched
 
+/* ===================================================================== *
+ * 7. TD 风格 TP 复刻(tktd, docs/17): 用 TK/PK 原语按 Triton-distributed
+ *    tp_moe 的通算融合逻辑重组 L0/L1。与 tktp(第 3/5 节)的差别只在
+ *    "调度策略层", 数据面原语(TMA push / pcie_sync / gg8 引擎)完全同源:
+ *
+ *    L0(tdag): AG producer 是**独立 kernel、独立 stream**(TD 的 producer
+ *      stream), push 按朴素 token 序、到达信号是 per-src-rank 段 flag
+ *      (TD 的 per-segment barrier, 非 tktp 的 per-token flag); 收侧 scatter
+ *      也在 producer kernel 里, 散完一个 src 的整个分片才发本地 ready flag。
+ *      GEMM kernel 只算不通信(grid = sm - comm_sms), 每个行块 gate 在它
+ *      真实行覆盖的 src 区间 [blk_lo, blk_hi] 的 ready flag 上(TD 的
+ *      dl.wait(segment_start..end)——但换成**有界**自旋, 红线 2), 发放序
+ *      row_perm 按"最晚就绪段"排(TD 的 threadblock swizzle: 本 rank 数据
+ *      的 tile 先算)。
+ *    L1(tdrs): W2 GEMM 按 N-chunk-major 任务序推进(dispenser CHUNKED
+ *      模板参数), 每个 chunk 的全部 tile 完成后发本地 chunk_done 信号
+ *      (TD 的 per-N-chunk gemm_done_flag); 独立 stream 上的 reduce-RS
+ *      kernel 逐 chunk 追赶: 等 chunk flag -> 本地 top-k 加权归约该列窗
+ *      -> 向量 st 直推源卡 staging(TD 的 reduce_topk + RS on reduce_stream;
+ *      RS 数据面与 TD 相同是向量 store, 非 TMA 整行)。最终归约复用
+ *      moe_final_reduce_push。
+ *
+ *    已知代价(docs/04 已判负的形态, 这里是刻意复刻做 A/B 归因): L0 粗粒度
+ *    段 gate 让大多数 tile 等整个 AG(docs/03 ring-by-source 教训); L1
+ *    N 维分解 = Comet-N。见 docs/17 的账。
+ * ===================================================================== */
+namespace tdag {
+struct prod_globals {
+    using cfg = gemm_config_fp8;
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    static constexpr int TOP_K = 8;
+    static constexpr int NSC = H / 128;
+    using token_vec = sv_fp8e4m3<H>;
+    using scale_vec = sv_fl<NSC>;
+    static constexpr int SLOTS = 20;             // 每 comm 块 in-flight 槽数
+    using pre_tokens_pgl = pgl<gl<fp8e4m3, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
+    using pre_scales_pgl = pgl<gl<float, 1, 1, -1, NSC, scale_vec>, NUM_DEVICES, false>;
+    using gathered_gl    = gl<fp8e4m3, 1, 1, -1, H, token_vec>;
+    using gscales_gl     = gl<float, 1, 1, -1, NSC, scale_vec>;
+    using slots_gl       = gl<int, 1, 1, -1, TOP_K>;
+    using order_gl       = gl<int, 1, 1, 1, -1>;
+    using barrier_pgl    = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    pre_tokens_pgl pre_tokens;
+    pre_scales_pgl pre_scales;
+    pre_tokens_pgl ag_staging;    // peer 可写 (S, H), plane s = 源 s 单写者
+    pre_scales_pgl ag_sscales;
+    gathered_gl gathered;         // 本地 expert-major 落地
+    gscales_gl g_scales;
+    slots_gl tp_slots;
+    order_gl pull_order;          // TD 序: (ring_dist(src), tok) 升序
+    barrier_pgl barrier;          // row 0 = 段到达(远端写, col=src), row 1 =
+                                  // pcie_barrier_all, row 2 = 段 ready(本地写)
+    const int dev_idx;
+    const int num_tokens;
+    const int s_max;              // world * T
+    const int num_push_sms;
+    const int seq;
+};
+/* push: 朴素 token 序把本 rank 分片推满 3 个 peer 的 staging plane; 全部
+ * 推达后由计数选举的唯一 lane 给每个 dest 发一个 per-src 段到达 flag
+ * (TD 的 per-segment barrier)。lane 级 store_async_wait + fence_sys 在
+ * acq_rel 计数之前 → elect 的 release 信号经计数链传递所有 lane 的写序
+ * (与 tppr8 push_retire_one + watermark 同构, 已在产)。 */
+__device__ inline void push_lane_td(const prod_globals &G, int *__restrict__ push_next,
+                                    int *__restrict__ push_done,
+                                    typename prod_globals::token_vec &tok,
+                                    typename prod_globals::scale_vec &sc, semaphore &sem) {
+    int phase = 0;
+    while (true) {
+        const int t = atomicAdd(push_next, 1);
+        if (t >= G.num_tokens) return;
+        tma::expect_bytes(sem, sizeof(typename prod_globals::token_vec) +
+                               sizeof(typename prod_globals::scale_vec));
+        tma_cta::load_async(tok, G.pre_tokens[G.dev_idx], {t, 0}, sem);
+        tma_cta::load_async(sc, G.pre_scales[G.dev_idx], {t, 0}, sem);
+        pcie_sync::guarded_wait(sem, phase);
+        phase ^= 1;
+        const int d = G.dev_idx * G.num_tokens + t;
+        #pragma unroll
+        for (int dst = 0; dst < prod_globals::NUM_DEVICES; dst++) {
+            if (dst == G.dev_idx) continue;
+            tma::store_async(G.ag_staging[dst], tok, {d, 0});
+            tma::store_async(G.ag_sscales[dst], sc, {d, 0});
+        }
+        tma::store_async_wait();
+        __threadfence_system();
+        int old;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(old) : "l"(push_done) : "memory");
+        if (old + 1 == G.num_tokens) {
+            #pragma unroll
+            for (int dst = 0; dst < prod_globals::NUM_DEVICES; dst++) {
+                if (dst == G.dev_idx) continue;
+                pcie_sync::signal_slot(G.barrier, dst, 0, G.dev_idx, G.seq);
+            }
+        }
+    }
+}
+/* scatter: 按 pull_order(本 rank 先, 再按 ring 距离)领 token。远端 token 只
+ * 等 per-src 段到达 flag(粗粒度, TD 语义); 散完某 src 的全部 T 个 token 后
+ * 由计数选举写本地 ready flag, GEMM gate 消费。 */
+__device__ inline void scatter_lane_td(const prod_globals &G, int *__restrict__ pull_next,
+                                       int *__restrict__ scattered_cnt,
+                                       typename prod_globals::token_vec &tok,
+                                       typename prod_globals::scale_vec &sc, semaphore &sem) {
+    int phase = 0;
+    while (true) {
+        const int i = atomicAdd(pull_next, 1);
+        if (i >= G.s_max) return;
+        const int d = G.pull_order[{i}];
+        const int src = d / G.num_tokens;
+        const int t = d - src * G.num_tokens;
+        if (src != G.dev_idx) {       // 段到达: 本地 acquire 有界自旋(红线 2)
+            int v;
+            PCIE_SPIN_GUARD_DECL;
+            do {
+                asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
+                             : "=r"(v) : "l"(&G.barrier[G.dev_idx][{0, src}]) : "memory");
+                if (v < G.seq) { __nanosleep(64); PCIE_SPIN_GUARD_TICK; }
+            } while (v < G.seq);
+        }
+        tma::expect_bytes(sem, sizeof(typename prod_globals::token_vec) +
+                               sizeof(typename prod_globals::scale_vec));
+        if (src == G.dev_idx) {       // 自己分片直读(免 staging 一跳)
+            tma_cta::load_async(tok, G.pre_tokens[src], {t, 0}, sem);
+            tma_cta::load_async(sc, G.pre_scales[src], {t, 0}, sem);
+        } else {
+            tma_cta::load_async(tok, G.ag_staging[G.dev_idx], {d, 0}, sem);
+            tma_cta::load_async(sc, G.ag_sscales[G.dev_idx], {d, 0}, sem);
+        }
+        pcie_sync::guarded_wait(sem, phase);
+        phase ^= 1;
+        #pragma unroll
+        for (int k = 0; k < prod_globals::TOP_K; k++) {
+            const int s = G.tp_slots[{d, k}];
+            if (s >= 0) {
+                tma::store_async(G.gathered, tok, {s, 0});
+                tma::store_async(G.g_scales, sc, {s, 0});
+            }
+        }
+        tma::store_async_wait();
+        __threadfence();
+        int old;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(old) : "l"(&scattered_cnt[src]) : "memory");
+        if (old + 1 == G.num_tokens)
+            asm volatile("st.release.gpu.global.s32 [%0], %1;"
+                         :: "l"(&G.barrier[G.dev_idx][{2, src}]), "r"(G.seq) : "memory");
+    }
+}
+__global__ __launch_bounds__(256)
+void producer_kernel(const __grid_constant__ prod_globals G,
+                     int *__restrict__ push_next, int *__restrict__ pull_next,
+                     int *__restrict__ push_done, int *__restrict__ scattered_cnt) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename prod_globals::token_vec (&tok)[prod_globals::SLOTS] =
+        al.allocate<typename prod_globals::token_vec, prod_globals::SLOTS>();
+    typename prod_globals::scale_vec (&sc)[prod_globals::SLOTS] =
+        al.allocate<typename prod_globals::scale_vec, prod_globals::SLOTS>();
+    __shared__ semaphore arrived[prod_globals::SLOTS];
+    const bool is_slot = (threadIdx.x % 8 == 0) &&
+                         (threadIdx.x / 8 < prod_globals::SLOTS);
+    const int slot = threadIdx.x / 8;
+    if (is_slot)
+        init_semaphore(arrived[slot], 0, 1);
+    __syncthreads();
+    if (is_slot) {
+        if (blockIdx.x < G.num_push_sms)
+            push_lane_td(G, push_next, push_done, tok[slot], sc[slot], arrived[slot]);
+        else
+            scatter_lane_td(G, pull_next, scattered_cnt, tok[slot], sc[slot], arrived[slot]);
+    }
+}
+struct gemm_globals {
+    using cfg = gemm_config_fp8;
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    using activations_gl = gl<fp8e4m3, 1, 1, -1, H, cfg::A_tile, cfg::A_tail_tile>;
+    using a_scales_gl    = gl<float, 1, 1, -1, -1>;
+    using weights_gl     = gl<fp8e4m3, 1, -1, -1, -1, cfg::B_tile>;
+    using w_scales_gl    = gl<float, 1, -1, -1, -1>;
+    using outputs_gl     = gl<bf16, 1, 1, -1, -1>;
+    using counts_gl      = gl<int, 1, 1, 1, -1>;
+    using barrier_pgl    = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    activations_gl activations;
+    a_scales_gl a_scales;
+    weights_gl weights;
+    w_scales_gl w_scales;
+    outputs_gl outputs;
+    counts_gl padded_tokens_per_expert;
+    const int num_local_experts;
+    const int expert_offset;
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int seq;
+    const int no_gate;      // 探针(TKTD_L0_NOGATE): 跳过段等待, 数值是错的
+};
+/* TD 的 dl.wait(segment_start..segment_end) 等价物: 行块的真实行覆盖 src
+ * 区间 [blk_lo, blk_hi], 逐段等本地 ready flag(有界自旋, 红线 2)。 */
+struct seg_gate {
+    const gemm_globals &G;
+    const int *__restrict__ blk_lo;
+    const int *__restrict__ blk_hi;
+    __device__ inline void operator()(int row_idx) const {
+        if (G.no_gate) return;
+        const int lo = blk_lo[row_idx], hi = blk_hi[row_idx];
+        for (int s = lo; s <= hi; s++) {
+            int v;
+            PCIE_SPIN_GUARD_DECL;
+            do {
+                asm volatile("ld.acquire.gpu.global.s32 %0, [%1];"
+                             : "=r"(v) : "l"(&G.barrier[G.dev_idx][{2, s}]) : "memory");
+                if (v < G.seq) { __nanosleep(32); PCIE_SPIN_GUARD_TICK; }
+            } while (v < G.seq);
+        }
+    }
+};
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void gemm_kernel(const __grid_constant__ gemm_globals G, const int *__restrict__ blk_expert,
+                 const int *__restrict__ blk_lo, const int *__restrict__ blk_hi,
+                 const int *__restrict__ row_perm, int *__restrict__ task_next,
+                 const int num_tasks, const int *__restrict__ blk_slack) {
+    grouped_gemm_sm120_fp8_dispenser(
+        G, seg_gate{G, blk_lo, blk_hi}, noop_epilogue{},
+        glu_store_policy<gemm_globals::outputs_gl>{G.outputs},
+        blk_expert, task_next, num_tasks, blk_slack, row_perm);
+}
+void producer_entry(kittens::py::TKParallelTensor &pre_tokens,
+                    kittens::py::TKParallelTensor &pre_scales,
+                    kittens::py::TKParallelTensor &ag_staging,
+                    kittens::py::TKParallelTensor &ag_sscales,
+                    at::Tensor &gathered, at::Tensor &gathered_scales,
+                    at::Tensor &tp_slots, at::Tensor &pull_order,
+                    kittens::py::TKParallelTensor &barrier,
+                    at::Tensor &push_next, at::Tensor &pull_next,
+                    at::Tensor &push_done, at::Tensor &scattered_cnt,
+                    const int num_comm_sms, const int num_push_sms,
+                    const int num_tokens, const int seq) {
+    const int dev_idx = barrier.local_rank_;
+    const int s_max = static_cast<int>(tp_slots.size(0));
+    TORCH_CHECK(s_max == prod_globals::NUM_DEVICES * num_tokens, "tp_slots rows must be world*T");
+    TORCH_CHECK(ag_staging.data_.size(0) == s_max, "ag_staging rows must be world*T");
+    TORCH_CHECK(pull_order.numel() == s_max, "pull_order must cover world*T");
+    TORCH_CHECK(gathered_scales.size(1) == prod_globals::NSC, "gathered_scales (P, H/128)");
+    TORCH_CHECK(push_next.numel() == 1 && pull_next.numel() == 1 && push_done.numel() == 1,
+                "counters");
+    TORCH_CHECK(scattered_cnt.numel() == prod_globals::NUM_DEVICES,
+                "scattered_cnt must be (world,)");
+    TORCH_CHECK(barrier.data_.size(0) >= 3 &&
+                barrier.data_.size(1) >= prod_globals::NUM_DEVICES,
+                "barrier needs rows {0=arrival,1=device barrier,2=ready}");
+    TORCH_CHECK(num_push_sms >= 1 && num_push_sms < num_comm_sms,
+                "need >=1 push SM and >=1 scatter SM");
+    prod_globals G {
+        .pre_tokens = kittens::py::parallel_tensor_to_pgl<prod_globals::pre_tokens_pgl>(pre_tokens),
+        .pre_scales = kittens::py::parallel_tensor_to_pgl<prod_globals::pre_scales_pgl>(pre_scales),
+        .ag_staging = kittens::py::parallel_tensor_to_pgl<prod_globals::pre_tokens_pgl>(ag_staging),
+        .ag_sscales = kittens::py::parallel_tensor_to_pgl<prod_globals::pre_scales_pgl>(ag_sscales),
+        .gathered = kittens::py::tensor_to_gl<prod_globals::gathered_gl>(gathered),
+        .g_scales = kittens::py::tensor_to_gl<prod_globals::gscales_gl>(gathered_scales),
+        .tp_slots = kittens::py::tensor_to_gl<prod_globals::slots_gl>(tp_slots),
+        .pull_order = kittens::py::tensor_to_gl<prod_globals::order_gl>(pull_order),
+        .barrier = kittens::py::parallel_tensor_to_pgl<prod_globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_tokens = num_tokens, .s_max = s_max,
+        .num_push_sms = num_push_sms, .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const int smem = prod_globals::SLOTS *
+        (sizeof(prod_globals::token_vec) + sizeof(prod_globals::scale_vec)) + 2048;
+    CUDACHECK(cudaFuncSetAttribute(producer_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    producer_kernel<<<num_comm_sms, 256, smem, stream>>>(
+        G, push_next.data_ptr<int>(), pull_next.data_ptr<int>(),
+        push_done.data_ptr<int>(), scattered_cnt.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+}
+void gemm_entry(at::Tensor &gathered, at::Tensor &gathered_scales,
+                at::Tensor &weights, at::Tensor &w_scales, at::Tensor &act,
+                at::Tensor &padded_tokens_per_expert, at::Tensor &blk_expert,
+                at::Tensor &blk_lo, at::Tensor &blk_hi, at::Tensor &row_perm,
+                at::Tensor &gemm_next, kittens::py::TKParallelTensor &barrier,
+                const int num_comm_sms, const int num_padded_local_tokens,
+                const int seq, at::Tensor &slack, const int two_level,
+                const int no_gate) {
+    using cfg = gemm_config_fp8;
+    const int dev_idx = barrier.local_rank_;
+    TORCH_CHECK(weights.size(2) == gemm_globals::H, "w1 (E,N,K) K must be H");
+    TORCH_CHECK(act.size(1) == weights.size(1) / 2, "act width must be N/2 (GLU)");
+    const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk && blk_lo.size(0) == nblk &&
+                blk_hi.size(0) == nblk && row_perm.size(0) == nblk,
+                "blk tables per row block");
+    TORCH_CHECK(slack.size(0) == nblk && slack.scalar_type() == at::kInt, "slack int32");
+    TORCH_CHECK(gemm_next.numel() == 1, "counter");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_comm_sms < sm, "num_comm_sms must leave room for compute");
+    const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
+    gemm_globals G {
+        .activations = kittens::py::tensor_to_gl<gemm_globals::activations_gl>(gathered),
+        .a_scales = kittens::py::tensor_to_gl<gemm_globals::a_scales_gl>(gathered_scales),
+        .weights = kittens::py::tensor_to_gl<gemm_globals::weights_gl>(weights),
+        .w_scales = kittens::py::tensor_to_gl<gemm_globals::w_scales_gl>(w_scales),
+        .outputs = kittens::py::tensor_to_gl<gemm_globals::outputs_gl>(act),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<gemm_globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = static_cast<int>(weights.size(0)),
+        .expert_offset = 0,
+        .barrier = kittens::py::parallel_tensor_to_pgl<gemm_globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .seq = seq, .no_gate = no_gate
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    gemm_kernel<<<sm - num_comm_sms, cfg::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), blk_lo.data_ptr<int>(), blk_hi.data_ptr<int>(),
+        row_perm.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+        two_level ? slack.data_ptr<int>() : nullptr);
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace tdag
+
+namespace tdrs {
+/* per-N-chunk 完成信号(TD 的 gemm_done_flag): 每 tile 记账一次, chunk 的
+ * 全部 tile(nblk * chunk_cols)写完后由计数选举写本地 chunk_done[c] = seq。
+ * 与 tppr8::signal_epilogue 同构(fence + 组 sync + warp0 lane0 计数)。 */
+struct chunk_signal_epilogue {
+    int *__restrict__ chunk_cnt;
+    int *__restrict__ chunk_done;
+    const int chunk_cols;
+    const int tasks_per_chunk;
+    const int seq;
+    __device__ inline void operator()(int row_idx, int col_idx) const {
+        (void)row_idx;
+        __threadfence();
+        kittens::group<gemm_config_fp8::CONSUMER_WARPS>::sync(1);
+        if (kittens::laneid() != 0 || kittens::warpid() != 0) return;
+        const int c = col_idx / chunk_cols;
+        int done;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(done) : "l"(&chunk_cnt[c]) : "memory");
+        if (done + 1 == tasks_per_chunk)
+            asm volatile("st.release.gpu.global.s32 [%0], %1;"
+                         :: "l"(&chunk_done[c]), "r"(seq) : "memory");
+    }
+};
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void gemm_nchunk_kernel(const __grid_constant__ gg8::globals G,
+                        const int *__restrict__ blk_expert, int *__restrict__ task_next,
+                        const int num_tasks, const int *__restrict__ blk_slack,
+                        int *__restrict__ chunk_cnt, int *__restrict__ chunk_done,
+                        const int chunk_cols, const int tasks_per_chunk, const int seq) {
+    grouped_gemm_sm120_fp8_dispenser<true, true>(
+        G, gg8::no_gate{},
+        chunk_signal_epilogue{chunk_cnt, chunk_done, chunk_cols, tasks_per_chunk, seq},
+        plain_store_policy<gg8::globals::outputs_gl>{G.outputs},
+        blk_expert, task_next, num_tasks, blk_slack, nullptr, chunk_cols);
+}
+struct rs_globals {
+    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int H = TK_HIDDEN;
+    static constexpr int TOP_K = 8;
+    using outputs_gl  = gl<bf16, 1, 1, -1, H>;          // expert_out (P, H)
+    using slots_gl    = gl<int, 1, 1, -1, TOP_K>;       // tp_slots (S, 8)
+    using w_gl        = gl<float, 1, 1, -1, TOP_K>;     // prered_w (S, 8)
+    using staging_pgl = pgl<gl<bf16, 1, 1, -1, H>, NUM_DEVICES, false>;
+    using barrier_pgl = pgl<gl<int, 1, 1, -1, -1>, NUM_DEVICES, false>;
+    outputs_gl expert_out;
+    slots_gl slots;
+    w_gl w;
+    staging_pgl staging;
+    barrier_pgl barrier;
+    const int dev_idx;
+    const int num_source_tokens;   // T
+    const int num_jobs;            // S = world*T
+    const int n_chunks;
+    const int chunk_elems;         // H / n_chunks
+    const int seq;
+};
+/* TD 的 reduce_topk + reduce_scatter on reduce_stream: 逐 chunk 等 GEMM 的
+ * chunk_done, 对每个 job 做该列窗的本地 top-k 加权归约, 向量 st 直推源卡
+ * combine staging(与 TD 相同的向量 store 数据面, 每 (job, chunk) 一段
+ * chunk_elems*2B 连续写)。job 按 blockIdx 静态划分(无原子, 各 chunk 同一
+ * 划分)。全部 chunk 完成后计数选举, 给每张源卡发 watermark(供
+ * moe_final_reduce_push 消费, 协议与 tktp L1 相同)。 */
+__global__ __launch_bounds__(256)
+void reduce_rs_kernel(const __grid_constant__ rs_globals G,
+                      const int *__restrict__ chunk_done, int *__restrict__ done_blocks) {
+    constexpr int VEC = 8;
+    for (int c = 0; c < G.n_chunks; c++) {
+        if (threadIdx.x == 0) {     // chunk 门: 本地有界自旋(红线 2)
+            int v;
+            PCIE_SPIN_GUARD_DECL;
+            do {
+                asm volatile("ld.acquire.gpu.global.s32 %0, [%1];"
+                             : "=r"(v) : "l"(&chunk_done[c]) : "memory");
+                if (v < G.seq) { __nanosleep(64); PCIE_SPIN_GUARD_TICK; }
+            } while (v < G.seq);
+        }
+        __syncthreads();
+        const int col0 = c * G.chunk_elems;
+        const int cvec = G.chunk_elems / VEC;
+        for (int j = blockIdx.x; j < G.num_jobs; j += gridDim.x) {
+            const int dst = j / G.num_source_tokens;
+            const int tok = j - dst * G.num_source_tokens;
+            const int row = G.dev_idx * G.num_source_tokens + tok;
+            __shared__ int s_slot[rs_globals::TOP_K];
+            __shared__ float s_w[rs_globals::TOP_K];
+            if (threadIdx.x < rs_globals::TOP_K) {
+                s_slot[threadIdx.x] = G.slots[{j, threadIdx.x}];
+                s_w[threadIdx.x] = G.w[{j, threadIdx.x}];
+            }
+            __syncthreads();
+            bf16 *out_row = &G.staging[dst][{row, col0}];
+            float4 *out_v = reinterpret_cast<float4 *>(out_row);
+            for (int cv = threadIdx.x; cv < cvec; cv += blockDim.x) {
+                float acc[VEC];
+                #pragma unroll
+                for (int i = 0; i < VEC; i++) acc[i] = 0.0f;
+                #pragma unroll
+                for (int k = 0; k < rs_globals::TOP_K; k++) {
+                    const int slot = s_slot[k];
+                    if (slot < 0) continue;
+                    const float wk = s_w[k];
+                    const bf16 *e_row = &G.expert_out[{slot, col0}];
+                    const float4 packed = reinterpret_cast<const float4 *>(e_row)[cv];
+                    const bf16_2 *pv = reinterpret_cast<const bf16_2 *>(&packed);
+                    #pragma unroll
+                    for (int jj = 0; jj < VEC / 2; jj++) {
+                        float2 f = __bfloat1622float2(pv[jj]);
+                        acc[2*jj] += wk * f.x; acc[2*jj+1] += wk * f.y;
+                    }
+                }
+                bf16_2 res[VEC / 2];
+                #pragma unroll
+                for (int jj = 0; jj < VEC / 2; jj++)
+                    res[jj] = __floats2bfloat162_rn(acc[2*jj], acc[2*jj+1]);
+                out_v[cv] = *reinterpret_cast<const float4 *>(res);
+            }
+            __syncthreads();   // 下一 job 复用 s_slot/s_w 前, 本 job 读完
+        }
+        __syncthreads();
+    }
+    // 完成选举: 每块 fence_sys + acq_rel 计数, 最后一块给每张源卡发 watermark
+    // (含自己)。release-acquire 链传递所有块的远端写序(同 push_retire_one)。
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        int old;
+        asm volatile("{atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;}"
+                     : "=r"(old) : "l"(done_blocks) : "memory");
+        if (old + 1 == gridDim.x) {
+            #pragma unroll
+            for (int s = 0; s < rs_globals::NUM_DEVICES; s++)
+                pcie_sync::signal_slot(G.barrier, s, 2 + G.dev_idx, 0, G.seq);
+        }
+    }
+}
+void gemm_nchunk_entry(at::Tensor &act_fp8, at::Tensor &act_scales,
+                       at::Tensor &weights, at::Tensor &w_scales,
+                       at::Tensor &expert_outputs, at::Tensor &padded_tokens_per_expert,
+                       at::Tensor &blk_expert, at::Tensor &gemm_next,
+                       at::Tensor &chunk_cnt, at::Tensor &chunk_done,
+                       const int n_chunks, const int num_rs_sms,
+                       const int num_padded_local_tokens, const int seq,
+                       at::Tensor &slack, const int two_level) {
+    using cfg = gemm_config_fp8;
+    TORCH_CHECK(weights.size(1) == TK_HIDDEN, "w2 rows must be H (B^T)");
+    TORCH_CHECK(weights.size(2) == act_fp8.size(1), "w2 K must match act inter");
+    TORCH_CHECK(act_scales.size(1) == act_fp8.size(1) / cfg::SCALE_K, "act_scales (P, inter/128)");
+    const int col_blocks = static_cast<int>(weights.size(1)) / cfg::COL_BLOCK;
+    TORCH_CHECK(n_chunks >= 1 && col_blocks % n_chunks == 0,
+                "n_chunks must divide H/COL_BLOCK");
+    const int nblk = num_padded_local_tokens / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    TORCH_CHECK(slack.size(0) == nblk && slack.scalar_type() == at::kInt, "slack int32");
+    TORCH_CHECK(gemm_next.numel() == 1 && chunk_cnt.numel() >= n_chunks &&
+                chunk_done.numel() >= n_chunks, "counters");
+    const int dev = static_cast<int>(act_fp8.device().index());
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev));
+    TORCH_CHECK(num_rs_sms < sm, "num_rs_sms must leave room for compute");
+    const int chunk_cols = col_blocks / n_chunks;
+    const int num_tasks = nblk * col_blocks;
+    gg8::globals G {
+        .activations = kittens::py::tensor_to_gl<gg8::globals::activations_gl>(act_fp8),
+        .weights = kittens::py::tensor_to_gl<gg8::globals::weights_gl>(weights),
+        .a_scales = kittens::py::tensor_to_gl<gg8::globals::a_scales_gl>(act_scales),
+        .w_scales = kittens::py::tensor_to_gl<gg8::globals::w_scales_gl>(w_scales),
+        .outputs = kittens::py::tensor_to_gl<gg8::globals::outputs_gl>(expert_outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<gg8::globals::counts_gl>(padded_tokens_per_expert),
+        .num_local_experts = static_cast<int>(weights.size(0)),
+        .expert_offset = 0
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(gemm_nchunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    gemm_nchunk_kernel<<<sm - num_rs_sms, cfg::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), gemm_next.data_ptr<int>(), num_tasks,
+        two_level ? slack.data_ptr<int>() : nullptr,
+        chunk_cnt.data_ptr<int>(), chunk_done.data_ptr<int>(),
+        chunk_cols, nblk * chunk_cols, seq);
+    CUDACHECK(cudaGetLastError());
+}
+void reduce_rs_entry(at::Tensor &expert_outputs, at::Tensor &tp_slots,
+                     at::Tensor &prered_w, kittens::py::TKParallelTensor &staging,
+                     at::Tensor &chunk_done, at::Tensor &done_blocks,
+                     kittens::py::TKParallelTensor &barrier,
+                     const int n_chunks, const int num_rs_sms,
+                     const int num_source_tokens, const int seq) {
+    const int dev_idx = barrier.local_rank_;
+    const int num_jobs = static_cast<int>(tp_slots.size(0));
+    TORCH_CHECK(num_jobs == rs_globals::NUM_DEVICES * num_source_tokens,
+                "tp_slots rows must be world*T");
+    TORCH_CHECK(prered_w.size(0) == num_jobs, "prered_w rows must be world*T");
+    TORCH_CHECK(staging.data_.size(0) == num_jobs, "staging rows must be world*T");
+    TORCH_CHECK(TK_HIDDEN % (n_chunks * 8) == 0, "chunk_elems must be 8-elem aligned");
+    TORCH_CHECK(chunk_done.numel() >= n_chunks && done_blocks.numel() == 1, "counters");
+    TORCH_CHECK(barrier.data_.size(0) >= 2 + rs_globals::NUM_DEVICES,
+                "barrier needs rows 2+world for watermarks");
+    TORCH_CHECK(num_rs_sms >= 1, "num_rs_sms >= 1");
+    rs_globals G {
+        .expert_out = kittens::py::tensor_to_gl<rs_globals::outputs_gl>(expert_outputs),
+        .slots = kittens::py::tensor_to_gl<rs_globals::slots_gl>(tp_slots),
+        .w = kittens::py::tensor_to_gl<rs_globals::w_gl>(prered_w),
+        .staging = kittens::py::parallel_tensor_to_pgl<rs_globals::staging_pgl>(staging),
+        .barrier = kittens::py::parallel_tensor_to_pgl<rs_globals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_source_tokens = num_source_tokens,
+        .num_jobs = num_jobs, .n_chunks = n_chunks,
+        .chunk_elems = TK_HIDDEN / n_chunks, .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    reduce_rs_kernel<<<num_rs_sms, 256, 0, stream>>>(
+        G, chunk_done.data_ptr<int>(), done_blocks.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+}
+} // namespace tdrs
+
 #include <torch/csrc/utils/pybind.h>
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_TK_PARALLEL_TENSOR(m);
@@ -1282,4 +1817,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
     m.def("moe_final_reduce_push", &preredpush::final_reduce_push_entry);
     m.def("tp_sched_build", &tpsched::sched_build_entry);
+    // TD 风格复刻路径(tktd, docs/17)
+    m.def("moe_td_ag_producer", &tdag::producer_entry);
+    m.def("moe_td_ag_gemm", &tdag::gemm_entry);
+    m.def("moe_td_gemm_nchunk", &tdrs::gemm_nchunk_entry);
+    m.def("moe_td_reduce_rs", &tdrs::reduce_rs_entry);
 }

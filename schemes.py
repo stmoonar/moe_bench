@@ -166,6 +166,12 @@ def _register_optional_schemes() -> None:
     except Exception:
         print("[schemes] tdtp unavailable:", file=_sys.stderr)
         _tb.print_exc()
+    try:
+        from .tk_td_scheme import TKTDFusedTP
+        SCHEMES[TKTDFusedTP.name] = TKTDFusedTP
+    except Exception:
+        print("[schemes] tktd unavailable:", file=_sys.stderr)
+        _tb.print_exc()
 
 
 _register_optional_schemes()

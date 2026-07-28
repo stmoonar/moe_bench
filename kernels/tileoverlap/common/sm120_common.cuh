@@ -368,8 +368,13 @@ struct glu_store_policy {
  * Store: plain_store_policy / glu_store_policy。
  */
 /* RESCALE=false = 裸 mma 吞吐探针(docs/03):跳过重标定 FFMA 与 scale 读,
- * 结果不正确,只用于测 fp8+fp32acc 的硬上限(tools/verify_fp8_gemm.py --raw)。 */
-template <bool RESCALE = true, typename Globals, typename Gate, typename Epilogue, typename Store>
+ * 结果不正确,只用于测 fp8+fp32acc 的硬上限(tools/verify_fp8_gemm.py --raw)。
+ * CHUNKED=true = N-chunk-major 任务序(tktd 的 TD 风格 L1, docs/17): 任务空间
+ * 先按列 chunk 分大段, 段内行主序 —— chunk c 的全部 tile 先于 chunk c+1 发放,
+ * 供 per-chunk 完成信号 + 另一 stream 的 RS 逐 chunk 追赶。编译期参数:
+ * false(默认)时 if constexpr 整支剪掉, 既有 kernel 逐指令不变。 */
+template <bool RESCALE = true, bool CHUNKED = false,
+          typename Globals, typename Gate, typename Epilogue, typename Store>
 // 必须 __forceinline__: 若 dispenser 以 ABI 调用形式存在, ptxas 会忽略
 // 函数体内的 setmaxnreg(C7506 'extern call', 2026-07-25 实测) → 寄存器
 // 分配退回 168 + acc spill。
@@ -390,7 +395,10 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
         // 只有 producer 领任务时查一次表; row_idx 从此处起就是真实行块 id,
         // gate/blk_expert/blk_slack/A 装载/store/epilogue 全部零改动。每个
         // 行块仍被发放恰好一次(双射), 信号计数与恒等序完全一致(死锁审计)。
-        const int *__restrict__ row_perm = nullptr) {
+        const int *__restrict__ row_perm = nullptr,
+        // CHUNKED=true 专用: 每个 N-chunk 含 chunk_cols 个 64 列 tile
+        // (须整除 col_blocks); CHUNKED=false 时忽略。
+        const int chunk_cols = 0) {
     using cfg = gemm_config_fp8;
     using consumers = kittens::group<cfg::CONSUMER_WARPS>;
 
@@ -434,9 +442,22 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 const int t = atomicAdd(task_next, 1);
                 int row_idx = -1, col_idx = -1;
                 if (t < num_tasks) {
-                    const int rb = t / col_blocks;
-                    row_idx = row_perm ? row_perm[rb] : rb;
-                    col_idx = t - rb * col_blocks;
+                    if constexpr (CHUNKED) {
+                        // chunk-major: t -> (chunk, 段内行主序)。任务总数与
+                        // (row, col) 覆盖集不变, 只有发放顺序变(死锁审计:
+                        // 每个 tile 仍恰好发放一次, 信号计数不变)。
+                        const int nblk_c = num_tasks / col_blocks;
+                        const int tpc = nblk_c * chunk_cols;   // tasks per chunk
+                        const int chunk = t / tpc;
+                        const int rem = t - chunk * tpc;
+                        const int rb = rem / chunk_cols;
+                        row_idx = row_perm ? row_perm[rb] : rb;
+                        col_idx = chunk * chunk_cols + (rem - rb * chunk_cols);
+                    } else {
+                        const int rb = t / col_blocks;
+                        row_idx = row_perm ? row_perm[rb] : rb;
+                        col_idx = t - rb * col_blocks;
+                    }
                 }
                 wait(task_done[q], get_phasebit<1>(qphase, q));
                 update_phasebit<1>(qphase, q);

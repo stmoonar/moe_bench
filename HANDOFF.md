@@ -3,7 +3,39 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-28）：TK_L1_SEG 批次分段已实现——combine 就绪塌缩的 TP 内解（待上机）
+## 最新（2026-07-28 深夜）：tktd —— TD 风格 TP 复刻路径已实现（归因探针，待上机）
+
+用 TK/PK 原语按 Triton-distributed tp_moe 的通算融合逻辑重组 L0/L1，作为
+**独立 scheme `tktd`**（不碰 tktp），把 tdtp vs tktp 的差距拆成"引擎差异"
+（tdtp−tktd）和"调度差异"（tktd−tktp）。设计/审计/runbook 全在
+[docs/17](docs/17_TD风格TP复刻_tktd.md)：
+
+- **L0**：AG producer 独立 kernel/独立 stream（TMA 行 push 朴素序 +
+  per-src **段**到达 flag，非 tktp 的 per-token）；GEMM 只算不通信，行块
+  gate 在其真实行覆盖的 src 区间 `[blk_lo, blk_hi]` 的段 ready flag 上
+  （TD 的 dl.wait 换**有界**自旋），发放序 = TD swizzle（本 rank tile 先）。
+- **L1**：dispenser 新增 `CHUNKED` 编译期模板参数（chunk-major 任务序，
+  默认 false 时 `if constexpr` 剪支、既有 kernel 逐指令不变）；W2 GEMM 每
+  N-chunk 发本地完成信号，独立 stream 的 reduce-RS kernel 逐 chunk 追赶
+  （向量 st 数据面，与 TD 同）；最终归约复用 moe_final_reduce_push。
+- **刻意复刻了两个已判负形态**（L0 粗粒度段 gate ≈ docs/03 ring-by-source；
+  L1 N 维分解 = docs/04 Comet-N）——预期慢于 tktp，这正是要测的归因量。
+- **本机已验**（2026-07-28，CPU）：`tools/preflight_td_cpu.py` 全绿——TD
+  专用表 host golden ↔ GPU 向量化 builder 逐元素一致 + 不变量（区间/双射/
+  stage 单调/pull_order 分段）；CHUNKED 任务映射双射且与嵌套循环枚举逐项
+  相同；RS chunk 列窗数据流仿真对拍直接参考。scheme setup 内还有一道
+  golden 对拍（不过直接 raise）。
+- **死锁审计**：全部等待点有界（PCIE_SPIN_GUARD / guarded_wait /既有
+  wait_slot），逐条表在 docs/17 §6 与提交信息；跨 rank 依赖链前向无环。
+- **未上机**。runbook（红线 3 单步隔离）：
+  `python -m moe_bench.tools.run_tktd`（默认只跑正确性门）→
+  `--perf --with tktp,serial` → `--sweep --nchunks-list 2,4,8,16` →
+  `--dist uniform` 判决档。旋钮 `TKTD_COMM_SMS/PUSH_SMS/RS_SMS/NCHUNKS`。
+  首跑触发 nvcc 重编（tk_moe.cu 变更）。注意 tktd 的 sched 走 torch
+  builder（比 tktp 融合 sched 慢 ~120µs），A/B 对照用分阶段数字或给 tktp
+  设 `TK_SCHED_FUSED=0` 对齐。
+
+## 2026-07-28：TK_L1_SEG 批次分段已实现——combine 就绪塌缩的 TP 内解（待上机）
 
 docs/15 说"塌缩 TP 内部无解（f⁸），改顺序无用"——**这个断言有个隐含前提被
 推翻了**：它只对"行块序与 token 无关"的调度成立。新方案（docs/16）把 token
