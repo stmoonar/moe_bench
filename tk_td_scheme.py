@@ -158,11 +158,14 @@ class TKTDFusedTP(DistributedScheme):
         # 先发完本相位的全部 kernel 再 sync), 不会引入跨相位依赖倒挂。
         # 只用于排障, 会破坏 overlap, 不是计时口径。
         self.sync_debug = int(os.environ.get("TKTD_SYNC_DEBUG", "0"))
-        # L1 kernel 级二分(TKTD_L1_SERIAL=1): nchunk GEMM / reduce-RS /
-        # final 逐个发射 + 全设备 sync + 打印。nchunk 先完成 → RS 发射时
-        # chunk 门已全满足, RS 也在 main stream 串行跑 —— 三个 kernel 完全
-        # 隔离, 死哪个一目了然。若此模式整门通过(含 verify), 则三个 kernel
-        # 单独都正确, bug 在并发共驻的交互里。只用于排障。
+        # L1 kernel 级二分(TKTD_L1_SERIAL):
+        #   1 = 三 kernel 全串行逐个 sync(2026-07-28 实测**整门通过**且
+        #       rel_err 与 tktp 逐位一致 → 三 kernel 单独均正确, bug 在
+        #       并发共驻交互);
+        #   2 = RS∥nchunk 真实 overlap, sync, 再 final 串行 —— 裁决
+        #       "RS 追赶 GEMM"这一半;
+        #   3 = nchunk 先行 sync, 再 RS∥final 并发 —— 裁决"final 与 RS
+        #       共驻"这一半。只用于排障。
         self.l1_serial = int(os.environ.get("TKTD_L1_SERIAL", "0"))
         col_blocks = H // 64
         assert col_blocks % self.n_chunks == 0, \
@@ -399,30 +402,60 @@ class TKTDFusedTP(DistributedScheme):
         tk.rowgroup_quant_fp8(self.act, self.act_fp8, self.act_scales)
         _dbg("act_quant")
         if self.l1_serial:
-            # kernel 级二分(排障): 三个 L1 kernel 全部 main stream 串行 +
-            # 逐个 sync。RS 的 chunk 门在 GEMM 完成后已全满足; final 的
-            # watermark 是跨 rank 的, 对端最晚也会走到自己的 RS(有界等待)。
+            # kernel 级二分(排障), 三档见 setup 注释。
             def _dbg2(tag):
                 torch.cuda.synchronize()
                 print(f"[tktd r{self.ctx.rank}] {tag} ok", flush=True)
-            tk.moe_td_gemm_nchunk(
-                self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
-                self.expert_out, self.padded, self.blk_expert,
-                self.gemm_next_l1, self.chunk_cnt, self.chunk_done,
-                self.n_chunks, self.rs_sms, self.num_padded_total,
-                self._l1_seq, self.slack, self.two_level)
-            _dbg2("L1a nchunk_gemm")
-            tk.moe_td_reduce_rs(
-                self.expert_out, self.tp_slots, self.prered_w,
-                self.combine_staging, self.chunk_done, self.done_blocks,
-                self.barrier_l1, self.n_chunks, self.rs_sms,
-                self.num_tokens, self._l1_seq)
-            _dbg2("L1b reduce_rs")
-            tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
-                                     self.recv_from, self.combine_out,
-                                     self.barrier_l1, self.num_tokens,
-                                     self._l1_seq)
-            _dbg2("L1c final")
+
+            def _nchunk():
+                tk.moe_td_gemm_nchunk(
+                    self.act_fp8, self.act_scales, self.w2_fp8, self.w2_scales,
+                    self.expert_out, self.padded, self.blk_expert,
+                    self.gemm_next_l1, self.chunk_cnt, self.chunk_done,
+                    self.n_chunks, self.rs_sms, self.num_padded_total,
+                    self._l1_seq, self.slack, self.two_level)
+
+            def _rs():
+                tk.moe_td_reduce_rs(
+                    self.expert_out, self.tp_slots, self.prered_w,
+                    self.combine_staging, self.chunk_done, self.done_blocks,
+                    self.barrier_l1, self.n_chunks, self.rs_sms,
+                    self.num_tokens, self._l1_seq)
+
+            def _final():
+                tk.moe_final_reduce_push(self.combine_staging,
+                                         self.final_contrib, self.recv_from,
+                                         self.combine_out, self.barrier_l1,
+                                         self.num_tokens, self._l1_seq)
+
+            if self.l1_serial == 2:
+                # RS∥nchunk 真实 overlap, final 隔离在 sync 之后
+                with torch.cuda.stream(self.comm_stream):
+                    _rs()
+                    self._ev_end.record(self.comm_stream)
+                _nchunk()
+                main.wait_event(self._ev_end)
+                _dbg2("L1ab nchunk||rs")
+                _final()
+                _dbg2("L1c final")
+            elif self.l1_serial == 3:
+                # nchunk 隔离在前, RS∥final 并发在后
+                _nchunk()
+                _dbg2("L1a nchunk_gemm")
+                with torch.cuda.stream(self.comm_stream):
+                    _rs()
+                    self._ev_end.record(self.comm_stream)
+                _final()
+                main.wait_event(self._ev_end)
+                _dbg2("L1bc rs||final")
+            else:
+                # 全串行(模式 1)
+                _nchunk()
+                _dbg2("L1a nchunk_gemm")
+                _rs()
+                _dbg2("L1b reduce_rs")
+                _final()
+                _dbg2("L1c final")
             return self.combine_out
         with torch.cuda.stream(self.comm_stream):
             # comm stream 上排在 producer 之后; 对 GEMM 的依赖走 chunk_done
