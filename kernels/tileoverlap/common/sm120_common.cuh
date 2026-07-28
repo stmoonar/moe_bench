@@ -384,7 +384,13 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
         // 跳过计算但保持全部 wait/arrive 节奏(信号计数与全满块完全一致)。
         // 布局仍按 ROW_BLOCK 补齐, 尾块上半行保持 stale —— 与既有 padding
         // 行语义相同, 无下游消费者。
-        const int *__restrict__ blk_slack = nullptr) {
+        const int *__restrict__ blk_slack = nullptr,
+        // 行块发放序(TK_L1_SEG, docs/16): 第 i 个发放的行块 = row_perm[i]
+        // (调度表构建的 [0,nblk) 双射)。nullptr = 恒等(既有行为逐指令不变)。
+        // 只有 producer 领任务时查一次表; row_idx 从此处起就是真实行块 id,
+        // gate/blk_expert/blk_slack/A 装载/store/epilogue 全部零改动。每个
+        // 行块仍被发放恰好一次(双射), 信号计数与恒等序完全一致(死锁审计)。
+        const int *__restrict__ row_perm = nullptr) {
     using cfg = gemm_config_fp8;
     using consumers = kittens::group<cfg::CONSUMER_WARPS>;
 
@@ -428,8 +434,9 @@ __device__ __forceinline__ void grouped_gemm_sm120_fp8_dispenser(
                 const int t = atomicAdd(task_next, 1);
                 int row_idx = -1, col_idx = -1;
                 if (t < num_tasks) {
-                    row_idx = t / col_blocks;
-                    col_idx = t - row_idx * col_blocks;
+                    const int rb = t / col_blocks;
+                    row_idx = row_perm ? row_perm[rb] : rb;
+                    col_idx = t - rb * col_blocks;
                 }
                 wait(task_done[q], get_phasebit<1>(qphase, q));
                 update_phasebit<1>(qphase, q);

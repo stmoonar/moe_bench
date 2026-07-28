@@ -138,7 +138,7 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
                 s.job_order, s.job_next, s.barrier_l1, s.num_comm_sms_l1,
                 s.num_padded_total, s.num_tokens, s.num_jobs, s._l1_seq,
                 s.l1_epired, s.slack, 0 if s.l1_epired else s.two_level,
-                s.l1_no_gate)
+                s.l1_no_gate, s._row_perm_arg)
         timed("L1_fused", st_l1)
 
         timed("final_red", lambda: s.tk.moe_final_reduce_push(
@@ -151,9 +151,16 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
         # 两级 tile 必须跟着 fused 一起开, 否则参考走全满块而 fused 走尾块,
         # exposure 会被系统性低估(balanced 无尾块 → slack 全 0, 行为与旧口径
         # 逐指令相同, 历史数字不受影响; uniform / local_first 下才有差别)。
-        def _gemm_alone(a, asc, w, wsc, out):
+        # 同理 TK_L1_SEG 的 row_perm 只跟给 L1 参考: 段间 B 复用稀释的代价
+        # 落在 L1_gemm_alone 里单独可见, exposure 仍然只量通信/就绪等待。
+        def _gemm_alone(a, asc, w, wsc, out, row_perm=None):
             ref_task_next.zero_()
-            if s.two_level:
+            if row_perm is not None:
+                s.tk.grouped_gemm_fp8(a, asc, w, wsc, out, s.padded,
+                                      s.blk_expert, ref_task_next, 0, False,
+                                      s.slack if s.two_level else
+                                      s.slack.new_empty(0), row_perm)
+            elif s.two_level:
                 s.tk.grouped_gemm_fp8(a, asc, w, wsc, out, s.padded,
                                       s.blk_expert, ref_task_next, 0, False,
                                       s.slack)
@@ -165,7 +172,8 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
             s.gathered, s.gathered_scales, s.w_gateup_fp8, s.w1_il_scales,
             ref_gateup))
         timed("L1_gemm_alone", lambda: _gemm_alone(
-            s.act_fp8, s.act_scales, s.w2_fp8, s.w2_scales, ref_expout))
+            s.act_fp8, s.act_scales, s.w2_fp8, s.w2_scales, ref_expout,
+            row_perm=s._row_perm_arg if s.l1_seg >= 2 else None))
 
         timed("full_run", s.run)
 
@@ -182,6 +190,7 @@ def _worker(rank, world, init_method, ne, iters, tokens, routing):
               f"dist={rdesc}, iters={iters}, comm_sms={s.num_comm_sms}, "
               f"comm_sms_l1={s.num_comm_sms_l1}, push_sms={s.l0_push_sms}, "
               f"two_level={s.two_level}, local_first={s.local_first}, "
+              f"l1_seg={s.l1_seg}, "
               f"no_gate={s.l0_no_gate}/{s.l1_no_gate}, epired={s.l1_epired}, "
               f"P={s.num_padded_total}, "
               f"max over ranks, us) ==")

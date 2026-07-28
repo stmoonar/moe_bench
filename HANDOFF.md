@@ -3,6 +3,52 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
+## 最新（2026-07-28）：TK_L1_SEG 批次分段已实现——combine 就绪塌缩的 TP 内解（待上机）
+
+docs/15 说"塌缩 TP 内部无解（f⁸），改顺序无用"——**这个断言有个隐含前提被
+推翻了**：它只对"行块序与 token 无关"的调度成立。新方案（docs/16）把 token
+按 `batch(j)=j·nseg/S` 切成 nseg 批，L1 GEMM 按"段"（= 所有 expert 的第 k 批
+行块）推进 → 段 k 算完时批次 ≤k **确定性**全就绪，塌缩变 nseg 级阶梯，预归约
+1.07GB 读 + push 100MB 摊回 GEMM 全程。
+
+**关键便宜之处：布局零改动。** batch 是 j 的单调函数，canonical 行序（expert
+内 j 升序）天然批次单调 → tp_slots/padded/slack/pull_order/push_order 与
+canonical **逐位相同**（preflight 机器化断言），零新增 padding，L0 完全不动。
+真正改的只有两张顺序表 + dispenser 一层查表：
+
+- `row_perm (nblk,)`：L1 行块发放序，按（段号=块首行 job 的批次, 块 id）排，
+  段内同 expert 行块相邻（B 复用只按段稀释）；
+- `job_order` 换键为"8 个 slot 行块在 perm 序中的最大位置"（新就绪序）；
+- dispenser producer 加 `row_perm` 查表 3 行（默认 nullptr = 逐指令不变）；
+  tppr8/gg8 透传（gg8 12 参重载给 gemm_alone 参考走同口径）。
+
+开关 `TK_L1_SEG=nseg`（默认 0=关；建议扫 2/4/8；与 TK_LOCAL_FIRST 互斥
+assert；tpsched 融合 sched 自动回退 torch 版 sched +~120µs → **A/B 看
+time_tp_stages 分阶段，不看 e2e**）。
+
+**实算就绪曲线**（真实调度表，uniform T=4096，与 docs/15 §3 同口径，
+l1_seg=0 的 1121µs 对上文档 1125µs 自校验）：50% 就绪 92.2%→51.6%（nseg≥2），
+push 尾部暴露 1121 → 534/236/112µs（nseg=2/4/8）。代价只有 B 段间重读
+`(nseg−1)×402MB ≈ (nseg−1)×310µs`，落在 L1_gemm_alone 里单独可见。
+**收益上界 = TK_L1_NOGATE 差值**（runbook 步 0 先跑探针拆分，docs/16 §5 的
+裁决链）。
+
+- **死锁审计（红线）：无新增、无修改等待点。** row_perm 是双射（preflight
+  断言）→ 每行块仍被发放恰好一次，行块信号的生产者/计数与恒等序完全一致，
+  只有时刻顺序变；push_job 的 `wait_slot` 有界如旧（PCIE_SPIN_GUARD）；
+  L1 GEMM gate 本来就是 no_gate；跨卡协议零改动;跨 rank 依赖链不变无环。
+  逐条表见 docs/16 §8。
+- **正确性强判据**：重排不改变任何一行的运算序 → on/off e2e rel_err 必须
+  **逐位一致**（0.042817506939172745）。
+- **本机已验**（2026-07-28，CPU）：preflight 全绿——host golden ↔ torch GPU
+  版逐元素对拍扩到 l1_seg ∈ {2,4} 档；四条新不变量（row_perm 双射 / 布局与
+  canonical 逐位相同 / 段号沿 perm 非降 / 就绪包含）；数据流仿真按 row_perm
+  序消费（l1_seg=4 档）rel_err < 1e-5。
+- **未上机**（开发机无 CUDA）。runbook 见 docs/16 §9：步 0 = docs/15 §6 的
+  NOGATE + COMM_SMS_L1 探针拆分（先定收益上界），步 1 = 正确性门（单步隔离,
+  on/off 逐位对照），步 2 = nseg sweep（裁决 L1_gemm_alone 涨幅 vs exposure
+  降幅），步 3 = e2e + balanced 零回退。
+
 ## 2026-07-28：每次运行打印每 expert 的 token 数（工具改动，不改任何结论）
 
 新增 `moe_bench/routing_stats.py`（约 70 行）。三个入口（`bench.py` 单卡 /

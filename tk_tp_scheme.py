@@ -74,7 +74,7 @@ def _local_seg_mask(counts_loc, counts_rem, counts_all, thr5):
 
 def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
                         num_experts, rank, device, local_first=False,
-                        seg_thr5=0):
+                        seg_thr5=0, l1_seg=0):
     """Host golden TP schedule (setup only, not timed). Produces:
       - padded (num_experts,) int32: per-expert ROW_BLOCK-padded token counts
         over the FULL world*T batch (identical on every rank; under
@@ -120,6 +120,21 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     proof). The generic code path below indexes a group table of size G = 2E
     (local, remote) or G = E (canonical), so both layouts share one
     implementation.
+
+    l1_seg (TK_L1_SEG, docs/16) >= 2 additionally emits a layer1 row-block
+    DISPENSE order `row_perm` that defeats the combine readiness collapse
+    (docs/15 §3): jobs are cut into l1_seg batches by batch(j) = j*l1_seg//S
+    — a MONOTONE function of j, and the canonical within-expert row order is
+    (src_dev, src_tok, kpos) = j-ascending, so rows are already batch-sorted
+    and THE LAYOUT DOES NOT CHANGE AT ALL (tp_slots / padded / slack /
+    pull_order / push_order are bit-identical to canonical). Only two things
+    move: row_perm orders blocks by (segment, block id) where a block's
+    segment = batch of its first row's job (first row of any block is always
+    a real row), and job_order re-keys to "max over the job's 8 blocks of
+    their position in row_perm" (the new readiness order). Completing segment
+    k finishes every batch<=k row, so batch-k jobs go ready at GEMM progress
+    (k+1)/l1_seg instead of f^8-collapsing to the tail. Mutually exclusive
+    with local_first (asserted in setup).
     """
     top_k = topk_ids.shape[1]
     all_topk = torch.empty(world_size, num_tokens, top_k, device=device,
@@ -197,8 +212,26 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     # any future table change.
     mins = tp_slots.min(dim=1).values.long()
     pull_order = torch.argsort(mins * S + torch.arange(S, device="cpu")).to(torch.int32)
-    maxs = tp_slots.max(dim=1).values.long()
-    job_order = torch.argsort(maxs * S + torch.arange(S, device="cpu")).to(torch.int32)
+    if l1_seg >= 2:
+        # 批次分段(docs/16): 段号 = 块首行 job 的批次(canonical 行序 j 升序
+        # → 块内最小批次; 每块首行必为真实行)。row_perm 按 (段, 块id) 排 →
+        # 段内同 expert 行块保持相邻(B tile 的 L2 复用只按段稀释)。
+        # job_order 换键为"8 个 slot 行块在 perm 序中的最大位置"= 新就绪序;
+        # 键不唯一(同一行块可是多个 job 的 max), +j tie-break 保持全序。
+        nblk_l = num_padded_total // ROW_BLOCK
+        first_job = slot_job[torch.arange(nblk_l, device="cpu") * ROW_BLOCK].long()
+        seg_of_blk = first_job * l1_seg // S
+        row_perm = torch.argsort(
+            seg_of_blk * nblk_l + torch.arange(nblk_l, device="cpu")).to(torch.int32)
+        permpos = torch.empty(nblk_l, dtype=torch.int64, device="cpu")
+        permpos[row_perm.long()] = torch.arange(nblk_l, device="cpu")
+        maxpos = permpos[tp_slots.long() // ROW_BLOCK].max(dim=1).values
+        job_order = torch.argsort(maxpos * S + torch.arange(S, device="cpu")).to(torch.int32)
+    else:
+        maxs = tp_slots.max(dim=1).values.long()
+        job_order = torch.argsort(maxs * S + torch.arange(S, device="cpu")).to(torch.int32)
+        row_perm = torch.arange(num_padded_total // ROW_BLOCK,
+                                dtype=torch.int32, device="cpu")
     # per-source push order = that source's tokens by (min expert, src_tok).
     # 键用 min expert 而不是本地表的 min slot: local_first 的**选择性**分段下,
     # 本卡自己的 token 可能落进段 1(行块排在最前), 本地 min slot 的序于是不再
@@ -222,11 +255,12 @@ def _build_tp_schedules(topk_ids, topk_weights, num_tokens, world_size,
     return (padded.to(torch.int32).to(device), tp_slots.to(device),
             tp_w.to(device), slack.to(device), pull_order.to(device),
             job_order.to(device), push_order.to(device), blk_expert.to(device),
-            slot_job.to(device), slot_w.to(device), num_padded_total)
+            slot_job.to(device), slot_w.to(device), row_perm.to(device),
+            num_padded_total)
 
 
 def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out,
-                            local_first=False, seg_thr5=0):
+                            local_first=False, seg_thr5=0, l1_seg=0):
     """GPU-vectorized rebuild of the TP schedule tables, element-for-element
     identical to the host `_build_tp_schedules` golden (tools/preflight_tp_cpu
     adjudicates). Called each run() and counted in timing — the fair analogue of
@@ -325,9 +359,28 @@ def _build_tp_schedules_gpu(packed_all, world_size, num_experts, rank, out,
     out["pull_order"].copy_(
         torch.argsort((mins * S + torch.arange(S, device=device))
                       .to(torch.int32)).to(torch.int32))
-    out["job_order"].copy_(
-        torch.argsort((tpl.max(dim=1).values * S + torch.arange(S, device=device))
-                      .to(torch.int32)).to(torch.int32))
+    if l1_seg >= 2:
+        # 批次分段(docs/16, 与 host golden 同式): row_perm + 新就绪序
+        # job_order。键值域 nblk*S ≤ ~1.7e7 (T=4096) < 2^31, int32 安全。
+        # l1_seg < 2 时不写 row_perm(setup 已初始化恒等, 免每迭代一个小 op)。
+        nblk_l = out["row_perm"].shape[0]
+        first_job = out["slot_job"][
+            torch.arange(nblk_l, device=device) * ROW_BLOCK].long()
+        seg_of_blk = first_job * l1_seg // S
+        rp = torch.argsort(
+            (seg_of_blk * nblk_l + torch.arange(nblk_l, device=device))
+            .to(torch.int32)).long()
+        out["row_perm"].copy_(rp.to(torch.int32))
+        permpos = torch.empty(nblk_l, dtype=torch.int64, device=device)
+        permpos.scatter_(0, rp, torch.arange(nblk_l, device=device))
+        maxpos = permpos[tpl // ROW_BLOCK].max(dim=1).values
+        out["job_order"].copy_(
+            torch.argsort((maxpos * S + torch.arange(S, device=device))
+                          .to(torch.int32)).to(torch.int32))
+    else:
+        out["job_order"].copy_(
+            torch.argsort((tpl.max(dim=1).values * S + torch.arange(S, device=device))
+                          .to(torch.int32)).to(torch.int32))
     # (min expert, src_tok) — rank-independent even under selective local_first
     # segmentation; identical to the min-slot order in the canonical layout
     # (see the host golden for the equivalence argument).
@@ -351,6 +404,8 @@ class TKFusedTP(DistributedScheme):
     - ``TK_COMM_SMS``      layer0 通信块数, 默认 24(拐点实测值)
     - ``TK_L0_PUSH_SMS``   其中做 push 的块数, 其余做本地 scatter, 默认 4
     - ``TK_COMM_SMS_L1``   layer1 通信块数, 默认跟随 ``TK_COMM_SMS``
+    - ``TK_L1_SEG``        layer1 批次分段数(docs/16, 反就绪塌缩), 默认 0=关;
+                           >=2 = 段数(建议扫 2/4/8), 与 TK_LOCAL_FIRST 互斥
     - ``TK_GPU_SCHED``     1(默认)= 调度表在 run() 内用 GPU 重建并计入耗时
                            (与 serial 的每次路由 all_gather + align 同口径);
                            0 = 只用 setup 的 host 表, 归因用, **不是公平口径**
@@ -398,13 +453,23 @@ class TKFusedTP(DistributedScheme):
         # 买更多本地块(A/B 用, 很大 = 全分段)。单位是 1/5 个满块当量。
         self.local_first = int(os.environ.get("TK_LOCAL_FIRST", "0"))
         self.local_seg_thr5 = int(os.environ.get("TK_LOCAL_SEG_THR5", "0"))
+        # L1 批次分段(TK_L1_SEG, docs/16): >=2 = 段数 nseg。把 job 按
+        # batch(j)=j*nseg//S 切批, L1 GEMM 按"段"(所有 expert 的第 k 批行块)
+        # 发放任务 → 批次 k 的 job 在 GEMM 进度 (k+1)/nseg 就绪, 而不是 f^8
+        # 塌缩到尾部(docs/15)。布局零改动(canonical 行序天然批次单调),
+        # 只有 L1 发放序(row_perm)与 job_order 换键。代价 = w2 B tile 的
+        # L2 复用按段稀释(~+402MB/段, docs/16 的账)。0 = 关(默认, 逐位回归)。
+        self.l1_seg = int(os.environ.get("TK_L1_SEG", "0"))
+        assert not (self.l1_seg >= 2 and self.local_first), \
+            "TK_L1_SEG 与 TK_LOCAL_FIRST 未联调, 一次只开一个(docs/16)"
 
         # ---- host golden schedule (not timed) ----
         (padded, tp_slots, tp_w, slack, pull_order, job_order, push_order,
-         blk_expert, slot_job, slot_w, num_padded_total) = _build_tp_schedules(
+         blk_expert, slot_job, slot_w, row_perm,
+         num_padded_total) = _build_tp_schedules(
             problem.topk_ids, problem.topk_weights, num_tokens, world,
             num_experts, ctx.rank, device, local_first=bool(self.local_first),
-            seg_thr5=self.local_seg_thr5)
+            seg_thr5=self.local_seg_thr5, l1_seg=self.l1_seg)
         self.padded = padded
         self.tp_slots = tp_slots.contiguous()
         self.prered_w = tp_w.contiguous()
@@ -415,6 +480,10 @@ class TKFusedTP(DistributedScheme):
         self.blk_expert = blk_expert.contiguous()
         self.slot_job = slot_job.contiguous()
         self.slot_w = slot_w.contiguous()
+        self.row_perm = row_perm.contiguous()
+        # kernel 参数: 空 tensor = nullptr = 恒等发放序(默认路径逐指令不变)
+        self._row_perm_arg = (self.row_perm if self.l1_seg >= 2
+                              else torch.empty(0, dtype=torch.int32, device=device))
         self.num_padded_total = num_padded_total
         self.num_jobs = world * num_tokens
         # 每迭代清零的计数器(同 stream, 无需额外同步)
@@ -460,6 +529,7 @@ class TKFusedTP(DistributedScheme):
                 "push_order": self.push_order,
                 "blk_expert": self.blk_expert,
                 "slot_job": self.slot_job, "slot_w": self.slot_w,
+                "row_perm": self.row_perm,
             }
             # 融合 kernel(tk.tp_sched_build, 单 block 1024 线程)。
             # smem 需求随 P 变(scan_a 4P + misc/seg4 + 小表), 超 99KB
@@ -468,12 +538,13 @@ class TKFusedTP(DistributedScheme):
                           + 4 * max(world * num_tokens, 1024 * world)
                           + 264 * 4 * 3 + 1024 * 4 + 512)
             # 融合 sched kernel 只实现了 canonical 单段布局(tpsched 的
-            # per-expert compaction), local_first 下回退 torch 向量化版
-            # —— sched 阶段会慢 ~120µs, A/B 必须用 time_tp_stages 的分阶段
-            # 数字裁决 L0, e2e 只在 local_first 定案后再补融合版(docs/14)。
+            # per-expert compaction), local_first / l1_seg 下回退 torch 向量化
+            # 版 —— sched 阶段会慢 ~120µs, A/B 必须用 time_tp_stages 的分阶段
+            # 数字裁决, e2e 只在方案定案后再补融合版(docs/14, docs/16)。
             self._sched_fused = (os.environ.get("TK_SCHED_FUSED", "1") == "1"
                                  and _smem_need <= 101376
-                                 and not self.local_first)
+                                 and not self.local_first
+                                 and self.l1_seg < 2)
             self._sched_graph = None  # captured lazily on first run()
 
         # ---- weights ----
@@ -595,7 +666,8 @@ class TKFusedTP(DistributedScheme):
                                 self._num_experts, self.ctx.rank,
                                 self._sched_out,
                                 local_first=bool(self.local_first),
-                                seg_thr5=self.local_seg_thr5)
+                                seg_thr5=self.local_seg_thr5,
+                                l1_seg=self.l1_seg)
 
     def _sched_fused_call(self):
         """单 kernel 调度表构建(与 _build_tp_schedules_gpu 逐元素一致,
@@ -687,7 +759,8 @@ class TKFusedTP(DistributedScheme):
             self.job_next, self.barrier_l1, self.num_comm_sms_l1,
             self.num_padded_total, self.num_tokens, self.num_jobs,
             self._l1_seq, self.l1_epired, self.slack,
-            0 if self.l1_epired else self.two_level, self.l1_no_gate)
+            0 if self.l1_epired else self.two_level, self.l1_no_gate,
+            self._row_perm_arg)
         tk.moe_final_reduce_push(self.combine_staging, self.final_contrib,
                                  self.recv_from, self.combine_out, self.barrier_l1,
                                  self.num_tokens, self._l1_seq)

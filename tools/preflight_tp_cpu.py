@@ -98,20 +98,25 @@ def check_builders(mod, ROW_BLOCK=128):
     world, T, topk = 4, 512, 8
     # local_first (docs/14) 的表和 canonical 表一起裁决: 同一份路由、同一批
     # 不变量, 只是布局分成本地/远端两段。thr5 = 分段的边际成本阈值(0 = 只分
-    # 免费的那批, 99 = 全分段上界档)。
+    # 免费的那批, 99 = 全分段上界档)。l1_seg (docs/16) 档在最后: 布局承诺是
+    # 与 canonical **逐位相同**(只有 job_order/row_perm 不同), canonical 档
+    # 先跑、表被缓存下来供对比。
     canon_cost = {}
+    canon_tabs = {}
     for dist_kind in ("balanced", "skewed"):
         for ne in (64, 256):
-            for rank, local_first, thr5 in ((0, False, 0), (3, False, 0),
-                                            (0, True, 0), (3, True, 0),
-                                            (0, True, 2), (3, True, 99)):
+            for rank, local_first, thr5, l1_seg in (
+                    (0, False, 0, 0), (3, False, 0, 0),
+                    (0, True, 0, 0), (3, True, 0, 0),
+                    (0, True, 2, 0), (3, True, 99, 0),
+                    (0, False, 0, 4), (3, False, 0, 2)):
                 all_ids, all_w = _make_topk(world, T, ne, topk, dist_kind, 0)
                 _STATE["ids"], _STATE["w"] = all_ids, all_w
                 with RequireExplicitDevice():
                     (padded_g, slots_g, w_g, slack_g, pull_g, job_g, pusho_g,
-                     blk_g, sjob_g, sw_g, P) = mod._build_tp_schedules(
+                     blk_g, sjob_g, sw_g, rowperm_g, P) = mod._build_tp_schedules(
                          all_ids[rank], all_w[rank], T, world, ne, rank, "cpu",
-                         local_first=local_first, seg_thr5=thr5)
+                         local_first=local_first, seg_thr5=thr5, l1_seg=l1_seg)
                 N = world * T * topk
                 packed_all = torch.stack(
                     [all_ids, all_w.contiguous().view(torch.int32)], dim=-1).contiguous()
@@ -126,13 +131,17 @@ def check_builders(mod, ROW_BLOCK=128):
                     "blk_expert": torch.zeros(P // ROW_BLOCK, dtype=torch.int32, device="cpu"),
                     "slot_job": torch.zeros(P, dtype=torch.int32, device="cpu"),
                     "slot_w": torch.zeros(P, dtype=torch.float32, device="cpu"),
+                    # l1_seg < 2 时 GPU builder 不写 row_perm(setup 已初始化
+                    # 恒等), 这里按同一约定预填恒等再对拍。
+                    "row_perm": torch.arange(P // ROW_BLOCK, dtype=torch.int32,
+                                             device="cpu"),
                 }
                 with RequireExplicitDevice():
                     mod._build_tp_schedules_gpu(packed_all, world, ne, rank, out,
                                                 local_first=local_first,
-                                                seg_thr5=thr5)
+                                                seg_thr5=thr5, l1_seg=l1_seg)
                 tag = (f"NE={ne} {dist_kind} rank={rank} "
-                       f"lf={int(local_first)}/thr{thr5}")
+                       f"lf={int(local_first)}/thr{thr5}/seg{l1_seg}")
                 for name, got, ref in [("padded", out["padded"], padded_g),
                                        ("tp_slots", out["tp_slots"], slots_g),
                                        ("prered_w", out["prered_w"], w_g),
@@ -142,7 +151,8 @@ def check_builders(mod, ROW_BLOCK=128):
                                        ("push_order", out["push_order"], pusho_g),
                                        ("blk_expert", out["blk_expert"], blk_g),
                                        ("slot_job", out["slot_job"], sjob_g),
-                                       ("slot_w", out["slot_w"], sw_g)]:
+                                       ("slot_w", out["slot_w"], sw_g),
+                                       ("row_perm", out["row_perm"], rowperm_g)]:
                     if got.shape != ref.shape or not torch.equal(got, ref):
                         fails.append(f"[{tag}] {name} host/GPU MISMATCH")
                 # blk_expert invariants (dispenser GEMM 的 B tile 索引)。
@@ -166,8 +176,13 @@ def check_builders(mod, ROW_BLOCK=128):
                 tail_m = slack_g >= ROW_BLOCK // 2
                 cost = float((~tail_m).sum()) + 0.6 * float(tail_m.sum())
                 ckey = (ne, dist_kind, rank)
-                if not local_first:
+                if not local_first and l1_seg == 0:
                     canon_cost[ckey] = cost
+                    canon_tabs[ckey] = {
+                        "padded": padded_g, "tp_slots": slots_g, "prered_w": w_g,
+                        "slack": slack_g, "pull_order": pull_g,
+                        "push_order": pusho_g, "blk_expert": blk_g,
+                        "slot_job": sjob_g, "slot_w": sw_g}
                 elif thr5 == 0 and cost > canon_cost[ckey] + 1e-9:
                     # thr5=0 的承诺是**严格帕累托**: 只分边际成本 <= 0 的
                     # expert, 总成本不得高于 canonical(docs/14 §4)。
@@ -196,6 +211,46 @@ def check_builders(mod, ROW_BLOCK=128):
                         fails.append(f"[{tag}] segment-1 block carries a remote row")
                     if thr5 == 0 and nb_local == 0 and dist_kind != "balanced":
                         fails.append(f"[{tag}] thr5=0 yielded no local block")
+                if l1_seg >= 2:
+                    # L1 批次分段(docs/16)的四条承诺, 逐条机器化:
+                    S_ = world * T
+                    nb = P // ROW_BLOCK
+                    rp = rowperm_g.long()
+                    # ① row_perm 是 [0, nblk) 的双射(每个行块发放恰好一次 ——
+                    #    行块信号计数不变的前提, 死锁审计的依据)
+                    if rp.unique().numel() != nb or int(rp.min()) < 0 \
+                            or int(rp.max()) >= nb:
+                        fails.append(f"[{tag}] row_perm not a permutation")
+                    # ② 布局零改动: 除 job_order/row_perm 外所有表与 canonical
+                    #    逐位相同(零 padding 代价 + L0 完全不受影响的机器化)
+                    for nm, cur in [("padded", padded_g), ("tp_slots", slots_g),
+                                    ("prered_w", w_g), ("slack", slack_g),
+                                    ("pull_order", pull_g),
+                                    ("push_order", pusho_g),
+                                    ("blk_expert", blk_g),
+                                    ("slot_job", sjob_g), ("slot_w", sw_g)]:
+                        if not torch.equal(cur, canon_tabs[ckey][nm]):
+                            fails.append(f"[{tag}] {nm} differs from canonical "
+                                         f"(l1_seg must not touch the layout)")
+                    # ③ 段号(= 块首行 job 的批次)沿 row_perm 非降, 且每块首行
+                    #    必为真实行(段号定义的前提)
+                    first_job = sjob_g.long()[torch.arange(nb) * ROW_BLOCK]
+                    if int(first_job.min()) < 0:
+                        fails.append(f"[{tag}] block leading row is padding")
+                    seg_id = first_job * l1_seg // S_
+                    if not bool((seg_id[rp][1:] >= seg_id[rp][:-1]).all()):
+                        fails.append(f"[{tag}] segments not monotone along row_perm")
+                    # ④ 就绪包含: 批次 b 的 job 的全部 8 个行块都在段<=b 的
+                    #    perm 前缀内 ——"段 k 算完 ⇒ 批次<=k 全就绪"(方案的
+                    #    语义判据)
+                    permpos = torch.empty(nb, dtype=torch.int64, device="cpu")
+                    permpos[rp] = torch.arange(nb, device="cpu")
+                    maxpp = permpos[slots_g.long() // ROW_BLOCK].max(dim=1).values
+                    batch_j = torch.arange(S_, device="cpu") * l1_seg // S_
+                    cnt = torch.bincount(seg_id, minlength=l1_seg).cumsum(0)
+                    if not bool((maxpp < cnt[batch_j]).all()):
+                        fails.append(f"[{tag}] job blocks escape their segment "
+                                     f"prefix (readiness promise broken)")
                 if flat.unique().numel() != N or int(flat.min()) < 0 or int(flat.max()) >= P:
                     fails.append(f"[{tag}] tp_slots not a bijection onto [0,P)")
                 # slot_job/slot_w = tp_slots/prered_w 的逆映射 (EPIRED 查表)
@@ -211,8 +266,14 @@ def check_builders(mod, ROW_BLOCK=128):
                                    torch.full_like(real_per_blk, ROW_BLOCK)):
                     fails.append(f"[{tag}] slack + real != ROW_BLOCK")
                 S = world * T
+                # job_order 的键: canonical = max slot(跨 job 唯一); l1_seg =
+                # (max perm 位置, j) 复合键(maxpp 不唯一, +j tie-break 后全序)
+                if l1_seg >= 2:
+                    jo_key = maxpp * S + torch.arange(S, device="cpu")
+                else:
+                    jo_key = slots_g.max(dim=1).values
                 for name, ordv, key in [("pull_order", pull_g, slots_g.min(dim=1).values),
-                                        ("job_order", job_g, slots_g.max(dim=1).values)]:
+                                        ("job_order", job_g, jo_key)]:
                     o = ordv.long()
                     if o.unique().numel() != S:
                         fails.append(f"[{tag}] {name} not a permutation")
@@ -245,7 +306,7 @@ def check_builders(mod, ROW_BLOCK=128):
     return fails
 
 
-def check_dataflow(mod, local_first=False, seg_thr5=0):
+def check_dataflow(mod, local_first=False, seg_thr5=0, l1_seg=0):
     """Small-shape fused-dataflow simulation vs naive TP reference (fp32)."""
     torch.manual_seed(0)
     world, T, topk = 4, 96, 8
@@ -272,15 +333,18 @@ def check_dataflow(mod, local_first=False, seg_thr5=0):
     staging = [torch.zeros(world, T, H, device="cpu") for _ in range(world)]
     for r in range(world):
         (_padded, tp_slots, tp_w, _slack, _po, _jo, _pso, blk_expert, _sj, _sw,
-         P) = mod._build_tp_schedules(ids[r], w[r], T, world, E, r, "cpu",
-                                      local_first=local_first,
-                                      seg_thr5=seg_thr5)
+         row_perm, P) = mod._build_tp_schedules(ids[r], w[r], T, world, E, r,
+                                                "cpu", local_first=local_first,
+                                                seg_thr5=seg_thr5,
+                                                l1_seg=l1_seg)
         gathered = torch.zeros(P, H, device="cpu")
         gathered[tp_slots.view(-1).long()] = X.repeat_interleave(topk, dim=0)
         expert_out = torch.zeros(P, H, device="cpu")
         # 按行块走(dispenser 的真实语义), 不假设同一 expert 的行块连续 ——
-        # local_first 布局下它们分处两段。
-        for blk in range(P // RB):
+        # local_first 布局下它们分处两段。遍历序 = row_perm(l1_seg 的 L1
+        # 发放序; 恒等时与旧口径相同), 验证"每个行块被消费恰好一次、结果与
+        # 顺序无关"的语义。
+        for blk in row_perm.tolist():
             e = int(blk_expert[blk])
             rows = slice(blk * RB, (blk + 1) * RB)
             gu = gathered[rows] @ W1[r][e].T.float()
@@ -291,7 +355,8 @@ def check_dataflow(mod, local_first=False, seg_thr5=0):
             staging[s][r] = part[s * T:(s + 1) * T]
     out = torch.cat([staging[r].sum(dim=0) for r in range(world)])
     rel = (out - ref).norm() / ref.norm()
-    tag = f" (local_first thr5={seg_thr5})" if local_first else ""
+    tag = (f" (local_first thr5={seg_thr5})" if local_first
+           else f" (l1_seg={l1_seg})" if l1_seg else "")
     return [] if rel < 1e-5 else [f"dataflow{tag} rel_err {float(rel):.2e} >= 1e-5"]
 
 
@@ -302,6 +367,7 @@ def main():
     fails += check_dataflow(mod, local_first=False)
     fails += check_dataflow(mod, local_first=True)      # thr5=0 (选择性分段)
     fails += check_dataflow(mod, local_first=True, seg_thr5=99)   # 全分段
+    fails += check_dataflow(mod, l1_seg=4)              # L1 批次分段(docs/16)
     for f in fails:
         print("  " + f)
     print(f"[preflight_tp_cpu] {'OK' if not fails else f'FAIL ({len(fails)})'}")
