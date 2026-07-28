@@ -152,6 +152,12 @@ class TKTDFusedTP(DistributedScheme):
         self.n_chunks = int(os.environ.get("TKTD_NCHUNKS", "4"))
         self.l0_no_gate = int(os.environ.get("TKTD_L0_NOGATE", "0"))
         self.two_level = int(os.environ.get("TKTD_TWO_LEVEL", "1"))
+        # 排障相位定位(TKTD_SYNC_DEBUG=1): 每个相位后全设备 synchronize 并
+        # 打印, 挂死/трap 会在**出事相位**的 sync 处抛出 —— 看各 rank 最后
+        # 一个 "ok" 标签即可定位。相位边界都是全 rank 同构点(所有 rank 都
+        # 先发完本相位的全部 kernel 再 sync), 不会引入跨相位依赖倒挂。
+        # 只用于排障, 会破坏 overlap, 不是计时口径。
+        self.sync_debug = int(os.environ.get("TKTD_SYNC_DEBUG", "0"))
         col_blocks = H // 64
         assert col_blocks % self.n_chunks == 0, \
             f"TKTD_NCHUNKS 须整除 H/64={col_blocks}"
@@ -319,6 +325,11 @@ class TKTDFusedTP(DistributedScheme):
     def run(self) -> torch.Tensor:
         tk = self.tk
         main = torch.cuda.current_stream()
+
+        def _dbg(tag):
+            if self.sync_debug:
+                torch.cuda.synchronize()
+                print(f"[tktd r{self.ctx.rank}] {tag} ok", flush=True)
         # 公平口径: 调度表在计时区内 GPU 重建(同 tktp 的 TK_GPU_SCHED=1 语义;
         # tktd 不接 tpsched 融合 kernel, sched 阶段比 tktp 慢 ~120µs, A/B 用
         # 分阶段数字或对 tktp 设 TK_SCHED_FUSED=0 对齐口径)。
@@ -336,6 +347,7 @@ class TKTDFusedTP(DistributedScheme):
                 self._sched_graph = g
             else:
                 self._sched_graph.replay()
+        _dbg("sched")
 
         # 双 barrier 包住 pre_tokens 覆写窗口 + 保证所有 rank 已消费完上一迭代
         # 的 staging(与 tktp 相同的协议; barrier 用 barrier_l0 row 1)。
@@ -345,6 +357,7 @@ class TKTDFusedTP(DistributedScheme):
                               self.pre_tokens.data_, self.pre_scales.data_)
         self._l0_seq += 1
         tk.pcie_device_barrier(self.barrier_l0, self._l0_seq)
+        _dbg("barrier+tok_quant")
 
         # 计数器清零(main stream; comm stream 经 ev0 排在其后)
         self.gemm_next_l0.zero_()
@@ -374,9 +387,11 @@ class TKTDFusedTP(DistributedScheme):
             self.blk_lo, self.blk_hi, self.l0_row_perm, self.gemm_next_l0,
             self.barrier_l0, self.num_comm_sms, self.num_padded_total,
             self._l0_seq, self.slack, self.two_level, self.l0_no_gate)
+        _dbg("L0(producer+gemm)")
 
         # ---- layer1: act 量化 -> N-chunk GEMM(main)∥ reduce-RS(comm) ----
         tk.rowgroup_quant_fp8(self.act, self.act_fp8, self.act_scales)
+        _dbg("act_quant")
         with torch.cuda.stream(self.comm_stream):
             # comm stream 上排在 producer 之后; 对 GEMM 的依赖走 chunk_done
             # flag(seq 门), 无需 stream 级同步。
@@ -396,4 +411,5 @@ class TKTDFusedTP(DistributedScheme):
                                  self.barrier_l1, self.num_tokens, self._l1_seq)
         # 形式上把 comm stream 汇回 main(下一迭代的清零/覆写以此为序)
         main.wait_event(self._ev_end)
+        _dbg("L1(nchunk+rs)+final")
         return self.combine_out
