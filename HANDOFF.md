@@ -6,9 +6,11 @@
 ## 最新（2026-07-31）：L0 SM 分配 microbench 已实现（待上机）
 
 新增 `tools/microbench_l0_sms.py`，直接读唯一主配置并按各 rank CUDA event 的
-max 测三条**无数据依赖、输入全就绪的独立吞吐曲线**：token push `{1,2,4}` SM、
-真实 `pull_order` 本地 scatter `{4,8,16,20,24,32}` SM，以及每个组合的初始剩余
-`device_sms-push_sms-scatter_sms` 上的 grouped GEMM。Scatter 不消费 push 结果：sweep
+max 测三条**无数据依赖、输入全就绪的独立吞吐曲线**：token push
+`{1,2,4,8,16,20,24,32}` SM、真实 `pull_order` 本地 scatter
+`{4,8,16,20,24,32,40,48,64}` SM，以及每个有效组合的初始剩余
+`device_sms-push_sms-scatter_sms` 上的 grouped GEMM。超过设备总 SM 的单阶段点自动跳过，
+GEMM 组合只保留 `push_sms+scatter_sms<device_sms`。Scatter 不消费 push 结果：sweep
 前从 all-gather golden 输入直接预填完整 staging/scales，并将所有 arrival flags 置为
 已到达。GEMM 也不消费 scatter 结果：sweep 前按 `tp_slots` 从 golden 输入直接物化完整
 gathered/scales。GEMM 复用生产 L0 同款 FP8 dispenser、两级尾块和 fp32-acc SwiGLU

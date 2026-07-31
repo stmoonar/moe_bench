@@ -3,8 +3,8 @@
 
 默认严格读取 ``configs/tp_rtx_pro5000_4gpu_fp8.yaml``，遍历：
 
-* token push: 1, 2, 4 SM；
-* 本地 token scatter（真实 ``pull_order``）: 4, 8, 16, 20, 24, 32 SM；
+* token push: 1, 2, 4, 8, 16, 20, 24, 32 SM；
+* 本地 token scatter（真实 ``pull_order``）: 4, 8, 16, 20, 24, 32, 40, 48, 64 SM；
 * grouped GEMM: 对每个 ``(push_sms, scatter_sms)`` 组合使用
   ``device_sms - push_sms - scatter_sms`` 个 persistent blocks。
 
@@ -15,7 +15,7 @@
 可选覆盖会写入结果 JSON：
 
     --experts E --tokens T --warmup N --iters N
-    --push-sms 1,2,4 --scatter-sms 4,8,16,20,24,32
+    --push-sms 1,2,4,8,16,20,24,32 --scatter-sms 4,8,16,20,24,32,40,48,64
     --dist balanced|uniform|skewed|single --output path.json
 
 三段没有前后数据依赖：scatter 的完整 staging/scales/arrival flags 在 sweep 前
@@ -202,18 +202,26 @@ def _worker_impl(
 
     props = torch.cuda.get_device_properties(device)
     total_sms = props.multi_processor_count
+    requested_push_sms = list(push_sms)
+    requested_scatter_sms = list(scatter_sms)
     device_desc = [None] * world
     dist.all_gather_object(device_desc, (props.name, total_sms))
     if len(set(device_desc)) != 1:
         raise RuntimeError(f"各 rank GPU/SM 数不一致: {device_desc}")
+    skipped_push = [sms for sms in push_sms if sms > total_sms]
+    skipped_scatter = [sms for sms in scatter_sms if sms > total_sms]
+    push_sms = [sms for sms in push_sms if sms <= total_sms]
+    scatter_sms = [sms for sms in scatter_sms if sms <= total_sms]
+    if not push_sms or not scatter_sms:
+        raise ValueError(f"没有不超过设备 SM 数 {total_sms} 的 sweep 点")
     combinations = [
-        (p, q, total_sms - p - q) for p in push_sms for q in scatter_sms
+        (p, q, total_sms - p - q)
+        for p in push_sms
+        for q in scatter_sms
+        if p + q < total_sms
     ]
-    invalid = [(p, q) for p, q, remain in combinations if remain < 1]
-    if invalid:
-        raise ValueError(
-            f"push+scatter 必须小于设备 SM 数 {total_sms}，非法组合={invalid}"
-        )
+    if not combinations:
+        raise ValueError(f"没有满足 push+scatter < {total_sms} 的 GEMM 组合")
 
     free_b, total_b = torch.cuda.mem_get_info(device)
     if rank == 0:
@@ -222,6 +230,12 @@ def _worker_impl(
             f"启动前显存空闲={free_b / 2**30:.1f}/{total_b / 2**30:.1f} GiB",
             flush=True,
         )
+        if skipped_push or skipped_scatter:
+            print(
+                f"[microbench] 跳过超过设备上限的点: "
+                f"push={skipped_push}, scatter={skipped_scatter}",
+                flush=True,
+            )
 
     ctx = DistContext(
         rank=rank, world_size=world, local_rank=rank, device=device, group=None
@@ -413,8 +427,12 @@ def _worker_impl(
                 "warmup_iters": cfg.warmup_iters,
                 "bench_iters": cfg.bench_iters,
                 "routing": cfg.routing.distribution.value,
+                "requested_push_sms": requested_push_sms,
+                "requested_scatter_sms": requested_scatter_sms,
                 "push_sms": push_sms,
                 "scatter_sms": scatter_sms,
+                "skipped_push_sms": skipped_push,
+                "skipped_scatter_sms": skipped_scatter,
             },
             "device": props.name,
             "device_sms": total_sms,
@@ -460,11 +478,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tokens", type=int)
     parser.add_argument("--warmup", type=int)
     parser.add_argument("--iters", type=int)
-    parser.add_argument("--push-sms", type=_csv_ints, default=_csv_ints("1,2,4"))
+    parser.add_argument(
+        "--push-sms",
+        type=_csv_ints,
+        default=_csv_ints("1,2,4,8,16,20,24,32"),
+    )
     parser.add_argument(
         "--scatter-sms",
         type=_csv_ints,
-        default=_csv_ints("4,8,16,20,24,32"),
+        default=_csv_ints("4,8,16,20,24,32,40,48,64"),
     )
     parser.add_argument("--dist", choices=[x.value for x in Distribution])
     parser.add_argument("--skew-alpha", type=float)
