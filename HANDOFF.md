@@ -14,28 +14,48 @@ GEMM 组合只保留 `push_sms+scatter_sms<device_sms`。Scatter 不消费 push 
 前从 all-gather golden 输入直接预填完整 staging/scales，并将所有 arrival flags 置为
 已到达。GEMM 也不消费 scatter 结果：sweep 前按 `tp_slots` 从 golden 输入直接物化完整
 gathered/scales。GEMM 复用生产 L0 同款 FP8 dispenser、两级尾块和 fp32-acc SwiGLU
-store policy；push/scatter 直接复用生产 `push_lane`/`scatter_lane`。counter 清零、
-slack seed、fixture 构造、同步与对拍均在计时区外；结果写到
+store policy；standalone push/scatter 直接复用生产 `push_lane`/`scatter_lane`。
+此外每个有效 `(push_sms,scatter_sms)` 组合会运行**无依赖、生产式转岗 sweep**：单个
+persistent kernel 启动全卡 blocks，初始 push/scatter blocks 在两套与 GEMM
+ gathered/output 无别名的 TK IPC/local scratch buffers 上完成一次有限通信；初始 compute
+blocks 同时从独立预填且 immutable 的输入领取 GEMM task。通信 blocks 完成后在本 block
+内汇合并加入同一个 GEMM task dispenser，不等待其他通信 block。CUDA event 覆盖整个
+融合 kernel；JSON 的 `grouped_gemm_with_comm_then_transition` 同时报相对全 SM 纯 GEMM
+和固定剩余 SM、不转岗纯 GEMM 的比值。
+counter 清零、slack seed、fixture 构造、同步与对拍均在计时区外；结果写到
 `tp_test_results/tp_run_<时间戳>/microbench_l0_sms.json`。
 
-首测必须确认卡空闲，并从 `/workspace` 单步隔离执行：
+新 persistent 协议首测必须确认卡空闲，并从 `/workspace` **只跑一个正确性门**：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  /root/miniconda3/envs/vllm-td/bin/python \
+  -m moe_bench.tools.microbench_l0_sms --overlap-smoke 4,20
+```
+
+该单点通过、确认 `nvidia-smi` 存活且卡可复用后，才运行完整矩阵：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
   /root/miniconda3/envs/vllm-td/bin/python -m moe_bench.tools.microbench_l0_sms
 ```
 
-解释边界：这是三段 standalone 曲线。生产 fused kernel 的 comm blocks 做完后会转岗
-GEMM，且三段会争用 TMA/L2/PCIe，因此 `remaining` 表不是融合总时延预测；定参数后仍需
-用原 kernel 做 `(TK_COMM_SMS,TK_L0_PUSH_SMS)` 二维复测。
+解释边界：standalone `grouped_gemm_remaining` 反映固定让出 SM；新的
+`grouped_gemm_with_comm_then_transition` 模拟生产动态：通信与初始 GEMM 并发，通信完成后
+转岗共享剩余 task，但 deliberately 去掉计算对 scatter 数据的 readiness gate，隔离数据
+依赖等待的影响。它仍使用独立 scratch，不是端到端数值数据流；定参数后需用原 kernel 做
+`(TK_COMM_SMS,TK_L0_PUSH_SMS)` 二维复测。
 
-**死锁审计**：新增 push-only 无跨卡等待；它只做本地 guarded TMA load、远端 posted
-store，最后发布 `st.release.sys` flag。scatter-only 保留生产路径的 arrival flag acquire，
-但 fixture 在 kernel 启动前已将所有 flag 置为当前 seq，不依赖 push 或对端生产者；若
-fixture/协议错误仍由 `PCIE_SPIN_GUARD` 有界 trap。两者的 TMA mbarrier 都改/保持
-`guarded_wait`；grouped GEMM 输入独立预填且无通信 gate，只有同 kernel 本地
- task/pipeline mbarrier。三段之间无等待边，依赖图为空；worker 捕获 CUDA error 后
-`os._exit`，PG 另设 3 分钟超时。未新增无界跨卡或跨块等待。开发机完成
+**死锁审计**：standalone/probe push 无跨卡等待，只做本地 guarded TMA load、远端
+posted store，最后发布 `st.release.sys` flag。probe scatter 保留生产 arrival flag acquire，
+但其独立 fixture 在 kernel 启动前已将所有 flag 置为当前 seq，不依赖 probe push 或对端
+生产者；错误由 `PCIE_SPIN_GUARD` 有界 trap。所有跨数据源 TMA mbarrier 用
+`guarded_wait`。转岗点只有 block-local named barrier：生产者和消费者都在同一 block，
+push/scatter lane 的有限循环必定退出或先 trap 整个 kernel；没有 grid/rank 等待。GEMM
+使用 `no_gate` 和独立 immutable 输入，不等待 scatter，所有 blocks 共享原子 task dispenser。
+push/scatter scratch 完全分离，跨 stream/rank 等待图为空。每轮 device synchronize + rank
+barrier 后才复用/析构 IPC scratch；worker 捕获 CUDA error 后 `os._exit`，PG 另设 3 分钟
+超时。未新增无界跨卡或跨块等待。开发机完成
 `py_compile`、lint、`git diff --check`；因无 torch/CUDA/nvcc，未做
 扩展编译与 GPU 首测。
 
