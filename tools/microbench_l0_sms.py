@@ -367,6 +367,10 @@ def _worker_impl(
         s.ag_staging_fp8.data_.zero_()
         s.ag_sscales.data_.zero_()
         s.ag_flags.data_.zero_()
+        torch.cuda.synchronize(device)
+        # 所有 rank 完成 staging 清零后才允许 peer push，否则慢 rank 的清零会
+        # 抹掉快 rank 已经写入的远端 payload/flag。
+        dist.barrier()
         prepare_push()
         launch_push()
         torch.cuda.synchronize(device)
