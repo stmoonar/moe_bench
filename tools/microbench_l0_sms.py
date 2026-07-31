@@ -18,8 +18,11 @@
     --push-sms 1,2,4 --scatter-sms 4,8,16,20,24,32
     --dist balanced|uniform|skewed|single --output path.json
 
-计时只覆盖目标 kernel；counter 清零、scatter 行块计数 seed、同步和正确性检查
-都在计时区外。每次迭代先在各 rank 本地计时，再逐样本取 rank max。
+三段没有前后数据依赖：scatter 的完整 staging/scales/arrival flags 在 sweep 前
+直接预填，所有 token 均已到达；GEMM 的完整 gathered/scales 也从全量输入直接预填，
+不消费 scatter kernel 的结果。计时只覆盖目标 kernel；counter 清零、scatter 行块
+计数 seed、fixture 构造、同步和正确性检查都在计时区外。每次迭代先在各 rank
+本地计时，再逐样本取 rank max。
 """
 from __future__ import annotations
 
@@ -93,7 +96,8 @@ def _bench(
     return _stats(samples.cpu().tolist())
 
 
-def _check_push(s, seq: int, world: int, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _gather_full_inputs(s, world: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build immutable golden inputs once; never timed and not produced by a stage."""
     tokens_u8 = s.pre_tokens.data_.view(torch.uint8)
     full_u8 = torch.empty(
         world * s.num_tokens, s.H, dtype=torch.uint8, device=tokens_u8.device
@@ -108,8 +112,18 @@ def _check_push(s, seq: int, world: int, rank: int) -> tuple[torch.Tensor, torch
     dist.all_gather_into_tensor(full_scales, s.pre_scales.data_)
     torch.cuda.synchronize()
     dist.barrier()
+    return full_u8, full_scales
 
-    remote = torch.arange(world, device=tokens_u8.device) != rank
+
+def _check_push(
+    s,
+    seq: int,
+    world: int,
+    rank: int,
+    full_u8: torch.Tensor,
+    full_scales: torch.Tensor,
+) -> None:
+    remote = torch.arange(world, device=full_u8.device) != rank
     rows = remote.repeat_interleave(s.num_tokens)
     if not torch.equal(s.ag_staging_fp8.data_.view(torch.uint8)[rows], full_u8[rows]):
         raise AssertionError("push payload mismatch")
@@ -117,7 +131,31 @@ def _check_push(s, seq: int, world: int, rank: int) -> tuple[torch.Tensor, torch
         raise AssertionError("push scale mismatch")
     if not torch.all(s.ag_flags.data_.view(-1)[rows] == seq):
         raise AssertionError("push arrival flag mismatch")
-    return full_u8, full_scales
+
+
+def _prime_scatter_fixture(
+    s, seq: int, full_u8: torch.Tensor, full_scales: torch.Tensor
+) -> None:
+    """Make every source token locally available before scatter starts."""
+    s.ag_staging_fp8.data_.view(torch.uint8).copy_(full_u8)
+    s.ag_sscales.data_.copy_(full_scales)
+    s.ag_flags.data_.fill_(seq)
+
+
+def _prime_gemm_fixture(
+    s, full_u8: torch.Tensor, full_scales: torch.Tensor
+) -> None:
+    """Build gathered rows directly from golden inputs, without running scatter."""
+    slots = s.tp_slots.reshape(-1).long()
+    if slots.numel() != torch.unique(slots).numel() or int(slots.min()) < 0:
+        raise AssertionError("tp_slots must be unique non-negative GEMM rows")
+    jobs = torch.arange(
+        s.ctx.world_size * s.num_tokens, device=slots.device
+    ).repeat_interleave(s.top_k)
+    s.gathered.zero_()
+    s.gathered_scales.zero_()
+    s.gathered.view(torch.uint8).index_copy_(0, slots, full_u8.index_select(0, jobs))
+    s.gathered_scales.index_copy_(0, slots, full_scales.index_select(0, jobs))
 
 
 def _check_scatter(s, full_u8: torch.Tensor, full_scales: torch.Tensor) -> None:
@@ -199,6 +237,7 @@ def _worker_impl(
         s.problem.hidden_states, s.pre_tokens.data_, s.pre_scales.data_
     )
     torch.cuda.synchronize(device)
+    full_u8, full_scales = _gather_full_inputs(s, world)
 
     push_results = []
     for sms in push_sms:
@@ -223,7 +262,7 @@ def _worker_impl(
         launch_push()
         torch.cuda.synchronize(device)
         dist.barrier()
-        full_u8, full_scales = _check_push(s, seq, world, rank)
+        _check_push(s, seq, world, rank, full_u8, full_scales)
         row = {"sms": sms, **_bench(
             prepare_push, launch_push, cfg.warmup_iters, cfg.bench_iters, device
         )}
@@ -231,10 +270,11 @@ def _worker_impl(
         if rank == 0:
             print(f"  push    SM={sms:2d}: {row['avg_us']:9.2f} us", flush=True)
 
-    # 最后一轮 push 后，所有远端 plane/flag 已填好；scatter 计时只做本地读取与散写。
+    # Scatter fixture 与 push sweep 无关：直接预填完整 staging/scales 和所有
+    # arrival flags，因此 kernel 启动前每个本地/远端源 token 都已到达。
+    _prime_scatter_fixture(s, seq, full_u8, full_scales)
     torch.cuda.synchronize(device)
     dist.barrier()
-    full_u8, full_scales = _check_push(s, seq, world, rank)
 
     nblk = s.num_padded_total // 128
     scatter_results = []
@@ -261,6 +301,9 @@ def _worker_impl(
                 seq,
             )
 
+        # 正确性门从空输出开始，避免前一个 SM 配置的旧数据掩盖漏写。
+        s.gathered.zero_()
+        s.gathered_scales.zero_()
         prepare_scatter()
         launch_scatter()
         torch.cuda.synchronize(device)
@@ -273,8 +316,13 @@ def _worker_impl(
         if rank == 0:
             print(f"  scatter SM={sms:2d}: {row['avg_us']:9.2f} us", flush=True)
 
-    # scatter 已把真实 gathered 行填满。参考和 sweep 都走生产 L0 同款
-    # grouped GEMM + fp32-acc SwiGLU store policy，只改变 persistent grid.x。
+    # GEMM fixture 与 scatter sweep 无关：直接按 routing slots 从 golden 输入构造
+    # 全量 gathered rows。kernel 启动前所有 row block 均已就绪且没有 readiness gate。
+    _prime_gemm_fixture(s, full_u8, full_scales)
+    torch.cuda.synchronize(device)
+
+    # 参考和 sweep 都走生产 L0 同款 grouped GEMM + fp32-acc SwiGLU store
+    # policy，只改变 persistent grid.x。
     gemm_ref = torch.zeros_like(s.act)
     gemm_out = torch.zeros_like(s.act)
     gemm_counter = torch.zeros(1, dtype=torch.int32, device=device)
@@ -373,10 +421,15 @@ def _worker_impl(
             "world_size": world,
             "num_padded_total": s.num_padded_total,
             "timing": "CUDA events; per-sample max over ranks; preparation excluded",
+            "fixture": (
+                "dependency-free: scatter staging/scales/flags are fully prefilled; "
+                "GEMM gathered/scales are independently materialized from golden inputs"
+            ),
             "interpretation": (
-                "three standalone throughput curves; grouped GEMM uses the initial "
-                "remaining blocks (device-push-scatter). Production fused comm blocks "
-                "join GEMM after finishing, so these rows are not fused latency predictions"
+                "three standalone all-inputs-ready throughput curves; grouped GEMM uses "
+                "the initial remaining blocks (device-push-scatter). Production fused "
+                "comm blocks join GEMM after finishing, so these rows are not fused "
+                "latency predictions"
             ),
             "push": push_results,
             "scatter": scatter_results,
