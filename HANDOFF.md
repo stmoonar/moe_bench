@@ -3,7 +3,37 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
-## 最新（2026-07-31）：tdtp FP8 contextual autotune 已接入（待上机）
+## 最新（2026-07-31）：L0 SM 分配 microbench 已实现（待上机）
+
+新增 `tools/microbench_l0_sms.py`，直接读唯一主配置并按各 rank CUDA event 的
+max 测三条**独立吞吐曲线**：token push `{1,2,4}` SM、真实 `pull_order` 本地
+scatter `{4,8,16,20,24,32}` SM，以及每个组合的初始剩余
+`device_sms-push_sms-scatter_sms` 上的 grouped GEMM。GEMM 复用生产 L0 同款
+FP8 dispenser、两级尾块和 fp32-acc SwiGLU store policy；push/scatter 直接复用
+生产 `push_lane`/`scatter_lane`，不是另写简化拷贝。counter 清零、slack seed、
+同步与对拍均在计时区外；结果写到 `tp_test_results/tp_run_<时间戳>/microbench_l0_sms.json`。
+
+首测必须确认卡空闲，并从 `/workspace` 单步隔离执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  /root/miniconda3/envs/vllm-td/bin/python -m moe_bench.tools.microbench_l0_sms
+```
+
+解释边界：这是三段 standalone 曲线。生产 fused kernel 的 comm blocks 做完后会转岗
+GEMM，且三段会争用 TMA/L2/PCIe，因此 `remaining` 表不是融合总时延预测；定参数后仍需
+用原 kernel 做 `(TK_COMM_SMS,TK_L0_PUSH_SMS)` 二维复测。
+
+**死锁审计**：新增 push-only 无跨卡等待；它只做本地 guarded TMA load、远端 posted
+store，最后发布 `st.release.sys` flag。scatter-only 的跨卡依赖只有本地读取远端源 rank
+发布的 per-token flag；生产者是先运行并完整同步结束的 push sweep，缺失/对端退出时走
+`PCIE_SPIN_GUARD` 有界 trap。两者的 TMA mbarrier 都改/保持 `guarded_wait`；grouped GEMM
+无通信 gate，只有同 kernel 本地 task/pipeline mbarrier。依赖链为 `push完成 → scatter读取`
+单向无环；worker 捕获 CUDA error 后 `os._exit`，PG 另设 3 分钟超时。未新增无界跨卡或
+跨块等待。开发机完成 `py_compile`、lint、`git diff --check`；因无 torch/CUDA/nvcc，未做
+扩展编译与 GPU 首测。
+
+## 2026-07-31：tdtp FP8 contextual autotune 已接入（待上机）
 
 参考 `tmp/Triton-distributed/python/triton_dist/layers/nvidia/tp_moe.py`，为
 `tdtp` 的 FP8 AG GroupGEMM 与 down GroupGEMM+BF16 RS 接入同款

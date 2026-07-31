@@ -76,11 +76,12 @@ void kernel_raw(const __grid_constant__ globals G, const int *__restrict__ blk_e
         plain_store_policy<globals::outputs_gl>{G.outputs},
         blk_expert, task_next, num_tasks, blk_slack, row_perm);
 }
-void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
-           const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
-           const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
-           at::Tensor &task_next, const int expert_offset, const bool raw,
-           const at::Tensor &blk_slack, const at::Tensor &row_perm) {
+void entry_grid(const at::Tensor &inputs, const at::Tensor &a_scales,
+                const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
+                const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
+                at::Tensor &task_next, const int expert_offset, const bool raw,
+                const at::Tensor &blk_slack, const at::Tensor &row_perm,
+                const int requested_sms) {
     using cfg = gemm_config_fp8;
     // 布局(docs/02): weights = B^T (E, N, K)(w1 原始布局, 免转置),
     // w_scales (E, N/128, K/128); mma_ABt + row-layout 加载。
@@ -123,19 +124,106 @@ void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
     }
     const int num_tasks = nblk * (static_cast<int>(weights.size(1)) / cfg::COL_BLOCK);
     int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
+    const int grid_sms = requested_sms > 0 ? requested_sms : sm;
+    TORCH_CHECK(grid_sms >= 1 && grid_sms <= sm,
+                "requested grouped GEMM SMs must be in [1, device SM count]");
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;
     if (raw) {
         CUDACHECK(cudaFuncSetAttribute(kernel_raw, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-        kernel_raw<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+        kernel_raw<<<grid_sms, cfg::NUM_THREADS, smem, stream>>>(
             G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks,
             blk_slack_ptr, row_perm_ptr);
     } else {
         CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-        kernel<<<sm, cfg::NUM_THREADS, smem, stream>>>(
+        kernel<<<grid_sms, cfg::NUM_THREADS, smem, stream>>>(
             G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks,
             blk_slack_ptr, row_perm_ptr);
     }
+    CUDACHECK(cudaGetLastError());
+}
+void entry(const at::Tensor &inputs, const at::Tensor &a_scales,
+           const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
+           const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
+           at::Tensor &task_next, const int expert_offset, const bool raw,
+           const at::Tensor &blk_slack, const at::Tensor &row_perm) {
+    entry_grid(inputs, a_scales, weights, w_scales, outputs,
+               padded_tokens_per_expert, blk_expert, task_next, expert_offset,
+               raw, blk_slack, row_perm, -1);
+}
+// microbench 专用: 显式限制 persistent block 数, 其余数据流与 grouped_gemm_fp8 相同。
+void entry_sms(const at::Tensor &inputs, const at::Tensor &a_scales,
+               const at::Tensor &weights, const at::Tensor &w_scales, at::Tensor &outputs,
+               const at::Tensor &padded_tokens_per_expert, const at::Tensor &blk_expert,
+               at::Tensor &task_next, const int expert_offset, const bool raw,
+               const at::Tensor &blk_slack, const int num_sms) {
+    entry_grid(inputs, a_scales, weights, w_scales, outputs,
+               padded_tokens_per_expert, blk_expert, task_next, expert_offset,
+               raw, blk_slack, at::Tensor(), num_sms);
+}
+
+__global__ __launch_bounds__(gemm_config_fp8::NUM_THREADS, 1)
+void kernel_glu(const __grid_constant__ globals G,
+                const int *__restrict__ blk_expert,
+                int *__restrict__ task_next, const int num_tasks,
+                const int *__restrict__ blk_slack) {
+    grouped_gemm_sm120_fp8_dispenser(
+        G, no_gate{}, noop_epilogue{},
+        glu_store_policy<globals::outputs_gl>{G.outputs},
+        blk_expert, task_next, num_tasks, blk_slack);
+}
+void entry_glu_sms(const at::Tensor &inputs, const at::Tensor &a_scales,
+                   const at::Tensor &weights, const at::Tensor &w_scales,
+                   at::Tensor &outputs,
+                   const at::Tensor &padded_tokens_per_expert,
+                   const at::Tensor &blk_expert, at::Tensor &task_next,
+                   const at::Tensor &blk_slack, const int num_sms) {
+    using cfg = gemm_config_fp8;
+    TORCH_CHECK(inputs.size(0) % cfg::ROW_BLOCK == 0, "tokens % ROW_BLOCK");
+    TORCH_CHECK(weights.size(2) == inputs.size(1), "weights K mismatch");
+    TORCH_CHECK(weights.size(1) % cfg::COL_BLOCK == 0, "weights N % COL_BLOCK");
+    TORCH_CHECK(outputs.size(0) == inputs.size(0) &&
+                outputs.size(1) * 2 == weights.size(1),
+                "GLU output must be (rows, weights_N/2)");
+    TORCH_CHECK(a_scales.size(0) == inputs.size(0) &&
+                a_scales.size(1) == inputs.size(1) / cfg::SCALE_K,
+                "a_scales mismatch");
+    TORCH_CHECK(w_scales.size(1) == weights.size(1) / cfg::SCALE_K &&
+                w_scales.size(2) == weights.size(2) / cfg::SCALE_K,
+                "w_scales mismatch");
+    TORCH_CHECK(task_next.numel() == 1, "task_next must be one int");
+    const int nblk = static_cast<int>(inputs.size(0)) / cfg::ROW_BLOCK;
+    TORCH_CHECK(blk_expert.size(0) == nblk, "blk_expert per row block");
+    const int *blk_slack_ptr = nullptr;
+    if (blk_slack.defined() && blk_slack.numel() > 0) {
+        TORCH_CHECK(blk_slack.size(0) == nblk &&
+                    blk_slack.scalar_type() == at::kInt,
+                    "blk_slack int32 per row block");
+        blk_slack_ptr = blk_slack.data_ptr<int>();
+    }
+    int sm; CUDACHECK(cudaDeviceGetAttribute(
+        &sm, cudaDevAttrMultiProcessorCount, inputs.device().index()));
+    TORCH_CHECK(num_sms >= 1 && num_sms <= sm, "GLU GEMM num_sms out of range");
+    globals G {
+        .activations = kittens::py::tensor_to_gl<globals::activations_gl>(const_cast<at::Tensor&>(inputs)),
+        .weights = kittens::py::tensor_to_gl<globals::weights_gl>(const_cast<at::Tensor&>(weights)),
+        .a_scales = kittens::py::tensor_to_gl<globals::a_scales_gl>(const_cast<at::Tensor&>(a_scales)),
+        .w_scales = kittens::py::tensor_to_gl<globals::w_scales_gl>(const_cast<at::Tensor&>(w_scales)),
+        .outputs = kittens::py::tensor_to_gl<globals::outputs_gl>(outputs),
+        .padded_tokens_per_expert = kittens::py::tensor_to_gl<globals::counts_gl>(const_cast<at::Tensor&>(padded_tokens_per_expert)),
+        .num_local_experts = static_cast<int>(weights.size(0)),
+        .expert_offset = 0
+    };
+    const int num_tasks = nblk * (static_cast<int>(weights.size(1)) /
+                                  cfg::COL_BLOCK);
+    constexpr int smem = cfg::DYNAMIC_SHARED_MEMORY + 1024;
+    CUDACHECK(cudaFuncSetAttribute(kernel_glu,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  smem));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    kernel_glu<<<num_sms, cfg::NUM_THREADS, smem, stream>>>(
+        G, blk_expert.data_ptr<int>(), task_next.data_ptr<int>(), num_tasks,
+        blk_slack_ptr);
     CUDACHECK(cudaGetLastError());
 }
 // 11 参签名重载(无 row_perm = 恒等发放序): 未定义 tensor 只在 C++ 内部传递,
@@ -296,7 +384,8 @@ struct dispatch_gate_p {
         }
     }
 };
-__device__ inline void push_lane(const pglobals &G, int *__restrict__ push_next,
+template <typename Globals>
+__device__ inline void push_lane(const Globals &G, int *__restrict__ push_next,
                                  typename pglobals::token_vec &tok,
                                  typename pglobals::scale_vec &sc, semaphore &sem) {
     int phase = 0;
@@ -327,7 +416,8 @@ __device__ inline void push_lane(const pglobals &G, int *__restrict__ push_next,
         }
     }
 }
-__device__ inline void scatter_lane(const pglobals &G, int *__restrict__ pull_next,
+template <typename Globals>
+__device__ inline void scatter_lane(const Globals &G, int *__restrict__ pull_next,
                                     typename pglobals::token_vec &tok,
                                     typename pglobals::scale_vec &sc, semaphore &sem) {
     int phase = 0;
@@ -338,17 +428,16 @@ __device__ inline void scatter_lane(const pglobals &G, int *__restrict__ pull_ne
         const int src = d / G.num_tokens;
         const int t = d % G.num_tokens;
         if (src != G.dev_idx) {       // 远端行: 本地 acquire 自旋等到达
-            // 有界自旋(踩坑加固): 协议 bug 导致 flag 永不到达时, ~30s 后
-            // trap 杀死整个 kernel -> CUDA error -> 进程干净退出, 避免
-            // 持久 kernel 自旋 wedge 整机(不可抢占 + IPC 级联, docs/06)。
-            long long spins = 0;
+            // 有界自旋: 协议 bug / 对端退出导致 flag 永不到达时 trap，避免
+            // persistent kernel wedge 整机。融合与 microbench 共用这一等待点。
             int v;
+            PCIE_SPIN_GUARD_DECL;
             do {
                 asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
                              : "=r"(v) : "l"(&G.ag_flags[G.dev_idx][{0, d}]) : "memory");
                 if (v < G.seq) {
                     __nanosleep(64);
-                    if (++spins > 500000000LL) asm volatile("trap;");
+                    PCIE_SPIN_GUARD_TICK;
                 }
             } while (v < G.seq);
         }
@@ -492,6 +581,154 @@ void entry_push(kittens::py::TKParallelTensor &pre_tokens, kittens::py::TKParall
     CUDACHECK(cudaGetLastError());
     const int rb = (num_padded_local_tokens / cfg::ROW_BLOCK + 255) / 256 + 1;
     reset_kernel_p<<<rb, 256, 0, stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+
+// 独立 L0 microbench：保持 push_lane/scatter_lane 的真实数据流，只拆掉 GEMM
+// 和通信块转岗。一个 block 因共享内存占用对应一个 SM，grid.x 即被测 SM 数。
+struct push_mb_globals {
+    pglobals::pre_tokens_pgl pre_tokens;
+    pglobals::pre_scales_pgl pre_scales;
+    pglobals::pre_tokens_pgl ag_staging;
+    pglobals::pre_scales_pgl ag_sscales;
+    pglobals::flags_pgl ag_flags;
+    pglobals::porder_gl push_order;
+    const int dev_idx;
+    const int num_tokens;
+    const int seq;
+};
+struct scatter_mb_globals {
+    pglobals::pre_tokens_pgl pre_tokens;
+    pglobals::pre_scales_pgl pre_scales;
+    pglobals::pre_tokens_pgl ag_staging;
+    pglobals::pre_scales_pgl ag_sscales;
+    pglobals::flags_pgl ag_flags;
+    pglobals::gathered_gl activations;
+    pglobals::gscales_gl a_scales;
+    pglobals::slots_gl tp_slots;
+    pglobals::order_gl pull_order;
+    pglobals::barrier_pgl barrier;
+    const int dev_idx;
+    const int num_tokens;
+    const int s_max;
+    const int seq;
+};
+__global__ __launch_bounds__(256, 1)
+void push_microbench_kernel(const __grid_constant__ push_mb_globals G,
+                            int *__restrict__ push_next) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename pglobals::token_vec (&tok)[pglobals::SLOTS] =
+        al.allocate<typename pglobals::token_vec, pglobals::SLOTS>();
+    typename pglobals::scale_vec (&sc)[pglobals::SLOTS] =
+        al.allocate<typename pglobals::scale_vec, pglobals::SLOTS>();
+    __shared__ semaphore arrived[pglobals::SLOTS];
+    const bool is_slot = (threadIdx.x % 8 == 0) &&
+                         (threadIdx.x / 8 < pglobals::SLOTS);
+    const int slot = threadIdx.x / 8;
+    if (is_slot) init_semaphore(arrived[slot], 0, 1);
+    __syncthreads();
+    if (is_slot) push_lane(G, push_next, tok[slot], sc[slot], arrived[slot]);
+}
+__global__ __launch_bounds__(256, 1)
+void scatter_microbench_kernel(const __grid_constant__ scatter_mb_globals G,
+                               int *__restrict__ pull_next) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    typename pglobals::token_vec (&tok)[pglobals::SLOTS] =
+        al.allocate<typename pglobals::token_vec, pglobals::SLOTS>();
+    typename pglobals::scale_vec (&sc)[pglobals::SLOTS] =
+        al.allocate<typename pglobals::scale_vec, pglobals::SLOTS>();
+    __shared__ semaphore arrived[pglobals::SLOTS];
+    const bool is_slot = (threadIdx.x % 8 == 0) &&
+                         (threadIdx.x / 8 < pglobals::SLOTS);
+    const int slot = threadIdx.x / 8;
+    if (is_slot) init_semaphore(arrived[slot], 0, 1);
+    __syncthreads();
+    if (is_slot) scatter_lane(G, pull_next, tok[slot], sc[slot], arrived[slot]);
+}
+constexpr int MICROBENCH_SMEM = pglobals::SLOTS *
+    (sizeof(pglobals::token_vec) + sizeof(pglobals::scale_vec)) + 2048;
+
+void push_microbench_entry(kittens::py::TKParallelTensor &pre_tokens,
+                           kittens::py::TKParallelTensor &pre_scales,
+                           kittens::py::TKParallelTensor &ag_staging,
+                           kittens::py::TKParallelTensor &ag_sscales,
+                           kittens::py::TKParallelTensor &ag_flags,
+                           at::Tensor &push_order, at::Tensor &push_next,
+                           const int num_sms, const int num_tokens,
+                           const int seq) {
+    const int dev_idx = pre_tokens.local_rank_;
+    TORCH_CHECK(push_next.numel() == 1 && push_next.scalar_type() == at::kInt,
+                "push_next must be one int32");
+    TORCH_CHECK(push_order.size(0) == pglobals::NUM_DEVICES &&
+                push_order.size(1) == num_tokens,
+                "push_order must be (world, T)");
+    TORCH_CHECK(ag_staging.data_.size(0) == pglobals::NUM_DEVICES * num_tokens,
+                "ag_staging rows must be world*T");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_sms >= 1 && num_sms <= sm, "push num_sms out of range");
+    push_mb_globals G {
+        .pre_tokens = kittens::py::parallel_tensor_to_pgl<pglobals::pre_tokens_pgl>(pre_tokens),
+        .pre_scales = kittens::py::parallel_tensor_to_pgl<pglobals::pre_scales_pgl>(pre_scales),
+        .ag_staging = kittens::py::parallel_tensor_to_pgl<pglobals::pre_tokens_pgl>(ag_staging),
+        .ag_sscales = kittens::py::parallel_tensor_to_pgl<pglobals::pre_scales_pgl>(ag_sscales),
+        .ag_flags = kittens::py::parallel_tensor_to_pgl<pglobals::flags_pgl>(ag_flags),
+        .push_order = kittens::py::tensor_to_gl<pglobals::porder_gl>(push_order),
+        .dev_idx = dev_idx, .num_tokens = num_tokens, .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CUDACHECK(cudaFuncSetAttribute(push_microbench_kernel,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  MICROBENCH_SMEM));
+    push_microbench_kernel<<<num_sms, 256, MICROBENCH_SMEM, stream>>>(
+        G, push_next.data_ptr<int>());
+    CUDACHECK(cudaGetLastError());
+}
+
+void scatter_microbench_entry(kittens::py::TKParallelTensor &pre_tokens,
+                              kittens::py::TKParallelTensor &pre_scales,
+                              kittens::py::TKParallelTensor &ag_staging,
+                              kittens::py::TKParallelTensor &ag_sscales,
+                              kittens::py::TKParallelTensor &ag_flags,
+                              at::Tensor &gathered, at::Tensor &gathered_scales,
+                              at::Tensor &tp_slots, at::Tensor &pull_order,
+                              at::Tensor &pull_next,
+                              kittens::py::TKParallelTensor &barrier,
+                              const int num_sms, const int num_tokens,
+                              const int seq) {
+    const int dev_idx = pre_tokens.local_rank_;
+    const int s_max = static_cast<int>(tp_slots.size(0));
+    TORCH_CHECK(s_max == pglobals::NUM_DEVICES * num_tokens,
+                "tp_slots rows must be world*T");
+    TORCH_CHECK(pull_order.numel() == s_max, "pull_order must cover world*T");
+    TORCH_CHECK(pull_next.numel() == 1 && pull_next.scalar_type() == at::kInt,
+                "pull_next must be one int32");
+    TORCH_CHECK(gathered.size(1) == pglobals::H &&
+                gathered_scales.size(1) == pglobals::NSC,
+                "gathered shapes mismatch");
+    int sm; CUDACHECK(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev_idx));
+    TORCH_CHECK(num_sms >= 1 && num_sms <= sm, "scatter num_sms out of range");
+    scatter_mb_globals G {
+        .pre_tokens = kittens::py::parallel_tensor_to_pgl<pglobals::pre_tokens_pgl>(pre_tokens),
+        .pre_scales = kittens::py::parallel_tensor_to_pgl<pglobals::pre_scales_pgl>(pre_scales),
+        .ag_staging = kittens::py::parallel_tensor_to_pgl<pglobals::pre_tokens_pgl>(ag_staging),
+        .ag_sscales = kittens::py::parallel_tensor_to_pgl<pglobals::pre_scales_pgl>(ag_sscales),
+        .ag_flags = kittens::py::parallel_tensor_to_pgl<pglobals::flags_pgl>(ag_flags),
+        .activations = kittens::py::tensor_to_gl<pglobals::gathered_gl>(gathered),
+        .a_scales = kittens::py::tensor_to_gl<pglobals::gscales_gl>(gathered_scales),
+        .tp_slots = kittens::py::tensor_to_gl<pglobals::slots_gl>(tp_slots),
+        .pull_order = kittens::py::tensor_to_gl<pglobals::order_gl>(pull_order),
+        .barrier = kittens::py::parallel_tensor_to_pgl<pglobals::barrier_pgl>(barrier),
+        .dev_idx = dev_idx, .num_tokens = num_tokens,
+        .s_max = s_max, .seq = seq
+    };
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CUDACHECK(cudaFuncSetAttribute(scatter_microbench_kernel,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  MICROBENCH_SMEM));
+    scatter_microbench_kernel<<<num_sms, 256, MICROBENCH_SMEM, stream>>>(
+        G, pull_next.data_ptr<int>());
     CUDACHECK(cudaGetLastError());
 }
 } // namespace tpdisp8
@@ -1812,7 +2049,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_gemm_fp8", &gg8::entry);
     m.def("grouped_gemm_fp8", &gg8::entry_noperm);
     m.def("grouped_gemm_fp8", &gg8::entry_notail);
+    m.def("grouped_gemm_fp8_sms", &gg8::entry_sms);
+    m.def("grouped_gemm_fp8_glu_sms", &gg8::entry_glu_sms);
     m.def("rowgroup_quant_fp8", &gg8::rowgroup_quant_entry);
+    m.def("moe_tp_push_microbench", &tpdisp8::push_microbench_entry);
+    m.def("moe_tp_scatter_microbench", &tpdisp8::scatter_microbench_entry);
     m.def("moe_tp_dispatch_gemm_fp8_push", &tpdisp8::entry_push);
     m.def("moe_tp_gemm_prered_push_fp8", &tppr8::entry);
     m.def("moe_final_reduce_push", &preredpush::final_reduce_push_entry);

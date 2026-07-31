@@ -24,6 +24,17 @@ def _nvcc_flags():
     return inc, lib
 
 
+def _needs_rebuild(so_path: str) -> bool:
+    if not os.path.exists(so_path):
+        return True
+    newest_source = max(
+        os.path.getmtime(os.path.join(_HERE, "tk_moe.cu")),
+        os.path.getmtime(_COMMON),
+        os.path.getmtime(__file__),
+    )
+    return os.path.getmtime(so_path) < newest_source
+
+
 def build_and_load(world_size: int, hidden: int = 4096, module_name: str = "tk_moe",
                    row_block: int = 128):
     build_dir = os.path.join(_HERE, "build")
@@ -31,7 +42,7 @@ def build_and_load(world_size: int, hidden: int = 4096, module_name: str = "tk_m
     mod = f"{module_name}_w{world_size}_h{hidden}_rb{row_block}"
     so_path = os.path.join(build_dir, f"{mod}.so")
 
-    if not os.path.exists(so_path):
+    if _needs_rebuild(so_path):
         _build_so(so_path, world_size, hidden, mod, row_block)
 
     spec = importlib.util.spec_from_file_location(mod, so_path)
@@ -48,7 +59,7 @@ def _build_so(so_path: str, world_size: int, hidden: int, mod: str, row_block: i
     with open(so_path + ".lock", "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
-            if os.path.exists(so_path):  # another rank built it while we waited
+            if not _needs_rebuild(so_path):  # another rank built it while we waited
                 return
             # copy the shared header next to the source so its #include "sm120_common.cuh" resolves
             import shutil
