@@ -3,6 +3,28 @@
 > 这份文档只记"接手要知道的当前状态"。原理与账在 [`docs/`](docs/README.md)，
 > 历史过程在 git（分支 `fp8_tp` / `tk_dev` 及其提交信息）。
 
+## 最新（2026-07-31）：tdtp FP8 contextual autotune 已接入（待上机）
+
+参考 `tmp/Triton-distributed/python/triton_dist/layers/nvidia/tp_moe.py`，为
+`tdtp` 的 FP8 AG GroupGEMM 与 down GroupGEMM+BF16 RS 接入同款
+`triton.autotune + contextual_autotune(is_dist=True)`。开关 `TD_AUTOTUNE=1`
+默认关闭；候选只扫 `num_stages={3,4} × num_warps={4,8}`。没有照搬 BF16
+候选的 BN/BK：FP8 BK 必须固定 128，BM 参与专家排序表，BN 参与 RS chunk
+完成协议且受 128×128 weight scale 约束，不能在 kernel autotuner 内独立覆盖。
+分布式选优使用各 rank 耗时的 max，日志由上游 tuner 写到
+`.autotune_logs/rank-<rank>.log`；结果是当前进程内 Triton cache，不会改默认配置。
+
+首测仍必须单步隔离；先确认卡空闲，再从 `/workspace` 执行：
+
+```bash
+TD_AUTOTUNE=1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  python -m moe_bench.tools.run_tktp --scheme tdtp --iters 10
+```
+
+本次没有新增或修改 kernel 等待点，只让现有完整分布式 op 为每个候选重复运行；
+`tdtp` 既有 `dl.wait`/NVSHMEM barrier 仍然无界，因此候选异常时依赖 worker
+fail-fast，首测不可并入长矩阵。开发机仅完成 `py_compile` 与 lint，未做 GPU 测试。
+
 ## 最新（2026-07-28 深夜）：tktd —— TD 风格 TP 复刻路径已实现（归因探针，待上机）
 
 用 TK/PK 原语按 Triton-distributed tp_moe 的通算融合逻辑重组 L0/L1，作为

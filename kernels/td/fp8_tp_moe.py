@@ -56,6 +56,42 @@ from triton_dist.kernels.nvidia.moe_reduce_rs import create_moe_rs_context
 from moe_bench.kernels.td.swiglu_quantize_fp8 import swiglu_quantize_fp8
 
 
+_FP8_AUTOTUNE_KERNELS_INSTALLED = False
+
+
+def _make_fp8_autotuned_ops():
+    """按 Triton-distributed TP_MoE 的方式包装两个分布式 GEMM。"""
+    global _FP8_AUTOTUNE_KERNELS_INSTALLED
+
+    from triton_dist.autotuner import contextual_autotune
+    from moe_bench.kernels.td import fp8_allgather_group_gemm as ag_module
+    from moe_bench.kernels.td import fp8_moe_reduce_rs as rs_module
+
+    if not _FP8_AUTOTUNE_KERNELS_INSTALLED:
+        # FP8 的 K tile 必须与 1x128/128x128 量化块对齐；M/N tile 又参与
+        # MoE 排序表和 RS chunk 完成协议，不能像 BF16 TP_MoE 那样直接扫描。
+        # 因此只调不改变协议几何的 pipeline stages / warps。
+        configs = [
+            triton.Config({}, num_stages=stages, num_warps=warps)
+            for stages in (3, 4)
+            for warps in (4, 8)
+        ]
+        ag_module.fp8_kernel_consumer_ag_group_gemm = triton.autotune(
+            configs=configs,
+            key=["M", "N", "K"],
+        )(ag_module.fp8_kernel_consumer_ag_group_gemm)
+        rs_module.fp8_moe_gather_rs_grouped_gemm_kernel = triton.autotune(
+            configs=configs,
+            key=["M", "N", "K"],
+        )(rs_module.fp8_moe_gather_rs_grouped_gemm_kernel)
+        _FP8_AUTOTUNE_KERNELS_INSTALLED = True
+
+    return (
+        contextual_autotune(is_dist=True)(fp8_ag_group_gemm),
+        contextual_autotune(is_dist=True)(run_fp8_moe_reduce_rs),
+    )
+
+
 # =============================================================================
 # FP8 Quantization Utilities
 # =============================================================================
@@ -211,13 +247,20 @@ class FP8_TP_MoE:
     """
 
     def __init__(self, rank=0, world_size=8, group=None,
-                 fp8_dtype=torch.float8_e4m3fn, block_k_quant=128, block_n_quant=128):
+                 fp8_dtype=torch.float8_e4m3fn, block_k_quant=128, block_n_quant=128,
+                 autotune=False):
         self.rank = rank
         self.world_size = world_size
         self.group = group
         self.fp8_dtype = fp8_dtype
         self.block_k_quant = block_k_quant
         self.block_n_quant = block_n_quant
+        self.autotune = autotune
+        if autotune:
+            self._ag_group_gemm, self._run_moe_reduce_rs = _make_fp8_autotuned_ops()
+        else:
+            self._ag_group_gemm = fp8_ag_group_gemm
+            self._run_moe_reduce_rs = run_fp8_moe_reduce_rs
 
         # Weights (FP8 quantized)
         self.gate_up_proj_fp8 = None  # [E, K, N_gateup_per_tp] in FP8
@@ -339,7 +382,7 @@ class FP8_TP_MoE:
         x_fp8, x_scale = quantize_fp8_blockwise(x, self.fp8_dtype, self.block_k_quant)
 
         # Step 2: FP8 AG + GroupGEMM (gate_up) with tile-level overlap
-        out_fused = fp8_ag_group_gemm(
+        out_fused = self._ag_group_gemm(
             x_fp8, x_scale,
             self.gate_up_proj_fp8, self.gate_up_proj_scale,
             self.ag_ctx,
@@ -357,7 +400,7 @@ class FP8_TP_MoE:
         )
 
         # Step 4: FP8 Grouped GEMM (down) + ReduceScatter
-        output = run_fp8_moe_reduce_rs(
+        output = self._run_moe_reduce_rs(
             swiglu_fp8,
             swiglu_scale,
             self.down_proj_fp8,
@@ -534,7 +577,7 @@ class FP8_TP_MoE_FP8RS(FP8_TP_MoE):
         x_fp8, x_scale = quantize_fp8_blockwise(x, self.fp8_dtype, self.block_k_quant)
 
         # Step 2: FP8 AG + GroupGEMM (gate_up) with tile-level overlap
-        out_fused = fp8_ag_group_gemm(
+        out_fused = self._ag_group_gemm(
             x_fp8, x_scale,
             self.gate_up_proj_fp8, self.gate_up_proj_scale,
             self.ag_ctx,

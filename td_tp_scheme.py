@@ -16,7 +16,9 @@ quantize_fp8_blockwise(x)                      # token 1x128 group, 每次 run �
 problem 的 fp8 数据（与 tktp/serial 同一份，公平）。
 
 依赖 triton_dist（服务器环境）与 NVSHMEM；worker 的初始化见 distributed.py
-（`requires_nvshmem = True` 时走 triton_dist.utils.initialize_distributed）。
+（`requires_nvshmem = True` 时走 triton_dist.utils.initialize_distributed）。设置
+``TD_AUTOTUNE=1`` 可启用 Triton-distributed TP_MoE 同款 contextual autotune；
+首次运行会扫描 FP8 GEMM 的 stages/warps 并在各 rank 的最慢耗时上选优。
 """
 
 from __future__ import annotations
@@ -65,9 +67,13 @@ class TDTFusedTP(DistributedScheme):
                                   dtype=torch.float32)
         # RS 分块数(GEMM-RS overlap 粒度), 与 td_benchmark 的 c4 实际值一致(32)
         self.n_chunks_rs = int(os.environ.get("TD_N_CHUNKS_RS", "32"))
+        self.autotune = os.environ.get("TD_AUTOTUNE", "0") == "1"
+        if self.autotune and ctx.is_rank0:
+            print("[tdtp] TD_AUTOTUNE=1: tuning FP8 AG/RS GEMM stages × warps", flush=True)
 
         layer = FP8_TP_MoE(rank=ctx.rank, world_size=world, group=ctx.group,
-                           block_k_quant=128, block_n_quant=128)
+                           block_k_quant=128, block_n_quant=128,
+                           autotune=self.autotune)
         # 直接接入 problem 的 fp8 权重(与 tktp/serial 同一份量化数据):
         # problem.w1 (E, 2I, K) fp8 -> gate_up_proj [E, K, 2I]
         # problem.w2 (E, K, I)  fp8 -> down_proj    [E, I, K]
