@@ -310,11 +310,12 @@ class FP8_TP_MoE:
                 f"fp8_dtype={self.fp8_dtype}"
             )
 
-    def _init_ctx(self, M: int):
+    def _init_ctx(self, M: int, n_chunks_max: int = 8):
         """Initialize AG and RS contexts.
 
         Args:
             M: total number of tokens across all ranks (global M)
+            n_chunks_max: synchronization-buffer capacity for RS N-chunks
         """
         N_gateup_per_tp = self.gate_up_proj_fp8.shape[2]
 
@@ -347,11 +348,31 @@ class FP8_TP_MoE:
             num_experts=self.num_experts,
             topk=self.top_k,
             input_dtype=torch.bfloat16,  # RS operates on BF16 GEMM output
+            n_chunks_max=n_chunks_max,
         )
 
         torch.cuda.synchronize()
         if self.world_size > 1:
             torch.distributed.barrier(group=self.group)
+
+    def autotune_report(self) -> str:
+        """Return the rank-local choices after contextual autotune finishes."""
+        from moe_bench.kernels.td import fp8_allgather_group_gemm as ag_module
+        from moe_bench.kernels.td import fp8_moe_reduce_rs as rs_module
+
+        def describe(name, tuner):
+            config = getattr(tuner, "best_config", None)
+            best_ms = getattr(tuner, "best_time", None)
+            if config is None:
+                return f"{name}=not-run"
+            latency = f", slowest-rank={best_ms:.4f}ms" if best_ms is not None else ""
+            return (f"{name}=(stages={config.num_stages}, warps={config.num_warps}"
+                    f"{latency})")
+
+        return " ".join((
+            describe("AG", ag_module.fp8_kernel_consumer_ag_group_gemm),
+            describe("RS", rs_module.fp8_moe_gather_rs_grouped_gemm_kernel),
+        ))
 
     def finalize(self):
         if self.rs_ctx:

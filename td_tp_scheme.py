@@ -67,7 +67,12 @@ class TDTFusedTP(DistributedScheme):
                                   dtype=torch.float32)
         # RS 分块数(GEMM-RS overlap 粒度), 与 td_benchmark 的 c4 实际值一致(32)
         self.n_chunks_rs = int(os.environ.get("TD_N_CHUNKS_RS", "32"))
+        if (self.n_chunks_rs <= 0
+                or self.n_chunks_rs & (self.n_chunks_rs - 1)
+                or pcfg.hidden_size % self.n_chunks_rs):
+            raise ValueError("TD_N_CHUNKS_RS 必须是能整除 hidden_size 的正 2 次幂")
         self.autotune = os.environ.get("TD_AUTOTUNE", "0") == "1"
+        self._autotune_reported = False
         if self.autotune and ctx.is_rank0:
             print("[tdtp] TD_AUTOTUNE=1: tuning FP8 AG/RS GEMM stages × warps", flush=True)
 
@@ -88,7 +93,7 @@ class TDTFusedTP(DistributedScheme):
         layer.down_proj_fp8 = problem.w2.transpose(1, 2).contiguous()
         layer.down_proj_scale = (
             problem.quant_config.w2_scale.transpose(1, 2).contiguous())
-        layer._init_ctx(M=world * T)
+        layer._init_ctx(M=world * T, n_chunks_max=max(8, self.n_chunks_rs))
         self.layer = layer
 
     def run(self) -> torch.Tensor:
@@ -97,8 +102,13 @@ class TDTFusedTP(DistributedScheme):
         dist.all_gather_into_tensor(self.full_ids, self.ids_local,
                                     group=self.ctx.group)
         dist.all_gather_into_tensor(self.full_w, self.w_local, group=self.ctx.group)
-        return self.layer.dist_triton_fwd(
+        output = self.layer.dist_triton_fwd(
             self.hidden_local, self.full_ids, self.full_w, self.n_chunks_rs)
+        if self.autotune and not self._autotune_reported:
+            if self.ctx.is_rank0:
+                print(f"[tdtp] autotune best: {self.layer.autotune_report()}", flush=True)
+            self._autotune_reported = True
+        return output
 
     def close(self) -> None:
         layer = getattr(self, "layer", None)
